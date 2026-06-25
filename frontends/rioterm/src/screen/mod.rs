@@ -440,6 +440,7 @@ impl Screen<'_> {
         self.renderer.is_window_focused = was_focused;
         if let Some(mut island) = old_island {
             island.update_colors(config.colors.tabs, config.colors.tabs_active);
+            island.title_font_size = config.navigation.tab_font_size;
             self.renderer.island = Some(island);
         }
 
