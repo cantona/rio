@@ -15,7 +15,8 @@ use rustc_hash::FxHashMap;
 use std::borrow::Cow;
 use std::time::Instant;
 
-pub const ISLAND_HEIGHT: f32 = 38.0;
+#[cfg(test)]
+const ISLAND_HEIGHT: f32 = 38.0;
 const PROGRESS_BAR_HEIGHT: f32 = 3.0;
 
 const PROGRESS_BAR_TIMEOUT_SECS: u64 = 15;
@@ -232,11 +233,15 @@ fn draw_island(
 }
 
 #[inline]
-fn island_rect(slot_x: f32, tab_width: f32) -> (f32, f32, f32, f32, f32) {
+fn island_rect(
+    slot_x: f32,
+    tab_width: f32,
+    bar_height: f32,
+) -> (f32, f32, f32, f32, f32) {
     let x = slot_x + TAB_GAP / 2.0;
     let w = (tab_width - TAB_GAP).max(0.0);
     let y = TAB_INSET_Y;
-    let h = ISLAND_HEIGHT - TAB_INSET_Y * 2.0;
+    let h = bar_height - TAB_INSET_Y * 2.0;
     let radius = TAB_RADIUS.min(w / 2.0).min(h / 2.0);
     (x, y, w, h, radius)
 }
@@ -248,9 +253,13 @@ fn close_button_center(island_x: f32, island_w: f32) -> Option<f32> {
 }
 
 #[inline]
-fn close_button_center_x(layout: &TabStripLayout, tab_index: usize) -> Option<f32> {
+fn close_button_center_x(
+    layout: &TabStripLayout,
+    tab_index: usize,
+    bar_height: f32,
+) -> Option<f32> {
     let slot_x = layout.left_margin + tab_index as f32 * layout.tab_width;
-    let (ix, _, iw, _, _) = island_rect(slot_x, layout.tab_width);
+    let (ix, _, iw, _, _) = island_rect(slot_x, layout.tab_width, bar_height);
     close_button_center(ix, iw)
 }
 
@@ -259,8 +268,9 @@ pub fn close_button_hit(
     layout: &TabStripLayout,
     tab_index: usize,
     x_unscaled: f32,
+    bar_height: f32,
 ) -> bool {
-    close_button_center_x(layout, tab_index)
+    close_button_center_x(layout, tab_index, bar_height)
         .is_some_and(|cx| (x_unscaled - cx).abs() <= CLOSE_HIT_HALF_WIDTH)
 }
 
@@ -270,8 +280,9 @@ fn draw_close_button(
     color: [f32; 4],
     hover: bool,
     order: u8,
+    bar_height: f32,
 ) {
-    let cy = ISLAND_HEIGHT / 2.0;
+    let cy = bar_height / 2.0;
     let r = CLOSE_GLYPH_HALF;
     let alpha = if hover {
         CLOSE_ALPHA_HOVER
@@ -305,6 +316,7 @@ pub struct Island {
     pub hide_if_single: bool,
     /// Tab-title font size in logical pixels (`navigation.tab-font-size`).
     pub title_font_size: f32,
+    pub tab_bar_height: f32,
     pub inactive_text_color: [f32; 4],
     pub active_text_color: [f32; 4],
     /// Current progress bar state
@@ -347,10 +359,12 @@ impl Island {
         active_text_color: [f32; 4],
         hide_if_single: bool,
         title_font_size: f32,
+        tab_bar_height: f32,
     ) -> Self {
         Self {
             hide_if_single,
             title_font_size,
+            tab_bar_height,
             inactive_text_color,
             active_text_color,
             progress_state: None,
@@ -634,7 +648,7 @@ impl Island {
         };
 
         let width = window_width / scale_factor;
-        let y_position = ISLAND_HEIGHT;
+        let y_position = self.tab_bar_height;
 
         // Determine color based on state
         let color = match state {
@@ -699,7 +713,7 @@ impl Island {
     /// Get the height of the island
     #[inline]
     pub fn height(&self) -> f32 {
-        ISLAND_HEIGHT
+        self.tab_bar_height
     }
 
     /// Render tabs using equal-width layout
@@ -833,7 +847,7 @@ impl Island {
                 let ui = sugarloaf.text_mut();
                 let text_width = ui.measure(&title, &title_opts);
                 let text_x = tab_x + (tab_width - text_width) / 2.0;
-                let text_y = (ISLAND_HEIGHT / 2.0) - (self.title_font_size / 2.);
+                let text_y = (self.tab_bar_height / 2.0) - (self.title_font_size / 2.);
                 ui.draw(text_x, text_y, &title, &title_opts);
             }
 
@@ -843,7 +857,8 @@ impl Island {
             // toward the strip — a white "active" overlay would
             // bleach custom colors to pastel on light themes, so the
             // hierarchy is carried by the mute instead.
-            let (ix, iy, iw, ih, radius) = island_rect(tab_x, tab_width);
+            let (ix, iy, iw, ih, radius) =
+                island_rect(tab_x, tab_width, self.tab_bar_height);
             let fill = match context_manager.custom_color(tab_index) {
                 Some(mut custom) => {
                     if !is_active {
@@ -878,7 +893,7 @@ impl Island {
                         sugarloaf.rounded_rect(
                             None,
                             cx - CLOSE_HOVER_HALF,
-                            ISLAND_HEIGHT / 2.0 - CLOSE_HOVER_HALF,
+                            self.tab_bar_height / 2.0 - CLOSE_HOVER_HALF,
                             CLOSE_HOVER_HALF * 2.0,
                             CLOSE_HOVER_HALF * 2.0,
                             fills.close_hover,
@@ -893,6 +908,7 @@ impl Island {
                         self.active_text_color,
                         self.close_hover,
                         2,
+                        self.tab_bar_height,
                     );
                 }
             }
@@ -903,7 +919,8 @@ impl Island {
 
         // Draw the floating (dragged) tab above the slot tabs.
         if let (Some(drag_idx), Some(floating_x)) = (drag_index, floating_left) {
-            let (ix, iy, iw, ih, radius) = island_rect(floating_x, tab_width);
+            let (ix, iy, iw, ih, radius) =
+                island_rect(floating_x, tab_width, self.tab_bar_height);
 
             // Soft elevation: a slightly inflated dark halo behind the
             // lifted island so it reads as floating over the strip.
@@ -944,7 +961,14 @@ impl Island {
             );
 
             if let Some(cx) = close_button_center(ix, iw) {
-                draw_close_button(sugarloaf, cx, self.active_text_color, false, 12);
+                draw_close_button(
+                    sugarloaf,
+                    cx,
+                    self.active_text_color,
+                    false,
+                    12,
+                    self.tab_bar_height,
+                );
             }
 
             let raw_title = self.get_title_for_tab(context_manager, drag_idx);
@@ -964,7 +988,7 @@ impl Island {
                 let ui = sugarloaf.text_mut();
                 let text_width = ui.measure(&title, &title_opts);
                 let text_x = floating_x + (tab_width - text_width) / 2.0;
-                let text_y = (ISLAND_HEIGHT / 2.0) - (self.title_font_size / 2.);
+                let text_y = (self.tab_bar_height / 2.0) - (self.title_font_size / 2.);
                 ui.draw(text_x, text_y, &title, &title_opts);
             }
         }
@@ -1103,7 +1127,7 @@ impl Island {
         let tab_x = left_margin + picker_tab as f32 * tab_width;
 
         // Picker is rendered just below the island
-        let picker_y = ISLAND_HEIGHT;
+        let picker_y = self.tab_bar_height;
 
         // Check if click is within picker vertical range
         if mouse_y_unscaled < picker_y || mouse_y_unscaled > picker_y + PICKER_HEIGHT {
@@ -1164,7 +1188,7 @@ impl Island {
         selected_color: Option<[f32; 4]>,
     ) {
         let padding = PICKER_PADDING;
-        let bg_y = ISLAND_HEIGHT;
+        let bg_y = self.tab_bar_height;
 
         // Compute total swatches width to derive the consistent inner content width
         // N color swatches + 1 reset swatch
@@ -1418,14 +1442,14 @@ mod tests {
     fn island_rect_insets_slot_and_clamps_radius() {
         // Slot at x=100, width 180 → island inset by half the gap on
         // each side and TAB_INSET_Y vertically.
-        let (x, y, w, h, radius) = island_rect(100.0, 180.0);
+        let (x, y, w, h, radius) = island_rect(100.0, 180.0, ISLAND_HEIGHT);
         assert_eq!(x, 100.0 + TAB_GAP / 2.0);
         assert_eq!(y, TAB_INSET_Y);
         assert_eq!(w, 180.0 - TAB_GAP);
         assert_eq!(h, ISLAND_HEIGHT - TAB_INSET_Y * 2.0);
         assert_eq!(radius, TAB_RADIUS);
 
-        let (_, _, w, h, radius) = island_rect(0.0, 4.0);
+        let (_, _, w, h, radius) = island_rect(0.0, 4.0, ISLAND_HEIGHT);
         assert_eq!(w, 0.0);
         assert_eq!(radius, 0.0);
         assert!(radius <= h / 2.0);
@@ -1473,7 +1497,7 @@ mod tests {
         let inactive_color = [0.5, 0.5, 0.5, 1.0];
         let active_color = [0.9, 0.9, 0.9, 1.0];
 
-        let island = Island::new(inactive_color, active_color, true, 12.0);
+        let island = Island::new(inactive_color, active_color, true, 12.0, ISLAND_HEIGHT);
 
         assert_eq!(island.inactive_text_color, inactive_color);
         assert_eq!(island.active_text_color, active_color);
@@ -1487,6 +1511,7 @@ mod tests {
             [1.0, 1.0, 1.0, 1.0],
             false,
             12.0,
+            ISLAND_HEIGHT,
         );
         assert_eq!(island.height(), ISLAND_HEIGHT);
     }
@@ -1497,6 +1522,7 @@ mod tests {
             [0.9, 0.9, 0.9, 1.0],
             false,
             12.0,
+            ISLAND_HEIGHT,
         )
     }
 
@@ -1793,7 +1819,7 @@ mod tests {
             tab_width: 180.0,
             tabs_width: 360.0,
         };
-        let cx = close_button_center_x(&layout, 1).unwrap();
+        let cx = close_button_center_x(&layout, 1, ISLAND_HEIGHT).unwrap();
         assert_eq!(
             cx,
             180.0 + TAB_GAP / 2.0 + (180.0 - TAB_GAP) - CLOSE_MARGIN_RIGHT
@@ -1808,7 +1834,7 @@ mod tests {
             tab_width: 60.0,
             tabs_width: 600.0,
         };
-        assert_eq!(close_button_center_x(&narrow, 3), None);
+        assert_eq!(close_button_center_x(&narrow, 3, ISLAND_HEIGHT), None);
     }
 
     #[test]
@@ -1822,7 +1848,7 @@ mod tests {
             tab_width: 180.0,
             tabs_width: 360.0,
         };
-        let cx = close_button_center_x(&layout, 0).unwrap();
+        let cx = close_button_center_x(&layout, 0, ISLAND_HEIGHT).unwrap();
         let title_max_right = layout.tab_width - TAB_PADDING_X;
         assert!(cx - CLOSE_HIT_HALF_WIDTH >= title_max_right);
     }
