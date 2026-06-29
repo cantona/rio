@@ -1237,6 +1237,10 @@ impl Screen<'_> {
                         drop(terminal);
                         self.mark_dirty();
                     }
+                    Act::ResetTriggers => {
+                        self.triggers.reset();
+                        self.mark_dirty();
+                    }
                     Act::ToggleFullscreen => self.context_manager.toggle_full_screen(),
                     Act::ToggleMaximized => self.context_manager.toggle_maximize_window(),
                     Act::ToggleAppearanceTheme => {
@@ -3544,7 +3548,15 @@ impl Screen<'_> {
                 },
                 Action::Run { program, args } => Event::Run { program, args },
                 Action::SendText(text) => Event::SendText { text },
-                Action::Coprocess { program, args } => Event::Coprocess { program, args },
+                Action::Coprocess {
+                    program,
+                    args,
+                    stdin,
+                } => Event::Coprocess {
+                    program,
+                    args,
+                    stdin,
+                },
                 Action::TabColor(color) => {
                     self.context_manager
                         .set_custom_color(tab_index, Some(color));
