@@ -155,9 +155,28 @@ mod platform {
         let Ok(xml) = XmlDocument::new() else {
             return;
         };
+        // Escape XML metacharacters: title/body carry trigger capture
+        // substitutions, i.e. attacker-controlled terminal output. Raw
+        // `<`/`>`/`&`/quotes would at best break the toast and at worst
+        // inject markup (e.g. a clickable protocol-launch action).
+        fn xml_escape(s: &str) -> String {
+            let mut out = String::with_capacity(s.len());
+            for c in s.chars() {
+                match c {
+                    '&' => out.push_str("&amp;"),
+                    '<' => out.push_str("&lt;"),
+                    '>' => out.push_str("&gt;"),
+                    '"' => out.push_str("&quot;"),
+                    '\'' => out.push_str("&apos;"),
+                    _ => out.push(c),
+                }
+            }
+            out
+        }
         let toast_xml = format!(
             r#"<toast><visual><binding template="ToastGeneric"><text>{}</text><text>{}</text></binding></visual></toast>"#,
-            title, body,
+            xml_escape(title),
+            xml_escape(body),
         );
         if xml.LoadXml(&HSTRING::from(&toast_xml)).is_err() {
             return;

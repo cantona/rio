@@ -11,9 +11,15 @@ use std::hash::{Hash, Hasher};
 /// Longest line (chars) matched against trigger regexes.
 const LINE_SCAN_CAP: usize = 4096;
 
+/// Scrollback lines (above the visible bottom) included when a feed_screen
+/// coprocess captures the screen, so a multi-line block that scrolled partly
+/// off the top is still captured whole.
+const FEED_HISTORY_LINES: i32 = 200;
+
 struct CompiledTrigger {
     regex: onig::Regex,
     instant: bool,
+    once: bool,
     action: TriggerAction,
 }
 
@@ -23,11 +29,21 @@ struct CompiledTrigger {
 pub struct Triggers {
     rules: Vec<CompiledTrigger>,
     has_highlight: bool,
+    /// Any rule pipes the screen to a coprocess; gate the screen capture.
+    has_feed_screen: bool,
     /// Per route, the set of (absolute line, content hash, finalized) we've
     /// already evaluated, so a given line+content fires once. Keyed on
     /// content rather than a cursor counter so prompt redraws and TUIs
     /// (which don't scroll) still register new output.
     seen: FxHashMap<usize, FxHashSet<(i64, u64, bool)>>,
+    /// (route, rule index) of `once` rules that have already fired. Reset on
+    /// rebuild (config reload).
+    fired_once: FxHashSet<(usize, usize)>,
+    /// Per route, the content hash of the cursor (live prompt) line last
+    /// evaluated. The cursor line re-fires whenever its content changes rather
+    /// than deduping forever, so a prompt that recurs at a redrawn position
+    /// (e.g. a second `login:` under tmux, which doesn't scroll) fires again.
+    last_cursor: FxHashMap<usize, u64>,
 }
 
 /// A one-shot trigger action with captures already substituted.
@@ -46,6 +62,7 @@ pub enum ResolvedAction {
     Coprocess {
         program: String,
         args: Vec<String>,
+        stdin: Option<String>,
     },
 }
 
@@ -74,6 +91,7 @@ impl Triggers {
                 Ok(regex) => rules.push(CompiledTrigger {
                     regex,
                     instant: rule.instant,
+                    once: rule.once,
                     action: rule.action.clone(),
                 }),
                 Err(err) => {
@@ -84,15 +102,60 @@ impl Triggers {
         let has_highlight = rules
             .iter()
             .any(|r| matches!(r.action, TriggerAction::Highlight { .. }));
+        let has_feed_screen = rules.iter().any(|r| {
+            matches!(
+                r.action,
+                TriggerAction::Coprocess {
+                    feed_screen: true,
+                    ..
+                }
+            )
+        });
         Self {
             rules,
             has_highlight,
+            has_feed_screen,
             seen: FxHashMap::default(),
+            fired_once: FxHashSet::default(),
+            last_cursor: FxHashMap::default(),
         }
     }
 
+    /// Recompile rules from config (config hot-reload), PRESERVING the
+    /// per-route dedup state. `*self = Triggers::new(...)` would wipe
+    /// `seen`/`fired_once`, so the next scan would treat every line
+    /// already on screen as new — re-firing `once` rules and re-running
+    /// `send_text` (e.g. re-typing a saved credential) just because an
+    /// unrelated config file was edited. Only the rules change here.
     pub fn rebuild(&mut self, config: &TriggersConfig) {
-        *self = Triggers::new(config);
+        let fresh = Triggers::new(config);
+        self.rules = fresh.rules;
+        self.has_highlight = fresh.has_highlight;
+        self.has_feed_screen = fresh.has_feed_screen;
+        // seen / fired_once / last_cursor intentionally retained.
+    }
+
+    /// Forget a route's accumulated dedup state when its pane closes,
+    /// so `seen`/`fired_once`/`last_cursor` don't grow without bound
+    /// over a long session that opens and closes many tabs.
+    pub fn forget_route(&mut self, route_id: usize) {
+        self.seen.remove(&route_id);
+        self.last_cursor.remove(&route_id);
+        self.fired_once.retain(|(r, _)| *r != route_id);
+    }
+
+    /// Re-arm `once` rules so the automation can run again. Bound to
+    /// `ResetTriggers` (e.g. Alt+R). Drops only the cursor-line (non-finalized)
+    /// dedup, so instant rules (a `login:`/`Password:` prompt) re-fire on the
+    /// current live line even when it sits where one fired before. Finalized
+    /// (scrolled-past) content stays deduped, so a re-arm doesn't replay a
+    /// whole stale flow at once.
+    pub fn reset(&mut self) {
+        self.fired_once.clear();
+        for seen in self.seen.values_mut() {
+            seen.retain(|(_, _, finalized)| *finalized);
+        }
+        self.last_cursor.clear();
     }
 
     #[inline]
@@ -122,9 +185,21 @@ impl Triggers {
         let cursor_row = grid.cursor.pos.row.0 as i64;
         let screen_lines = grid.screen_lines();
 
+        // Captured lazily on the first feed_screen match (see below) so the
+        // common path — and every non-matching frame — pays nothing.
+        let mut screen_text: Option<String> = None;
+
         let seen = self.seen.entry(route_id).or_default();
         // Drop lines that have scrolled out of the live view.
         seen.retain(|(abs, _, _)| *abs >= history);
+        // In the alternate screen history never advances, so the retain
+        // above frees nothing and a redrawing TUI (htop/watch) grows the
+        // set without bound. Cap it: clearing costs at most a re-fire of
+        // whatever is currently on screen, which the per-line dedup then
+        // re-suppresses immediately.
+        if seen.len() > 8192 {
+            seen.clear();
+        }
 
         let mut actions = Vec::new();
         for i in 0..screen_lines {
@@ -143,13 +218,22 @@ impl Triggers {
                 &text
             };
 
-            // (line, content, phase) — re-evaluated only when the content
-            // changes, so unchanged lines cost just a hash lookup.
-            if !seen.insert((abs, hash_text(text), finalized)) {
+            let hash = hash_text(text);
+
+            // The live prompt (cursor line) re-fires when its content changes,
+            // so a prompt that recurs at a redrawn (non-scrolling) position —
+            // e.g. a second login: under tmux — isn't deduped forever. Other
+            // lines fire once each, keyed on (line, content, phase).
+            if (i as i64) == cursor_row {
+                if self.last_cursor.get(&route_id) == Some(&hash) {
+                    continue;
+                }
+                self.last_cursor.insert(route_id, hash);
+            } else if !seen.insert((abs, hash, finalized)) {
                 continue;
             }
 
-            for rule in &self.rules {
+            for (idx, rule) in self.rules.iter().enumerate() {
                 if matches!(rule.action, TriggerAction::Highlight { .. }) {
                     continue;
                 }
@@ -158,8 +242,35 @@ impl Triggers {
                 if rule.instant == finalized {
                     continue;
                 }
+                if rule.once && self.fired_once.contains(&(route_id, idx)) {
+                    continue;
+                }
+                let mut matched = false;
                 for caps in rule.regex.captures_iter(text) {
-                    actions.push(resolve(&rule.action, &caps));
+                    if self.has_feed_screen
+                        && screen_text.is_none()
+                        && matches!(
+                            rule.action,
+                            TriggerAction::Coprocess {
+                                feed_screen: true,
+                                ..
+                            }
+                        )
+                    {
+                        screen_text = Some(capture_screen(term));
+                    }
+                    actions.push(resolve(&rule.action, &caps, screen_text.as_deref()));
+                    matched = true;
+                    // A `once` rule fires a single action per line even
+                    // when the pattern occurs several times — otherwise
+                    // it would emit N notifications/runs before
+                    // fired_once is set after the loop.
+                    if rule.once {
+                        break;
+                    }
+                }
+                if matched && rule.once {
+                    self.fired_once.insert((route_id, idx));
                 }
             }
         }
@@ -193,7 +304,11 @@ impl Triggers {
                     continue;
                 };
                 let rgba = rgba_u8(*color);
-                for caps in rule.regex.captures_iter(&text) {
+                // Cap matches per rule per line: a pathological pattern
+                // on adversarial output could otherwise push an unbounded
+                // number of ranges every frame (this runs under the
+                // terminal lock, on the render path).
+                for caps in rule.regex.captures_iter(&text).take(256) {
                     if let Some((start, end)) = span(&text, &caps) {
                         out.push((Pos::new(line, start)..=Pos::new(line, end), rgba));
                     }
@@ -202,6 +317,19 @@ impl Triggers {
         }
         out
     }
+}
+
+/// Visible screen plus recent scrollback as one newline-joined string, for a
+/// feed_screen coprocess. Recent history is included so a multi-line block
+/// that has scrolled partly above the visible area is still captured whole.
+fn capture_screen<T: EventListener>(term: &Crosswords<T>) -> String {
+    let grid = &term.grid;
+    let screen_lines = grid.screen_lines() as i32;
+    let start = grid.topmost_line().0.max(-FEED_HISTORY_LINES);
+    (start..screen_lines)
+        .map(|i| extract_line_text(term, Line(i)))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Match span as cell columns (onig reports byte offsets; columns are
@@ -213,7 +341,11 @@ fn span(text: &str, caps: &onig::Captures) -> Option<(Column, Column)> {
     Some((Column(start), Column(end.max(start))))
 }
 
-fn resolve(action: &TriggerAction, caps: &onig::Captures) -> ResolvedAction {
+fn resolve(
+    action: &TriggerAction,
+    caps: &onig::Captures,
+    screen: Option<&str>,
+) -> ResolvedAction {
     match action {
         TriggerAction::Notify {
             title,
@@ -232,9 +364,18 @@ fn resolve(action: &TriggerAction, caps: &onig::Captures) -> ResolvedAction {
         TriggerAction::SendText { text } => {
             ResolvedAction::SendText(substitute(text, caps))
         }
-        TriggerAction::Coprocess { program, args } => ResolvedAction::Coprocess {
+        TriggerAction::Coprocess {
+            program,
+            args,
+            feed_screen,
+        } => ResolvedAction::Coprocess {
             program: program.clone(),
             args: args.iter().map(|a| substitute(a, caps)).collect(),
+            stdin: if *feed_screen {
+                screen.map(str::to_owned)
+            } else {
+                None
+            },
         },
         // Handled by `highlights()`; `scan` skips it.
         TriggerAction::Highlight { .. } => ResolvedAction::SendText(String::new()),
