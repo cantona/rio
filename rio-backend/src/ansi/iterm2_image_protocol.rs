@@ -15,6 +15,22 @@ use std::str;
 use crate::simd_base64;
 use crate::simd_utf8;
 
+/// Decode an image with bounded resources. Caps total allocation and
+/// per-dimension size so an attacker-supplied payload can't OOM the
+/// process (decompression bomb) before the size clamp downstream.
+fn decode_limited(buffer: &[u8]) -> image_rs::ImageResult<image_rs::DynamicImage> {
+    use std::io::Cursor;
+    let mut limits = image_rs::Limits::default();
+    limits.max_image_width = Some(16384);
+    limits.max_image_height = Some(16384);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    let mut reader = image_rs::ImageReader::new(Cursor::new(buffer))
+        .with_guessed_format()
+        .map_err(image_rs::ImageError::IoError)?;
+    reader.limits(limits);
+    reader.decode()
+}
+
 /// Parse the OSC 1337 parameters to add a graphic to the grid.
 pub fn parse(params: &[&[u8]]) -> Option<GraphicData> {
     let (params, contents) = param_values(params)?;
@@ -31,7 +47,12 @@ pub fn parse(params: &[&[u8]]) -> Option<GraphicData> {
         }
     };
 
-    let image = match image_rs::load_from_memory(&buffer) {
+    // Bound decode allocation: a small OSC 1337 payload can declare huge
+    // dimensions (or use a multi-strip compressed TIFF) and OOM the
+    // process during decode — the post-decode MAX_GRAPHIC_DIMENSIONS
+    // clamp runs too late to stop it. ImageReader.limits caps the
+    // allocation before pixels are materialized.
+    let image = match decode_limited(&buffer) {
         Ok(image) => image,
         Err(err) => {
             tracing::warn!("Can't load image: {}", err);

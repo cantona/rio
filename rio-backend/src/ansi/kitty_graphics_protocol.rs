@@ -1315,17 +1315,33 @@ fn create_graphic_data(cmd: &KittyGraphicsCommand) -> Result<GraphicData, Graphi
             use image_rs::ImageFormat;
 
             debug!("Decoding PNG, pixel_data length: {}", pixel_data.len());
-            let img = match image_rs::load_from_memory_with_format(
-                &pixel_data,
-                ImageFormat::Png,
-            ) {
-                Ok(img) => {
-                    debug!("PNG decoded successfully: {}x{}", img.width(), img.height());
-                    img
-                }
-                Err(e) => {
-                    debug!("PNG decode failed: {:?}", e);
-                    return Err(GraphicError::InvalidData);
+            // Bound decode allocation before pixels are materialized: a
+            // small PNG can declare huge dimensions and OOM the process
+            // (the MAX_DIMENSION check below only runs post-decode).
+            let img = {
+                use std::io::Cursor;
+                let mut limits = image_rs::Limits::default();
+                limits.max_image_width = Some(MAX_DIMENSION);
+                limits.max_image_height = Some(MAX_DIMENSION);
+                limits.max_alloc = Some(256 * 1024 * 1024);
+                let mut reader = image_rs::ImageReader::with_format(
+                    Cursor::new(&pixel_data),
+                    ImageFormat::Png,
+                );
+                reader.limits(limits);
+                match reader.decode() {
+                    Ok(img) => {
+                        debug!(
+                            "PNG decoded successfully: {}x{}",
+                            img.width(),
+                            img.height()
+                        );
+                        img
+                    }
+                    Err(e) => {
+                        debug!("PNG decode failed: {:?}", e);
+                        return Err(GraphicError::InvalidData);
+                    }
                 }
             };
             // PNG dimensions come from the decoded header — now enforce
