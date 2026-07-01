@@ -1641,6 +1641,228 @@ impl<U: EventListener> Crosswords<U> {
         text.strip_suffix('\n').map(str::to_owned).unwrap_or(text)
     }
 
+    /// Serialize history + visible rows into a styled ANSI stream: text
+    /// plus minimal SGR runs, replayable through the parser to rebuild
+    /// the same content in a fresh terminal. At most the last
+    /// `max_lines` rows are emitted; trailing blank rows are dropped.
+    pub fn scrollback_to_ansi(&self, max_lines: usize) -> String {
+        use crate::config::colors::AnsiColor;
+        use crate::crosswords::style::{Style, StyleFlags};
+        use std::fmt::Write as _;
+
+        fn push_color(out: &mut String, color: AnsiColor, is_fg: bool) {
+            let (normal, bright, extended) =
+                if is_fg { (30, 90, 38) } else { (40, 100, 48) };
+            match color {
+                AnsiColor::Named(n) => {
+                    let idx = n as usize;
+                    match idx {
+                        0..=7 => {
+                            let _ = write!(out, "\x1b[{}m", normal + idx);
+                        }
+                        8..=15 => {
+                            let _ = write!(out, "\x1b[{}m", bright + idx - 8);
+                        }
+                        // Foreground/Background and the Dim* variants map
+                        // to the reset default, which SGR 0 already set.
+                        _ => {}
+                    }
+                }
+                AnsiColor::Indexed(i) => {
+                    let _ = write!(out, "\x1b[{extended};5;{i}m");
+                }
+                AnsiColor::Spec(rgb) => {
+                    let _ =
+                        write!(out, "\x1b[{extended};2;{};{};{}m", rgb.r, rgb.g, rgb.b);
+                }
+            }
+        }
+
+        fn push_sgr(out: &mut String, style: &Style) {
+            out.push_str("\x1b[0m");
+            if *style == Style::default() {
+                return;
+            }
+            let f = style.flags;
+            // Non-underline attributes as plain SGR codes.
+            for (flag, code) in [
+                (StyleFlags::BOLD, 1),
+                (StyleFlags::DIM, 2),
+                (StyleFlags::ITALIC, 3),
+                (StyleFlags::INVERSE, 7),
+                (StyleFlags::HIDDEN, 8),
+                (StyleFlags::STRIKEOUT, 9),
+            ] {
+                if f.contains(flag) {
+                    let _ = write!(out, "\x1b[{code}m");
+                }
+            }
+            // Underline variants use the colon subparameter forms that
+            // rio's parser round-trips (4:2/4:3/4:4/4:5). SGR 21 is NOT
+            // double-underline in rio (and xterm/kitty/alacritty) — it
+            // is bold-off, so the plain `4`/`4:2..` family is required.
+            let underline = if f.contains(StyleFlags::DOUBLE_UNDERLINE) {
+                Some("4:2")
+            } else if f.contains(StyleFlags::UNDERCURL) {
+                Some("4:3")
+            } else if f.contains(StyleFlags::DOTTED_UNDERLINE) {
+                Some("4:4")
+            } else if f.contains(StyleFlags::DASHED_UNDERLINE) {
+                Some("4:5")
+            } else if f.contains(StyleFlags::UNDERLINE) {
+                Some("4")
+            } else {
+                None
+            };
+            if let Some(code) = underline {
+                let _ = write!(out, "\x1b[{code}m");
+            }
+            push_color(out, style.fg, true);
+            push_color(out, style.bg, false);
+        }
+
+        let bottom = self.grid.bottommost_line().0;
+        // Clamp to i32 before the cast: a config value near usize::MAX
+        // would overflow (debug panic) or wrap negative (empty dump).
+        let span = max_lines.saturating_sub(1).min(i32::MAX as usize) as i32;
+        let top = self.grid.topmost_line().0.max(bottom - span);
+
+        let mut out = String::new();
+        let mut current = Style::default();
+        let mut pending_newlines = 0usize;
+        let mut pending_blanks = 0usize;
+
+        // A space is only truly "blank" (safe to run-length collapse in
+        // the default style) when NOTHING about it is visible: default
+        // bg, not inverse, and none of the space-visible line attributes
+        // (underline family / strikeout). Otherwise it must be emitted as
+        // a styled cell.
+        let is_visible_blank_style = |style: &Style| -> bool {
+            style.bg == Style::default().bg
+                && !style.flags.intersects(
+                    StyleFlags::INVERSE
+                        | StyleFlags::UNDERLINE
+                        | StyleFlags::UNDERCURL
+                        | StyleFlags::DOTTED_UNDERLINE
+                        | StyleFlags::DASHED_UNDERLINE
+                        | StyleFlags::DOUBLE_UNDERLINE
+                        | StyleFlags::STRIKEOUT,
+                )
+        };
+
+        for line in (top..=bottom).map(Line::from) {
+            let grid_line = &self.grid[line];
+            // line_length excludes a trailing styled-bg / bg-only tail
+            // (those cells report c()=='\0'); scan the full width so a
+            // colored clear-to-EOL region (status bars, themed prompts)
+            // survives restore.
+            let mut scan_len = grid_line.line_length().0;
+            let width = self.grid.columns();
+            while scan_len < width && grid_line[Column(scan_len)].is_bg_only() {
+                scan_len += 1;
+            }
+
+            for column in (0..scan_len).map(Column::from) {
+                let cell = &grid_line[column];
+                if matches!(cell.wide(), Wide::Spacer | Wide::LeadingSpacer) {
+                    continue;
+                }
+
+                let c = cell.c();
+                let style = if cell.is_bg_only() {
+                    Style {
+                        bg: match cell.content_tag() {
+                            square::ContentTag::BgRgb => {
+                                let (r, g, b) = cell.bg_rgb();
+                                AnsiColor::Spec(crate::config::colors::ColorRgb {
+                                    r,
+                                    g,
+                                    b,
+                                })
+                            }
+                            _ => AnsiColor::Indexed(cell.bg_palette_index()),
+                        },
+                        ..Style::default()
+                    }
+                } else {
+                    self.grid.style_set.get(cell.style_id())
+                };
+
+                let is_blank = (c == '\0' || c == ' ') && is_visible_blank_style(&style);
+                // extras_id() is only meaningful on a Codepoint cell;
+                // on a bg-only cell those bits are the bg color, so
+                // gate the check (a bg-only cell has no zero-width
+                // extras to preserve anyway).
+                if is_blank && (cell.is_bg_only() || cell.extras_id().is_none()) {
+                    pending_blanks += 1;
+                    continue;
+                }
+
+                for _ in 0..std::mem::take(&mut pending_newlines) {
+                    out.push_str("\r\n");
+                }
+                // Flush gap blanks in the DEFAULT style: `current` may
+                // carry a bg/underline/inverse that would otherwise paint
+                // these spaces (color/underline bleed across the gap).
+                let blanks = std::mem::take(&mut pending_blanks);
+                if blanks > 0 {
+                    if current != Style::default() {
+                        push_sgr(&mut out, &Style::default());
+                        current = Style::default();
+                    }
+                    for _ in 0..blanks {
+                        out.push(' ');
+                    }
+                }
+                if style != current {
+                    push_sgr(&mut out, &style);
+                    current = style;
+                }
+                out.push(if c == '\0' { ' ' } else { c });
+                // Only Codepoint cells carry a real extras_id: a bg-only
+                // cell reuses those bits for its bg color, so reading
+                // extras_id() there aliases an unrelated live slot and
+                // would inject that slot's zero-width chars (stray
+                // combining marks) into the dump. The trailing bg-only
+                // scan above made such cells reachable here.
+                if !cell.is_bg_only() {
+                    if let Some(eid) = cell.extras_id() {
+                        if let Some(extras) = self.grid.extras_table.get(eid) {
+                            out.extend(extras.zerowidth.iter());
+                        }
+                    }
+                }
+            }
+
+            if grid_line[self.grid.last_column()].wrapline() {
+                // Soft-wrapped row: NO newline (replay re-wraps). Its
+                // trailing spaces are real content — flush them so the
+                // next row isn't spliced on. This holds even for a
+                // fully-blank wrapped row (had_content == false): its
+                // width of spaces must be emitted, or the row vanishes
+                // and everything below it shifts up one line.
+                let blanks = std::mem::take(&mut pending_blanks);
+                if blanks > 0 {
+                    if current != Style::default() {
+                        push_sgr(&mut out, &Style::default());
+                        current = Style::default();
+                    }
+                    for _ in 0..blanks {
+                        out.push(' ');
+                    }
+                }
+            } else {
+                pending_blanks = 0;
+                pending_newlines += 1;
+            }
+        }
+
+        if !out.is_empty() {
+            out.push_str("\x1b[0m\r\n");
+        }
+        out
+    }
+
     /// Convert a single line in the grid to a String. Used by Block selection;
     /// trailing blank cells are dropped. No trailing newline is appended —
     /// the caller controls row separation.
@@ -6733,5 +6955,166 @@ mod tests {
 
         // Cursor must be untouched.
         assert_eq!(cw.grid.cursor.pos, cursor_before);
+    }
+
+    /// scrollback_to_ansi output replayed into a fresh terminal must
+    /// reproduce the same text and cell styles.
+    #[test]
+    fn scrollback_ansi_round_trip() {
+        use crate::performer::handler::Processor;
+        let mut cw = new_term(20, 5);
+        let mut processor = Processor::default();
+        processor.advance(
+            &mut cw,
+            b"plain\r\n\x1b[1;31mbold red\x1b[0m\r\n\x1b[44m  \x1b[0m gap\r\n\x1b[38;5;208morange\x1b[0m",
+        );
+
+        let dump = cw.scrollback_to_ansi(100);
+
+        let mut replayed = new_term(20, 5);
+        let mut rp = Processor::default();
+        rp.advance(&mut replayed, dump.as_bytes());
+
+        for line in 0..4 {
+            for col in 0..20 {
+                let a = &cw.grid[Line(line)][Column(col)];
+                let b = &replayed.grid[Line(line)][Column(col)];
+                let (ca, cb) = (a.c(), b.c());
+                let norm = |c: char| if c == '\0' { ' ' } else { c };
+                assert_eq!(
+                    norm(ca),
+                    norm(cb),
+                    "text mismatch at ({line},{col}): {ca:?} vs {cb:?}"
+                );
+                let sa = cw.grid.style_set.get(a.style_id());
+                let sb = replayed.grid.style_set.get(b.style_id());
+                if !a.is_bg_only() && !b.is_bg_only() && norm(ca) != ' ' {
+                    assert_eq!(sa, sb, "style mismatch at ({line},{col})");
+                }
+            }
+        }
+
+        // The blue-bg blank cells must survive (bg-only or styled space).
+        let bg_cell = replayed.grid[Line(2)][Column(0)];
+        let has_bg = if bg_cell.is_bg_only() {
+            true
+        } else {
+            replayed.grid.style_set.get(bg_cell.style_id()).bg
+                != crate::crosswords::style::Style::default().bg
+        };
+        assert!(has_bg, "blue background lost in round trip");
+    }
+
+    #[test]
+    fn scrollback_ansi_no_style_bleed_onto_gap() {
+        // A colored-bg run followed by spaces then a default char: the
+        // spaces must NOT inherit the run's bg (the gap-blank style-reset
+        // fix). Regression for the "red 2-cell block becomes 5-cell".
+        use crate::performer::handler::Processor;
+        let mut cw = new_term(20, 3);
+        let mut processor = Processor::default();
+        processor.advance(&mut cw, b"\x1b[41mAB\x1b[0m   C");
+
+        let dump = cw.scrollback_to_ansi(100);
+        let mut replayed = new_term(20, 3);
+        Processor::default().advance(&mut replayed, dump.as_bytes());
+
+        use crate::config::colors::AnsiColor;
+        let default_bg = crate::crosswords::style::Style::default().bg;
+        for col in 2..5 {
+            let cell = replayed.grid[Line(0)][Column(col)];
+            let bg = if cell.is_bg_only() {
+                AnsiColor::Indexed(cell.bg_palette_index())
+            } else {
+                replayed.grid.style_set.get(cell.style_id()).bg
+            };
+            assert_eq!(
+                bg, default_bg,
+                "gap space at col {col} inherited the run bg"
+            );
+        }
+    }
+
+    #[test]
+    fn scrollback_ansi_double_underline_round_trips() {
+        // SGR 21 is bold-off in rio's parser; a double-underlined cell
+        // must serialize as 4:2, not 21 (which would cancel bold).
+        use crate::crosswords::style::StyleFlags;
+        use crate::performer::handler::Processor;
+        let mut cw = new_term(10, 2);
+        Processor::default().advance(&mut cw, b"\x1b[1m\x1b[4:2mDU");
+
+        let dump = cw.scrollback_to_ansi(100);
+        let mut replayed = new_term(10, 2);
+        Processor::default().advance(&mut replayed, dump.as_bytes());
+
+        let cell = replayed.grid[Line(0)][Column(0)];
+        let style = replayed.grid.style_set.get(cell.style_id());
+        assert!(
+            style.flags.contains(StyleFlags::DOUBLE_UNDERLINE),
+            "double underline lost"
+        );
+        assert!(
+            style.flags.contains(StyleFlags::BOLD),
+            "bold cancelled by SGR 21"
+        );
+    }
+
+    #[test]
+    fn scrollback_ansi_wrapped_row_keeps_trailing_spaces() {
+        // A soft-wrapped full row ending in real spaces must not merge
+        // with the continuation row on replay.
+        use crate::performer::handler::Processor;
+        let mut cw = new_term(20, 4);
+        Processor::default().advance(&mut cw, b"aaaaaaaaaaaaaaaaa   bbb");
+
+        let dump = cw.scrollback_to_ansi(100);
+        let mut replayed = new_term(20, 4);
+        Processor::default().advance(&mut replayed, dump.as_bytes());
+
+        // Row 0 keeps its 'a's + trailing spaces; 'b's stay on row 1.
+        let row1: String = (0..3)
+            .map(|c| replayed.grid[Line(1)][Column(c)].c())
+            .collect();
+        assert_eq!(row1, "bbb", "wrapped row merged into the previous one");
+    }
+
+    #[test]
+    fn scrollback_ansi_bg_only_cell_no_foreign_zerowidth() {
+        // A truecolor clear-to-EOL cell reuses the extras_id bits for
+        // its bg blue channel; the serializer must NOT read extras_id
+        // on a bg-only cell (it would alias a live slot and inject that
+        // slot's combining marks). Regression for the data-corruption
+        // the trailing-bg scan exposed.
+        use crate::performer::handler::Processor;
+        let mut cw = new_term(20, 3);
+        // A combining mark on row 0 populates an extras slot (id 1),
+        // then a truecolor bg (blue=1) clear-to-EOL on row 1.
+        Processor::default().advance(&mut cw, b"e\xcc\x81\r\n\x1b[48;2;10;20;1mX\x1b[K");
+
+        let dump = cw.scrollback_to_ansi(100);
+        // The dump must not contain a stray U+0301 (0xcc 0x81) after the
+        // 'X' — only the one that legitimately follows 'e' on row 0.
+        let occurrences = dump.matches('\u{0301}').count();
+        assert_eq!(occurrences, 1, "foreign combining mark injected: {dump:?}");
+    }
+
+    #[test]
+    fn scrollback_ansi_blank_wrapped_row_preserved() {
+        // A fully-blank soft-wrapped middle row must not be dropped, or
+        // content below it shifts up one line.
+        use crate::performer::handler::Processor;
+        let mut cw = new_term(10, 4);
+        Processor::default().advance(&mut cw, b"AAAAAAAAAA          B");
+
+        let dump = cw.scrollback_to_ansi(100);
+        let mut replayed = new_term(10, 4);
+        Processor::default().advance(&mut replayed, dump.as_bytes());
+        // 'B' stays on row 2 (after the A-row and the blank wrapped row).
+        assert_eq!(
+            replayed.grid[Line(2)][Column(0)].c(),
+            'B',
+            "blank wrapped row dropped"
+        );
     }
 }
