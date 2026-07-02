@@ -13,6 +13,22 @@ pub fn default_tab_font_size() -> f32 {
 }
 
 #[inline]
+pub fn default_tab_max_width() -> f32 {
+    180.0
+}
+
+pub fn default_tab_gap() -> f32 {
+    6.0
+}
+
+pub fn default_tab_inset_y() -> f32 {
+    7.0
+}
+
+pub fn default_tab_radius() -> f32 {
+    6.0
+}
+
 pub fn default_tab_bar_height() -> f32 {
     34.0
 }
@@ -166,6 +182,35 @@ pub struct Navigation {
     /// Height (in logical pixels) of the tab strip / island bar.
     #[serde(default = "default_tab_bar_height", rename = "tab-bar-height")]
     pub tab_bar_height: f32,
+    /// Maximum width (logical px) of one tab. 0 = no cap: tabs expand
+    /// to fill the whole strip.
+    #[serde(default = "default_tab_max_width", rename = "tab-max-width")]
+    pub tab_max_width: f32,
+    /// Horizontal gap (logical px) between tab islands. 0 = tabs touch.
+    #[serde(default = "default_tab_gap", rename = "tab-gap")]
+    pub tab_gap: f32,
+    /// Vertical inset (logical px) of each island inside the strip.
+    /// 0 = tabs fill the full bar height (classic flat strip).
+    #[serde(default = "default_tab_inset_y", rename = "tab-inset-y")]
+    pub tab_inset_y: f32,
+    /// Corner radius of each tab island. 0 = square corners.
+    #[serde(default = "default_tab_radius", rename = "tab-radius")]
+    pub tab_radius: f32,
+    /// Explicit island fill for inactive tabs. When unset, fills adapt
+    /// to the window background's luminance.
+    #[serde(
+        default = "Option::default",
+        deserialize_with = "deserialize_to_arr_opt",
+        rename = "tab-fill"
+    )]
+    pub tab_fill: Option<ColorArray>,
+    /// Explicit island fill for the active tab.
+    #[serde(
+        default = "Option::default",
+        deserialize_with = "deserialize_to_arr_opt",
+        rename = "tab-fill-active"
+    )]
+    pub tab_fill_active: Option<ColorArray>,
 }
 
 impl Default for Navigation {
@@ -183,6 +228,12 @@ impl Default for Navigation {
             open_config_with_split: true,
             tab_font_size: default_tab_font_size(),
             tab_bar_height: default_tab_bar_height(),
+            tab_max_width: default_tab_max_width(),
+            tab_gap: default_tab_gap(),
+            tab_inset_y: default_tab_inset_y(),
+            tab_radius: default_tab_radius(),
+            tab_fill: None,
+            tab_fill_active: None,
         }
     }
 }

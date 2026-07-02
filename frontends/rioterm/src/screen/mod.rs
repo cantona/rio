@@ -445,7 +445,12 @@ impl Screen<'_> {
         if let Some(mut island) = old_island {
             island.update_colors(config.colors.tabs, config.colors.tabs_active);
             island.title_font_size = config.navigation.tab_font_size;
-            island.tab_bar_height = config.navigation.tab_bar_height;
+            island.geom =
+                crate::renderer::island::TabGeom::from_navigation(&config.navigation);
+            island.fill_override = (
+                config.navigation.tab_fill,
+                config.navigation.tab_fill_active,
+            );
             self.renderer.island = Some(island);
         }
 
@@ -2611,6 +2616,7 @@ impl Screen<'_> {
             self.sugarloaf.window_size().width,
             self.sugarloaf.scale_factor(),
             num_tabs,
+            self.renderer.navigation.tab_max_width,
         )
     }
 
@@ -2680,7 +2686,7 @@ impl Screen<'_> {
                 &self.island_tab_layout(num_tabs),
                 self.context_manager.current_index(),
                 mouse_x as f32 / scale_factor,
-                self.renderer.navigation.tab_bar_height,
+                island::TabGeom::from_navigation(&self.renderer.navigation),
             );
 
         self.apply_close_hover(hovering)
@@ -2768,7 +2774,7 @@ impl Screen<'_> {
                 &layout,
                 self.context_manager.current_index(),
                 mouse_x_unscaled,
-                self.renderer.navigation.tab_bar_height,
+                island::TabGeom::from_navigation(&self.renderer.navigation),
             )
         {
             return true;
@@ -2834,7 +2840,7 @@ impl Screen<'_> {
                 &layout,
                 clicked_tab,
                 mouse_x_unscaled,
-                self.renderer.navigation.tab_bar_height,
+                island::TabGeom::from_navigation(&self.renderer.navigation),
             )
         {
             self.stop_hint_mode_if_active();
