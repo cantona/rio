@@ -196,6 +196,11 @@ pub struct Navigation {
     /// Corner radius of each tab island. 0 = square corners.
     #[serde(default = "default_tab_radius", rename = "tab-radius")]
     pub tab_radius: f32,
+    /// Show the close button on the hovered tab (Terminal.app style)
+    /// and let its click close that tab. When false the close button
+    /// only exists on the active tab.
+    #[serde(default = "default_bool_true", rename = "tab-close-on-hover")]
+    pub tab_close_on_hover: bool,
     /// Explicit island fill for inactive tabs. When unset, fills adapt
     /// to the window background's luminance.
     #[serde(
@@ -232,6 +237,7 @@ impl Default for Navigation {
             tab_gap: default_tab_gap(),
             tab_inset_y: default_tab_inset_y(),
             tab_radius: default_tab_radius(),
+            tab_close_on_hover: true,
             tab_fill: None,
             tab_fill_active: None,
         }

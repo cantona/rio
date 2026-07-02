@@ -451,6 +451,7 @@ impl Screen<'_> {
                 config.navigation.tab_fill,
                 config.navigation.tab_fill_active,
             );
+            island.close_on_hover = config.navigation.tab_close_on_hover;
             self.renderer.island = Some(island);
         }
 
@@ -2679,22 +2680,47 @@ impl Screen<'_> {
         let num_tabs = self.context_manager.len();
         let scale_factor = self.sugarloaf.scale_factor();
 
-        let hovering = num_tabs > 1
+        let in_bar = num_tabs > 1
             && self.renderer.navigation.island_visible(num_tabs)
-            && mouse_y <= (self.renderer.navigation.tab_bar_height * scale_factor) as f64
-            && island::close_button_hit(
-                &self.island_tab_layout(num_tabs),
-                self.context_manager.current_index(),
-                mouse_x as f32 / scale_factor,
-                island::TabGeom::from_navigation(&self.renderer.navigation),
-            );
+            && mouse_y <= (self.renderer.navigation.tab_bar_height * scale_factor) as f64;
+        let layout = self.island_tab_layout(num_tabs);
+        let x_unscaled = mouse_x as f32 / scale_factor;
+        let hovered_tab = (in_bar && layout.tab_width > 0.0)
+            .then(|| ((x_unscaled - layout.left_margin) / layout.tab_width) as usize)
+            .filter(|idx| *idx < num_tabs);
+        let hovering = hovered_tab.is_some_and(|idx| {
+            (self.renderer.navigation.tab_close_on_hover
+                || idx == self.context_manager.current_index())
+                && island::close_button_hit(
+                    &layout,
+                    idx,
+                    x_unscaled,
+                    island::TabGeom::from_navigation(&self.renderer.navigation),
+                )
+        });
 
-        self.apply_close_hover(hovering)
+        let tab_changed = self
+            .renderer
+            .island
+            .as_mut()
+            .is_some_and(|island| island.set_hovered_tab(hovered_tab));
+        if tab_changed {
+            self.mark_dirty();
+        }
+        self.apply_close_hover(hovering) || tab_changed
     }
 
     #[inline]
     pub fn clear_close_button_hover(&mut self) -> bool {
-        self.apply_close_hover(false)
+        let tab_changed = self
+            .renderer
+            .island
+            .as_mut()
+            .is_some_and(|island| island.set_hovered_tab(None));
+        if tab_changed {
+            self.mark_dirty();
+        }
+        self.apply_close_hover(false) || tab_changed
     }
 
     pub fn handle_island_click(
@@ -2835,7 +2861,8 @@ impl Screen<'_> {
             return true;
         }
 
-        if clicked_tab == self.context_manager.current_index()
+        if (self.renderer.navigation.tab_close_on_hover
+            || clicked_tab == self.context_manager.current_index())
             && island::close_button_hit(
                 &layout,
                 clicked_tab,
@@ -2845,6 +2872,9 @@ impl Screen<'_> {
         {
             self.stop_hint_mode_if_active();
             self.last_close_press = Some((std::time::Instant::now(), mouse_x_unscaled));
+            if clicked_tab != self.context_manager.current_index() {
+                self.context_manager.select_tab(clicked_tab);
+            }
             self.close_tab(clipboard);
             return true;
         }
