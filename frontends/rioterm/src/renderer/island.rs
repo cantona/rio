@@ -211,6 +211,8 @@ struct IslandFills {
     active: [f32; 4],
     outline: Option<[f32; 4]>,
     close_hover: [f32; 4],
+    /// Overlay composited onto an inactive island under the pointer.
+    hover: [f32; 4],
 }
 
 fn island_fills(bg: [f32; 4]) -> IslandFills {
@@ -221,6 +223,7 @@ fn island_fills(bg: [f32; 4]) -> IslandFills {
             active: [1.0, 1.0, 1.0, 0.92],
             outline: Some([0.0, 0.0, 0.0, 0.14]),
             close_hover: [0.0, 0.0, 0.0, 0.09],
+            hover: [0.0, 0.0, 0.0, 0.08],
         }
     } else {
         IslandFills {
@@ -228,6 +231,7 @@ fn island_fills(bg: [f32; 4]) -> IslandFills {
             active: [1.0, 1.0, 1.0, 0.18],
             outline: None,
             close_hover: [1.0, 1.0, 1.0, 0.14],
+            hover: [1.0, 1.0, 1.0, 0.10],
         }
     }
 }
@@ -398,6 +402,11 @@ pub struct Island {
     /// Cursor is over the active island's close button — draws the
     /// hover backdrop. Updated on every cursor move by `Screen`.
     close_hover: bool,
+    /// Tab slot currently under the pointer (hover highlight).
+    hovered_tab: Option<usize>,
+    /// `[navigation] tab-close-on-hover` — show the close button on
+    /// the hovered tab, not only the active one.
+    pub close_on_hover: bool,
 }
 
 impl Island {
@@ -430,11 +439,19 @@ impl Island {
             slide_springs: FxHashMap::default(),
             last_anim_frame: Instant::now(),
             close_hover: false,
+            hovered_tab: None,
+            close_on_hover: true,
         }
     }
 
     /// Set whether the cursor hovers the active island's close button.
     /// Returns true when the state changed (the caller redraws).
+    pub fn set_hovered_tab(&mut self, tab: Option<usize>) -> bool {
+        let changed = self.hovered_tab != tab;
+        self.hovered_tab = tab;
+        changed
+    }
+
     pub fn set_close_hover(&mut self, hover: bool) -> bool {
         let changed = self.close_hover != hover;
         self.close_hover = hover;
@@ -918,7 +935,7 @@ impl Island {
             // bleach custom colors to pastel on light themes, so the
             // hierarchy is carried by the mute instead.
             let (ix, iy, iw, ih, radius) = island_rect(tab_x, tab_width, self.geom);
-            let fill = match context_manager.custom_color(tab_index) {
+            let mut fill = match context_manager.custom_color(tab_index) {
                 Some(mut custom) => {
                     if !is_active {
                         custom[3] *= INACTIVE_CUSTOM_MUTE;
@@ -933,6 +950,9 @@ impl Island {
                     }
                 }
             };
+            if !is_active && self.hovered_tab == Some(tab_index) {
+                fill = over(fill, fills.hover);
+            }
             draw_island(
                 sugarloaf,
                 ix,
@@ -946,9 +966,14 @@ impl Island {
                 0,
             );
 
-            if is_active && num_tabs > 1 {
+            // Close affordance on the active tab and on whichever tab
+            // the pointer hovers (Terminal.app behavior).
+            let is_hovered = self.hovered_tab == Some(tab_index);
+            let shows_close = is_active || (is_hovered && self.close_on_hover);
+            if shows_close && num_tabs > 1 {
                 if let Some(cx) = close_button_center(ix, iw) {
-                    if self.close_hover {
+                    let close_hovered = self.close_hover && is_hovered;
+                    if close_hovered {
                         sugarloaf.rounded_rect(
                             None,
                             cx - CLOSE_HOVER_HALF,
@@ -964,8 +989,12 @@ impl Island {
                     draw_close_button(
                         sugarloaf,
                         cx,
-                        self.active_text_color,
-                        self.close_hover,
+                        if is_active {
+                            self.active_text_color
+                        } else {
+                            self.inactive_text_color
+                        },
+                        close_hovered,
                         2,
                         self.geom.bar_height,
                     );
