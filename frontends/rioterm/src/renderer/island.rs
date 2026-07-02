@@ -21,10 +21,53 @@ const PROGRESS_BAR_HEIGHT: f32 = 3.0;
 
 const PROGRESS_BAR_TIMEOUT_SECS: u64 = 15;
 
+/// Configurable tab-strip geometry ([navigation] tab-bar-height /
+/// tab-gap / tab-inset-y / tab-radius). Defaults reproduce the stock
+/// floating-island look; gap = inset = radius = 0 gives a flat strip.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TabGeom {
+    pub bar_height: f32,
+    pub gap: f32,
+    pub inset_y: f32,
+    pub radius: f32,
+    /// Per-tab width cap; `0` disables the cap so tabs expand to
+    /// fill the strip.
+    pub max_tab_width: f32,
+}
+
+impl TabGeom {
+    pub fn from_navigation(nav: &rio_backend::config::navigation::Navigation) -> Self {
+        Self {
+            bar_height: nav.tab_bar_height,
+            gap: nav.tab_gap,
+            inset_y: nav.tab_inset_y,
+            radius: nav.tab_radius,
+            max_tab_width: nav.tab_max_width,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for TabGeom {
+    fn default() -> Self {
+        Self {
+            bar_height: ISLAND_HEIGHT,
+            gap: TAB_GAP,
+            inset_y: TAB_INSET_Y,
+            radius: TAB_RADIUS,
+            max_tab_width: MAX_TAB_WIDTH,
+        }
+    }
+}
+
 const TAB_PADDING_X: f32 = 27.0;
+#[cfg(test)]
 const MAX_TAB_WIDTH: f32 = 180.0;
+#[cfg(test)]
 const TAB_GAP: f32 = 6.0;
+#[cfg(test)]
 const TAB_INSET_Y: f32 = 7.0;
+#[cfg(test)]
 const TAB_RADIUS: f32 = 6.0;
 const TITLE_ELLIPSIS: char = '…';
 const DRAG_THRESHOLD: f32 = 4.0;
@@ -141,6 +184,7 @@ pub fn tab_strip_layout(
     window_width: f32,
     scale_factor: f32,
     num_tabs: usize,
+    max_tab_width: f32,
 ) -> TabStripLayout {
     #[cfg(target_os = "macos")]
     let left_margin = ISLAND_MARGIN_LEFT_MACOS;
@@ -149,7 +193,12 @@ pub fn tab_strip_layout(
 
     let available_width =
         (window_width / scale_factor) - ISLAND_MARGIN_RIGHT - left_margin;
-    let tab_width = (available_width / num_tabs.max(1) as f32).clamp(0.0, MAX_TAB_WIDTH);
+    let cap = if max_tab_width > 0.0 {
+        max_tab_width
+    } else {
+        f32::INFINITY
+    };
+    let tab_width = (available_width / num_tabs.max(1) as f32).clamp(0.0, cap);
     TabStripLayout {
         left_margin,
         tab_width,
@@ -233,16 +282,12 @@ fn draw_island(
 }
 
 #[inline]
-fn island_rect(
-    slot_x: f32,
-    tab_width: f32,
-    bar_height: f32,
-) -> (f32, f32, f32, f32, f32) {
-    let x = slot_x + TAB_GAP / 2.0;
-    let w = (tab_width - TAB_GAP).max(0.0);
-    let y = TAB_INSET_Y;
-    let h = bar_height - TAB_INSET_Y * 2.0;
-    let radius = TAB_RADIUS.min(w / 2.0).min(h / 2.0);
+fn island_rect(slot_x: f32, tab_width: f32, geom: TabGeom) -> (f32, f32, f32, f32, f32) {
+    let x = slot_x + geom.gap / 2.0;
+    let w = (tab_width - geom.gap).max(0.0);
+    let y = geom.inset_y;
+    let h = geom.bar_height - geom.inset_y * 2.0;
+    let radius = geom.radius.min(w / 2.0).min(h / 2.0);
     (x, y, w, h, radius)
 }
 
@@ -256,10 +301,10 @@ fn close_button_center(island_x: f32, island_w: f32) -> Option<f32> {
 fn close_button_center_x(
     layout: &TabStripLayout,
     tab_index: usize,
-    bar_height: f32,
+    geom: TabGeom,
 ) -> Option<f32> {
     let slot_x = layout.left_margin + tab_index as f32 * layout.tab_width;
-    let (ix, _, iw, _, _) = island_rect(slot_x, layout.tab_width, bar_height);
+    let (ix, _, iw, _, _) = island_rect(slot_x, layout.tab_width, geom);
     close_button_center(ix, iw)
 }
 
@@ -268,9 +313,9 @@ pub fn close_button_hit(
     layout: &TabStripLayout,
     tab_index: usize,
     x_unscaled: f32,
-    bar_height: f32,
+    geom: TabGeom,
 ) -> bool {
-    close_button_center_x(layout, tab_index, bar_height)
+    close_button_center_x(layout, tab_index, geom)
         .is_some_and(|cx| (x_unscaled - cx).abs() <= CLOSE_HIT_HALF_WIDTH)
 }
 
@@ -316,7 +361,9 @@ pub struct Island {
     pub hide_if_single: bool,
     /// Tab-title font size in logical pixels (`navigation.tab-font-size`).
     pub title_font_size: f32,
-    pub tab_bar_height: f32,
+    pub geom: TabGeom,
+    /// Explicit (inactive, active) island fills; None = adaptive.
+    pub fill_override: (Option<[f32; 4]>, Option<[f32; 4]>),
     pub inactive_text_color: [f32; 4],
     pub active_text_color: [f32; 4],
     /// Current progress bar state
@@ -359,12 +406,13 @@ impl Island {
         active_text_color: [f32; 4],
         hide_if_single: bool,
         title_font_size: f32,
-        tab_bar_height: f32,
+        geom: TabGeom,
     ) -> Self {
         Self {
             hide_if_single,
             title_font_size,
-            tab_bar_height,
+            geom,
+            fill_override: (None, None),
             inactive_text_color,
             active_text_color,
             progress_state: None,
@@ -648,7 +696,7 @@ impl Island {
         };
 
         let width = window_width / scale_factor;
-        let y_position = self.tab_bar_height;
+        let y_position = self.geom.bar_height;
 
         // Determine color based on state
         let color = match state {
@@ -713,7 +761,7 @@ impl Island {
     /// Get the height of the island
     #[inline]
     pub fn height(&self) -> f32 {
-        self.tab_bar_height
+        self.geom.bar_height
     }
 
     /// Render tabs using equal-width layout
@@ -764,7 +812,12 @@ impl Island {
         self.slide_springs
             .retain(|_, s| s.update(dt, DRAG_ANIMATION_LENGTH));
 
-        let layout = tab_strip_layout(window_width, scale_factor, num_tabs);
+        let layout = tab_strip_layout(
+            window_width,
+            scale_factor,
+            num_tabs,
+            self.geom.max_tab_width,
+        );
         let TabStripLayout {
             left_margin,
             tab_width,
@@ -783,7 +836,14 @@ impl Island {
         // each frame so OSC 11 and theme changes stay coherent. The
         // strip itself keeps the plain window background — the islands
         // float directly on it, with no strip tint or border lines.
-        let fills = island_fills(bg_color);
+        let mut fills = island_fills(bg_color);
+        if let Some(inactive) = self.fill_override.0 {
+            fills.inactive = inactive;
+            fills.outline = None;
+        }
+        if let Some(active) = self.fill_override.1 {
+            fills.active = active;
+        }
 
         // Render each tab
         for tab_index in 0..num_tabs {
@@ -847,7 +907,7 @@ impl Island {
                 let ui = sugarloaf.text_mut();
                 let text_width = ui.measure(&title, &title_opts);
                 let text_x = tab_x + (tab_width - text_width) / 2.0;
-                let text_y = (self.tab_bar_height / 2.0) - (self.title_font_size / 2.);
+                let text_y = (self.geom.bar_height / 2.0) - (self.title_font_size / 2.);
                 ui.draw(text_x, text_y, &title, &title_opts);
             }
 
@@ -857,8 +917,7 @@ impl Island {
             // toward the strip — a white "active" overlay would
             // bleach custom colors to pastel on light themes, so the
             // hierarchy is carried by the mute instead.
-            let (ix, iy, iw, ih, radius) =
-                island_rect(tab_x, tab_width, self.tab_bar_height);
+            let (ix, iy, iw, ih, radius) = island_rect(tab_x, tab_width, self.geom);
             let fill = match context_manager.custom_color(tab_index) {
                 Some(mut custom) => {
                     if !is_active {
@@ -893,7 +952,7 @@ impl Island {
                         sugarloaf.rounded_rect(
                             None,
                             cx - CLOSE_HOVER_HALF,
-                            self.tab_bar_height / 2.0 - CLOSE_HOVER_HALF,
+                            self.geom.bar_height / 2.0 - CLOSE_HOVER_HALF,
                             CLOSE_HOVER_HALF * 2.0,
                             CLOSE_HOVER_HALF * 2.0,
                             fills.close_hover,
@@ -908,7 +967,7 @@ impl Island {
                         self.active_text_color,
                         self.close_hover,
                         2,
-                        self.tab_bar_height,
+                        self.geom.bar_height,
                     );
                 }
             }
@@ -919,8 +978,7 @@ impl Island {
 
         // Draw the floating (dragged) tab above the slot tabs.
         if let (Some(drag_idx), Some(floating_x)) = (drag_index, floating_left) {
-            let (ix, iy, iw, ih, radius) =
-                island_rect(floating_x, tab_width, self.tab_bar_height);
+            let (ix, iy, iw, ih, radius) = island_rect(floating_x, tab_width, self.geom);
 
             // Soft elevation: a slightly inflated dark halo behind the
             // lifted island so it reads as floating over the strip.
@@ -967,7 +1025,7 @@ impl Island {
                     self.active_text_color,
                     false,
                     12,
-                    self.tab_bar_height,
+                    self.geom.bar_height,
                 );
             }
 
@@ -988,7 +1046,7 @@ impl Island {
                 let ui = sugarloaf.text_mut();
                 let text_width = ui.measure(&title, &title_opts);
                 let text_x = floating_x + (tab_width - text_width) / 2.0;
-                let text_y = (self.tab_bar_height / 2.0) - (self.title_font_size / 2.);
+                let text_y = (self.geom.bar_height / 2.0) - (self.title_font_size / 2.);
                 ui.draw(text_x, text_y, &title, &title_opts);
             }
         }
@@ -1123,11 +1181,16 @@ impl Island {
             left_margin,
             tab_width,
             ..
-        } = tab_strip_layout(window_width, scale_factor, num_tabs);
+        } = tab_strip_layout(
+            window_width,
+            scale_factor,
+            num_tabs,
+            self.geom.max_tab_width,
+        );
         let tab_x = left_margin + picker_tab as f32 * tab_width;
 
         // Picker is rendered just below the island
-        let picker_y = self.tab_bar_height;
+        let picker_y = self.geom.bar_height;
 
         // Check if click is within picker vertical range
         if mouse_y_unscaled < picker_y || mouse_y_unscaled > picker_y + PICKER_HEIGHT {
@@ -1188,7 +1251,7 @@ impl Island {
         selected_color: Option<[f32; 4]>,
     ) {
         let padding = PICKER_PADDING;
-        let bg_y = self.tab_bar_height;
+        let bg_y = self.geom.bar_height;
 
         // Compute total swatches width to derive the consistent inner content width
         // N color swatches + 1 reset swatch
@@ -1442,14 +1505,14 @@ mod tests {
     fn island_rect_insets_slot_and_clamps_radius() {
         // Slot at x=100, width 180 → island inset by half the gap on
         // each side and TAB_INSET_Y vertically.
-        let (x, y, w, h, radius) = island_rect(100.0, 180.0, ISLAND_HEIGHT);
+        let (x, y, w, h, radius) = island_rect(100.0, 180.0, TabGeom::default());
         assert_eq!(x, 100.0 + TAB_GAP / 2.0);
         assert_eq!(y, TAB_INSET_Y);
         assert_eq!(w, 180.0 - TAB_GAP);
         assert_eq!(h, ISLAND_HEIGHT - TAB_INSET_Y * 2.0);
         assert_eq!(radius, TAB_RADIUS);
 
-        let (_, _, w, h, radius) = island_rect(0.0, 4.0, ISLAND_HEIGHT);
+        let (_, _, w, h, radius) = island_rect(0.0, 4.0, TabGeom::default());
         assert_eq!(w, 0.0);
         assert_eq!(radius, 0.0);
         assert!(radius <= h / 2.0);
@@ -1497,7 +1560,8 @@ mod tests {
         let inactive_color = [0.5, 0.5, 0.5, 1.0];
         let active_color = [0.9, 0.9, 0.9, 1.0];
 
-        let island = Island::new(inactive_color, active_color, true, 12.0, ISLAND_HEIGHT);
+        let island =
+            Island::new(inactive_color, active_color, true, 12.0, TabGeom::default());
 
         assert_eq!(island.inactive_text_color, inactive_color);
         assert_eq!(island.active_text_color, active_color);
@@ -1511,7 +1575,7 @@ mod tests {
             [1.0, 1.0, 1.0, 1.0],
             false,
             12.0,
-            ISLAND_HEIGHT,
+            TabGeom::default(),
         );
         assert_eq!(island.height(), ISLAND_HEIGHT);
     }
@@ -1522,7 +1586,7 @@ mod tests {
             [0.9, 0.9, 0.9, 1.0],
             false,
             12.0,
-            ISLAND_HEIGHT,
+            TabGeom::default(),
         )
     }
 
@@ -1719,7 +1783,7 @@ mod tests {
         // 1000 physical px @ 2x scale → 500 logical px window. Slots
         // stay below the cap here, so the math matches the old
         // fill-the-strip layout.
-        let layout = tab_strip_layout(1000.0, 2.0, 4);
+        let layout = tab_strip_layout(1000.0, 2.0, 4, MAX_TAB_WIDTH);
         #[cfg(target_os = "macos")]
         {
             assert_eq!(layout.left_margin, ISLAND_MARGIN_LEFT_MACOS);
@@ -1733,12 +1797,14 @@ mod tests {
             assert_eq!(layout.tabs_width, 492.0);
         }
         // Zero tabs clamps the divisor.
-        assert!(tab_strip_layout(1000.0, 2.0, 0).tab_width.is_finite());
+        assert!(tab_strip_layout(1000.0, 2.0, 0, MAX_TAB_WIDTH)
+            .tab_width
+            .is_finite());
     }
 
     #[test]
     fn tab_strip_layout_caps_slot_width() {
-        let layout = tab_strip_layout(3000.0, 2.0, 2);
+        let layout = tab_strip_layout(3000.0, 2.0, 2, MAX_TAB_WIDTH);
         assert_eq!(layout.tab_width, MAX_TAB_WIDTH);
         assert_eq!(layout.tabs_width, MAX_TAB_WIDTH * 2.0);
         // The tabs region ends well before the 1500 logical px strip.
@@ -1746,7 +1812,7 @@ mod tests {
 
         // Pathologically narrow window: width clamps at 0 instead of
         // going negative.
-        let layout = tab_strip_layout(10.0, 2.0, 4);
+        let layout = tab_strip_layout(10.0, 2.0, 4, MAX_TAB_WIDTH);
         assert_eq!(layout.tab_width, 0.0);
         assert_eq!(layout.tabs_width, 0.0);
     }
@@ -1819,7 +1885,7 @@ mod tests {
             tab_width: 180.0,
             tabs_width: 360.0,
         };
-        let cx = close_button_center_x(&layout, 1, ISLAND_HEIGHT).unwrap();
+        let cx = close_button_center_x(&layout, 1, TabGeom::default()).unwrap();
         assert_eq!(
             cx,
             180.0 + TAB_GAP / 2.0 + (180.0 - TAB_GAP) - CLOSE_MARGIN_RIGHT
@@ -1834,7 +1900,7 @@ mod tests {
             tab_width: 60.0,
             tabs_width: 600.0,
         };
-        assert_eq!(close_button_center_x(&narrow, 3, ISLAND_HEIGHT), None);
+        assert_eq!(close_button_center_x(&narrow, 3, TabGeom::default()), None);
     }
 
     #[test]
@@ -1848,7 +1914,7 @@ mod tests {
             tab_width: 180.0,
             tabs_width: 360.0,
         };
-        let cx = close_button_center_x(&layout, 0, ISLAND_HEIGHT).unwrap();
+        let cx = close_button_center_x(&layout, 0, TabGeom::default()).unwrap();
         let title_max_right = layout.tab_width - TAB_PADDING_X;
         assert!(cx - CLOSE_HIT_HALF_WIDTH >= title_max_right);
     }
