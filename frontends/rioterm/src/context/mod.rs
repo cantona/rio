@@ -697,6 +697,12 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     #[inline]
+    pub fn notify_close_armed(&self) {
+        self.event_proxy
+            .send_event(RioEvent::CloseButtonArmed, self.window_id);
+    }
+
+    #[inline]
     pub fn request_save_session_as(&mut self, name: String) {
         self.event_proxy
             .send_event(RioEvent::SaveSessionAs(name), self.window_id);
@@ -983,13 +989,14 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     #[inline]
     pub fn close_current_context(&mut self, sugarloaf: &mut Sugarloaf) {
         if self.contexts.len() == 1 {
-            // MacOS: Close last tab will work, leading to hide and
-            // keep Rio running in background.
-            #[cfg(target_os = "macos")]
-            {
-                self.event_proxy
-                    .send_event(RioEvent::CloseWindow, self.window_id);
-            }
+            // Closing the last tab closes THIS window, not the whole
+            // app: CloseWindow removes just this route and only exits
+            // the loop when it was the last window. Sending Quit here
+            // (the old non-macOS behavior) ran process::exit(0),
+            // tearing down every other window's shells with no prompt
+            // or session save.
+            self.event_proxy
+                .send_event(RioEvent::CloseWindow, self.window_id);
             return;
         }
 

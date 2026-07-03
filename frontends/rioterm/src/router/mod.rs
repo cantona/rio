@@ -558,6 +558,38 @@ impl Route<'_> {
             return true;
         }
 
+        if let Some(pending) = self.window.screen.renderer.confirm_close.pending() {
+            if key_event.state == rio_window::event::ElementState::Pressed {
+                use crate::renderer::confirm_close::PendingClose;
+                match &key_event.logical_key {
+                    Key::Character(c) if c.as_str() == "y" || c.as_str() == "Y" => {
+                        self.window.screen.renderer.confirm_close.set_pending(None);
+                        match pending {
+                            PendingClose::Tab(tab) => {
+                                self.window.screen.close_tab_at(tab, clipboard);
+                            }
+                            PendingClose::Current | PendingClose::Window => {
+                                self.window
+                                    .screen
+                                    .close_split_or_tab_confirmed(clipboard);
+                            }
+                        }
+                        self.request_overlay_redraw();
+                    }
+                    Key::Character(c) if c.as_str() == "n" || c.as_str() == "N" => {
+                        self.window.screen.renderer.confirm_close.set_pending(None);
+                        self.request_overlay_redraw();
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        self.window.screen.renderer.confirm_close.set_pending(None);
+                        self.request_overlay_redraw();
+                    }
+                    _ => {}
+                }
+            }
+            return true;
+        }
+
         if let Some(kind) = self.window.screen.renderer.session_prompt.kind() {
             if key_event.state == rio_window::event::ElementState::Pressed {
                 match (&key_event.logical_key, kind) {

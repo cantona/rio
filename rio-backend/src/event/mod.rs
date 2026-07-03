@@ -242,6 +242,13 @@ pub enum RioEvent {
     /// Hide the transient "session saved" notice.
     ClearSessionNotice,
 
+    /// A tab close button was armed (double-click confirm); schedule
+    /// the disarm repaint.
+    CloseButtonArmed,
+
+    /// Drop a stale armed close button and repaint.
+    DisarmCloseButton,
+
     /// Save the session under a chosen name (palette "Save Session As").
     SaveSessionAs(String),
 
@@ -331,6 +338,8 @@ impl Debug for RioEvent {
             RioEvent::Quit => write!(f, "Quit"),
             RioEvent::SaveSession => write!(f, "SaveSession"),
             RioEvent::ClearSessionNotice => write!(f, "ClearSessionNotice"),
+            RioEvent::CloseButtonArmed => write!(f, "CloseButtonArmed"),
+            RioEvent::DisarmCloseButton => write!(f, "DisarmCloseButton"),
             RioEvent::SaveSessionAs(_) => write!(f, "SaveSessionAs"),
             RioEvent::RestoreSessionByName(_) => write!(f, "RestoreSessionByName"),
             RioEvent::CloseTerminal(route) => write!(f, "CloseTerminal {route}"),
