@@ -1586,3 +1586,45 @@ mod tests {
         assert_eq!(&new_bindings[0].action, &Action::Scroll(1));
     }
 }
+
+/// Named keys (arrows etc.) in `[bindings]` must parse and trigger —
+/// guards the keyboard-resize path end to end at the binding layer.
+#[cfg(test)]
+mod named_key_config_bindings {
+    use super::*;
+
+    #[test]
+    fn arrow_divider_binding_parses_and_matches() {
+        let config_bindings = vec![ConfigKeyBinding {
+            key: String::from("up"),
+            action: String::from("movedividerup"),
+            with: String::from("control | shift"),
+            esc: String::from(""),
+            mode: String::from(""),
+        }];
+        let new_bindings = config_key_bindings(config_bindings, vec![]);
+        assert_eq!(new_bindings.len(), 1, "binding failed to parse");
+        let b = &new_bindings[0];
+        assert_eq!(
+            b.action,
+            Action::MoveDividerUp,
+            "action wrong: {:?}",
+            b.action
+        );
+        eprintln!("parsed binding: mods={:?} trigger={:?}", b.mods, b.trigger);
+
+        // Simulate the runtime match the way process_key_event does.
+        let mods = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        let mode = BindingMode::empty();
+        let key = BindingKey::Keycode {
+            key: Key::Named(ArrowUp),
+            location: KeyLocation::Standard,
+        };
+        assert!(
+            b.is_triggered_by(mode, mods, &key),
+            "binding does not trigger: binding mods={:?} trigger={:?}",
+            b.mods,
+            b.trigger
+        );
+    }
+}
