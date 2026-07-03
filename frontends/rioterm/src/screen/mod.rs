@@ -1110,12 +1110,10 @@ impl Screen<'_> {
                         self.split_down();
                     }
                     Act::MoveDividerUp => {
-                        // User wants divider to move up visually, which means expanding the bottom split
-                        self.move_divider_down();
+                        self.move_divider_up();
                     }
                     Act::MoveDividerDown => {
-                        // User wants divider to move down visually, which means expanding the top split
-                        self.move_divider_up();
+                        self.move_divider_down();
                     }
                     Act::MoveDividerLeft => {
                         self.move_divider_left();
@@ -1464,8 +1462,28 @@ impl Screen<'_> {
         self.mark_dirty();
     }
 
+    /// One grid cell per press, tmux-style — the canonical integer
+    /// cell stride, so every press moves the same exact amount.
+    fn divider_step_y(&self) -> f32 {
+        let cell = self.context_manager.current().dimension.cell;
+        if cell.cell_height > 0 {
+            cell.cell_height as f32
+        } else {
+            20.0
+        }
+    }
+
+    fn divider_step_x(&self) -> f32 {
+        let cell = self.context_manager.current().dimension.cell;
+        if cell.cell_width > 0 {
+            cell.cell_width as f32
+        } else {
+            10.0
+        }
+    }
+
     pub fn move_divider_up(&mut self) {
-        let amount = 20.0; // Default movement amount
+        let amount = self.divider_step_y();
         if self
             .context_manager
             .move_divider_up(amount, &mut self.sugarloaf)
@@ -1475,7 +1493,7 @@ impl Screen<'_> {
     }
 
     pub fn move_divider_down(&mut self) {
-        let amount = 20.0; // Default movement amount
+        let amount = self.divider_step_y();
         if self
             .context_manager
             .move_divider_down(amount, &mut self.sugarloaf)
@@ -1485,7 +1503,7 @@ impl Screen<'_> {
     }
 
     pub fn move_divider_left(&mut self) {
-        let amount = 40.0; // Default movement amount
+        let amount = self.divider_step_x();
         if self
             .context_manager
             .move_divider_left(amount, &mut self.sugarloaf)
@@ -1495,7 +1513,7 @@ impl Screen<'_> {
     }
 
     pub fn move_divider_right(&mut self) {
-        let amount = 40.0; // Default movement amount
+        let amount = self.divider_step_x();
         if self
             .context_manager
             .move_divider_right(amount, &mut self.sugarloaf)

@@ -139,6 +139,33 @@ click: `tab-close-confirm` can require a y/n confirmation (`ask`) or a
 deliberate second click — the × arms and turns red, click again to
 close (`double-click`).
 
+### ⌨️ tmux-style keyboard split resizing
+The `movedivider*` actions were rebuilt from the ground up — they now
+behave like `tmux resize-pane`:
+
+```toml
+[bindings]
+keys = [
+  { key = "up",    with = "alt | shift", action = "movedividerup" },
+  { key = "down",  with = "alt | shift", action = "movedividerdown" },
+  { key = "left",  with = "alt | shift", action = "movedividerleft" },
+  { key = "right", with = "alt | shift", action = "movedividerright" },
+]
+```
+
+- **Directions are literal** — `left` always moves the divider left,
+  regardless of which pane has focus.
+- **One grid cell per press** — precise steps that scale with your
+  font size, not fixed pixel jumps.
+- **Deterministic divider ownership** — each key acts on the focused
+  pane's bottom/right edge (the last pane in an axis falls back to its
+  top/left edge), so in any stack every divider is reachable by
+  focusing the pane above or left of it.
+- **Stable in mixed layouts** — nested vertical + horizontal splits
+  resize at the correct container level instead of corrupting the
+  layout weights; a stack bordering the moved divider shares the
+  change proportionally, keeping its internal balance.
+
 ### 🔧 Quality of life
 Key bindings, `window.decorations` and more hot-reload on config save ·
 middle-click paste from selection · crisper UI text on HiDPI · correct
