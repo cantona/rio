@@ -5,8 +5,10 @@
   <br>Rio Terminal — cantona edition
 </h1>
   <p align="center">
-    The GPU-accelerated Rio terminal, with sessions, automation triggers,
-    working inline images and a fully customizable tab bar.
+    A highly optimized, highly customizable fork of the GPU-accelerated
+    Rio terminal — session restore, output-driven automation, working
+    inline images, and a tab bar that bends to your config, not the
+    other way around.
     <br />
     <a href="#why-this-fork">Why this fork</a>
     ·
@@ -18,29 +20,47 @@
   </p>
 </p>
 
-A maintained fork of [raphamorim/rio](https://github.com/raphamorim/rio) that ships
-the features power users keep asking for. Tracks upstream `main` and rebases
-regularly — everything upstream has, plus everything below. The `dev` branch is the
-product.
+A maintained fork of [raphamorim/rio](https://github.com/raphamorim/rio) that keeps
+Rio's GPU-fast, damage-tracked rendering core and ships the features power users keep
+asking for — implemented perf-first, so none of them cost you frames. Tracks upstream
+`main` and rebases regularly: everything upstream has, plus everything below. The
+`dev` branch is the product.
 
 ## Why this fork
 
-Rio is a fantastic, fast terminal — but some workflows need more than fast:
-picking up your work exactly where you left it, automating repetitive
-console interactions, and actually seeing the images your tools print.
-This fork adds those, upstreamable-quality and CI-green, without changing
-any default behavior: with a stock config it behaves like stock Rio.
+This fork turns Rio's blazing GPU core into a complete daily driver:
+
+- **Your workspace survives restarts.** Tabs, splits, working directories,
+  window size and styled scrollback come back exactly as you left them —
+  including named workspaces you can switch between.
+- **Repetitive console work automates itself.** Regex-driven triggers watch
+  the output and highlight, notify, recolor the tab, or type responses for
+  you — a serial-console login becomes a zero-touch event.
+- **Graphics just work.** `imgcat`, `chafa`, `viu`, sixel — inline images
+  render correctly and stay solid under heavy use.
+- **The interface is yours to shape.** The tab strip alone exposes ten
+  config options — geometry, fills, hover behavior, close protection —
+  every one applied live the moment you save.
+
+All of it is built perf-first on top of Rio's per-line damage tracking, so
+none of it costs you frames. Existing configs keep working unchanged, and
+every enhancement is one config line to tune or turn off.
 
 ## Highlights
 
 ### 🔄 Session save & restore
 Close the terminal, reopen it, and your world comes back — like a browser
 restoring tabs. Every tab, the split layout with its ratios, each pane's
-working directory, even the styled scrollback text.
+working directory, the window size, even the styled scrollback text.
 
 ```toml
 [session]
-restore = "prompt"   # never | prompt | always
+# What happens at quit/launch: "never" disables sessions entirely,
+# "prompt" asks before saving and before resuming, "always" does both
+# silently. Default: "never".
+restore = "prompt"
+# How many scrollback lines each pane saves. Default: 2000.
+max-scrollback-lines = 2000
 ```
 
 - `ctrl+shift+s` saves on demand (with a "session saved" flash)
@@ -51,10 +71,26 @@ restore = "prompt"   # never | prompt | always
 
 ### ⚡ Terminal triggers
 iTerm2-style regex → action rules in a hot-reloading `triggers.toml`.
-Highlight matches, fire desktop notifications with urgency levels, run
-commands, or send text back to the terminal — enough to script a full
-serial-console auto-login (`minicom` → detect prompt → send credentials)
-with one-shot rules and an `alt+r` re-arm.
+Six actions: highlight matches with a per-rule color, recolor the tab,
+fire desktop notifications with urgency levels, run a command, pipe the
+screen to a coprocess, or type text back into the terminal — plus
+`once` (one-shot) and `instant` (fire mid-line) flags:
+
+```toml
+[[triggers.rules]]
+regex = "login:"
+once = true            # one-shot; re-arm with the resettriggers action
+[triggers.rules.action]
+send_text = { text = "admin\n" }
+
+[[triggers.rules]]
+regex = "error: (.*)"
+[triggers.rules.action]
+notify = { title = "Error", body = "\\1", urgency = "critical" }
+```
+
+Enough to script a full serial-console auto-login — `minicom` → detect
+prompt → send credentials — or turn any log pattern into a desktop alert.
 
 ### 🖼️ Inline images that work
 Sixel and iTerm2 (OSC 1337) graphics render correctly — `imgcat`,
@@ -68,25 +104,47 @@ live on save:
 
 ```toml
 [navigation]
-tab-bar-height = 24        # strip height (default 34)
-tab-font-size = 14         # title size (default 12)
-tab-max-width = 0          # 0 = tabs expand to fill the strip
-tab-gap = 1                # px between tabs, 0 = touching
-tab-inset-y = 0            # 0 = flat full-height tabs
-tab-radius = 6             # corner rounding, 0 = square
-tab-fill = "#2b2b2d"       # fixed fills, or omit for adaptive
+# Height of the tab strip, logical px. Default: 34.
+tab-bar-height = 24
+# Tab title font size, logical px. Default: 12.
+tab-font-size = 14
+# Widest a single tab may grow, logical px; 0 removes the cap so tabs
+# share the whole strip like a browser. Default: 180.
+tab-max-width = 0
+# Horizontal space between tabs; 0 makes them touch. Default: 6.
+tab-gap = 1
+# How far each tab floats inside the strip vertically; 0 gives flat
+# full-height tabs. Default: 7.
+tab-inset-y = 0
+# Corner rounding of each tab; 0 is square. Default: 6.
+tab-radius = 6
+# Fixed background for inactive / active tabs. Omit either and it
+# adapts to your theme's background luminance. Default: adaptive.
+tab-fill = "#2b2b2d"
 tab-fill-active = "#4a4a4c"
-tab-close-on-hover = true  # Terminal.app-style ×-on-hover, closes any tab
+# Hovering a tab shows its close button and a highlight, and the ×
+# closes that tab directly. false = × on the active tab only.
+# Default: true.
+tab-close-on-hover = true
+# Misclick protection for closing tabs: "never" closes on one action,
+# "ask" pops a yes/no prompt, "double-click" arms the × (it turns red)
+# and a second action within 3s closes. Applies to the close button,
+# keyboard shortcuts and the command palette. Default: "never".
+tab-close-confirm = "double-click"
 ```
 
 Hover highlights, per-tab close buttons, macOS-Terminal or classic-flat
-looks — your choice, not the theme's.
+looks — your choice, not the theme's. And no more tabs lost to a stray
+click: `tab-close-confirm` can require a y/n confirmation (`ask`) or a
+deliberate second click — the × arms and turns red, click again to
+close (`double-click`).
 
 ### 🔧 Quality of life
 Key bindings, `window.decorations` and more hot-reload on config save ·
 middle-click paste from selection · crisper UI text on HiDPI · correct
-grid resize when the tab bar appears · `togglemaximized` action ·
-function-key and enter bindings parse correctly in `[bindings]`.
+grid resize when the tab bar appears · instant repaint when a shell
+exits and its tab closes · `togglemaximized` action · function-key and
+enter bindings parse correctly in `[bindings]`.
 
 ## Build & Install
 
