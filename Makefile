@@ -8,6 +8,10 @@ RELEASE_DIR = release
 APP_NAME = Rio.app
 APP_TEMPLATE = $(BUILD_MISC_DIR)/osx/$(APP_NAME)
 APP_BINARY = $(TARGET_DIR)/$(TARGET)
+# Session-persistence daemon, bundled next to the rio binary so
+# `ptyd_binary()` finds it (it looks beside the executable, then PATH).
+PTYD_TARGET = rio-ptyd
+PTYD_BINARY = $(TARGET_DIR)/$(PTYD_TARGET)
 APP_BINARY_DIR = $(TARGET_DIR_OSX)/$(APP_NAME)/Contents/MacOS
 APP_EXTRAS_DIR = $(TARGET_DIR_OSX)/$(APP_NAME)/Contents/Resources
 TERMINFO = $(BUILD_MISC_DIR)/rio.terminfo
@@ -52,6 +56,7 @@ $(TARGET)-universal:
 	RUSTFLAGS='-C link-arg=-s' MACOSX_DEPLOYMENT_TARGET="10.15" cargo build --release --target=x86_64-apple-darwin
 	RUSTFLAGS='-C link-arg=-s' MACOSX_DEPLOYMENT_TARGET="11.0" cargo build --release --target=aarch64-apple-darwin
 	@lipo target/{x86_64,aarch64}-apple-darwin/release/$(TARGET) -create -output $(APP_BINARY)
+	@lipo target/{x86_64,aarch64}-apple-darwin/release/$(PTYD_TARGET) -create -output $(PTYD_BINARY)
 
 app-universal: $(APP_NAME)-universal ## Create a universal Rio.app
 $(APP_NAME)-%: $(TARGET)-%
@@ -59,6 +64,7 @@ $(APP_NAME)-%: $(TARGET)-%
 	@mkdir -p $(APP_EXTRAS_DIR)
 	@cp -fRp $(APP_TEMPLATE) $(TARGET_DIR_OSX)
 	@cp -fp $(APP_BINARY) $(APP_BINARY_DIR)
+	@cp -fp $(PTYD_BINARY) $(APP_BINARY_DIR)
 	@touch -r "$(APP_BINARY)" "$(TARGET_DIR_OSX)/$(APP_NAME)"
 
 install-terminfo:
@@ -80,10 +86,10 @@ release-macos-signed-app:
 	@make install-terminfo
 	@make app-universal
 	@echo "Releasing Rio v$(version)"
-	@codesign --force --deep --options runtime --sign "Developer ID Application: Hugo Amorim" "$(TARGET_DIR_OSX)/$(APP_NAME)"
+	@codesign --force --deep --options runtime --sign "Developer ID Application: Su Kang Yin" "$(TARGET_DIR_OSX)/$(APP_NAME)"
 	mkdir -p $(RELEASE_DIR) && cp -rf ./target/release/osx/* ./release/
 	@ditto -c -k --keepParent ./release/$(APP_NAME) ./release/Rio-v$(version).zip
-	@xcrun notarytool submit ./release/Rio-v$(version).zip --keychain-profile "Hugo Amorim" --wait
+	@xcrun notarytool submit ./release/Rio-v$(version).zip --keychain-profile "Su Kang Yin" --wait
 	rm -rf ./release/$(APP_NAME)
 	@unzip ./release/Rio-v$(version).zip -d ./release
 	@echo "Please verify if 'Rio.App/Contents/Resources/72/rio' exists before create-dmg"
@@ -112,6 +118,9 @@ bump-brew:
 	brew bump-cask-pr rio --version ${version}
 
 # TODO: Move to bin path
+# A bare `cargo build --release` builds every workspace member's
+# binary — including the rio-ptyd daemon that [session] persistent
+# needs — so no explicit `-p rio-ptyd` is required here.
 release-x11:
 	RUSTFLAGS='-C link-arg=-s' cargo build --release --no-default-features --features=x11
 	target/release/rio

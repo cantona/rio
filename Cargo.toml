@@ -7,6 +7,7 @@ members = [
     "rio-grapheme-width",
     "rio-window",
     "rio-notifier",
+    "rio-ptyd",
     "frontends/rioterm",
 ]
 resolver = "2"
@@ -32,6 +33,7 @@ teletypewriter = { path = "teletypewriter", version = "0.4.10" }
 rio-backend = { path = "rio-backend", version = "0.4.10" }
 rio-window = { path = "rio-window", version = "0.4.10", default-features = false }
 rio-notifier = { path = "rio-notifier", version = "0.4.10" }
+rio-ptyd = { path = "rio-ptyd", version = "0.4.10" }
 rio-grapheme-width = { path = "rio-grapheme-width", version = "0.4.10" }
 sugarloaf = { path = "sugarloaf", version = "0.4.10" }
 corcovado = { path = "corcovado", version = "0.4.10" }

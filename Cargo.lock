@@ -3973,6 +3973,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rio-ptyd"
+version = "0.4.10"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rio-window"
 version = "0.4.10"
 dependencies = [

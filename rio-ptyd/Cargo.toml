@@ -1,0 +1,21 @@
+[package]
+name = "rio-ptyd"
+version.workspace = true
+edition = "2021"
+license = "MIT"
+readme = false
+description = "Standalone per-pane PTY session daemon: shells survive their terminal, attach locally or over any byte transport (ssh)"
+repository = { workspace = true }
+
+[lib]
+name = "rio_ptyd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rio-ptyd"
+path = "src/main.rs"
+
+[dependencies]
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = "1.0"
