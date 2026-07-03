@@ -538,6 +538,33 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     route.restore_session_named(&name);
                 }
             }
+            RioEventType::Rio(RioEvent::CloseButtonArmed) => {
+                self.scheduler.schedule(
+                    EventPayload::new(
+                        RioEventType::Rio(RioEvent::DisarmCloseButton),
+                        window_id,
+                    ),
+                    crate::renderer::island::Island::ARM_TIMEOUT
+                        + Duration::from_millis(100),
+                    false,
+                    TimerId::new(Topic::DisarmCloseButton, 0),
+                );
+            }
+            RioEventType::Rio(RioEvent::DisarmCloseButton) => {
+                if let Some(route) = self.router.routes.get_mut(&window_id) {
+                    let changed = route
+                        .window
+                        .screen
+                        .renderer
+                        .island
+                        .as_mut()
+                        .is_some_and(|island| island.disarm_stale());
+                    if changed {
+                        route.window.screen.mark_dirty();
+                        route.request_redraw();
+                    }
+                }
+            }
             RioEventType::Rio(RioEvent::ClearSessionNotice) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
                     route
@@ -1216,6 +1243,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 if route.path != RoutePath::Terminal
                     || route.window.screen.renderer.confirm_quit.is_active()
                     || route.window.screen.renderer.session_prompt.is_active()
+                    || route.window.screen.renderer.confirm_close.is_active()
                 {
                     #[cfg(target_os = "macos")]
                     if state == ElementState::Pressed
@@ -1564,6 +1592,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 if route.path != RoutePath::Terminal
                     || route.window.screen.renderer.confirm_quit.is_active()
                     || route.window.screen.renderer.session_prompt.is_active()
+                    || route.window.screen.renderer.confirm_close.is_active()
                 {
                     route.window.winit_window.set_cursor(CursorIcon::Default);
                     return;
@@ -1880,6 +1909,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 if route.path != RoutePath::Terminal
                     || route.window.screen.renderer.confirm_quit.is_active()
                     || route.window.screen.renderer.session_prompt.is_active()
+                    || route.window.screen.renderer.confirm_close.is_active()
                 {
                     return;
                 }

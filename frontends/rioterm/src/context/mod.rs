@@ -697,6 +697,12 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     #[inline]
+    pub fn notify_close_armed(&self) {
+        self.event_proxy
+            .send_event(RioEvent::CloseButtonArmed, self.window_id);
+    }
+
+    #[inline]
     pub fn request_save_session_as(&mut self, name: String) {
         self.event_proxy
             .send_event(RioEvent::SaveSessionAs(name), self.window_id);
@@ -989,6 +995,13 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             {
                 self.event_proxy
                     .send_event(RioEvent::CloseWindow, self.window_id);
+            }
+            // Elsewhere closing the last tab is a quit request, which
+            // honors the quit and session prompts instead of silently
+            // doing nothing.
+            #[cfg(not(target_os = "macos"))]
+            {
+                self.event_proxy.send_event(RioEvent::Quit, self.window_id);
             }
             return;
         }
