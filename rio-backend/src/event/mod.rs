@@ -34,6 +34,11 @@ pub enum Msg {
     #[allow(dead_code)]
     Shutdown,
 
+    /// Terminate the pty's child, then stop the io loop. Unlike
+    /// `Shutdown`, this reaches through the pty backend (a session
+    /// daemon translates it into killing the remote shell).
+    Kill,
+
     Resize(WinsizeBuilder),
 }
 
