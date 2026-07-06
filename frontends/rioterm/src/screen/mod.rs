@@ -217,6 +217,16 @@ impl Screen<'_> {
             shell,
             working_dir,
             spawn_performer: true,
+            persistence: if cfg!(unix) && config.session.uses_daemons() {
+                Some(crate::context::PersistenceOptions {
+                    ring_bytes: config.session.ring_bytes,
+                })
+            } else {
+                None
+            },
+            autosave: config.session.restore
+                == rio_backend::config::session::SessionRestore::Always,
+            session_name: None,
             #[cfg(not(target_os = "windows"))]
             use_fork: config.use_fork,
             is_native,
@@ -1444,6 +1454,7 @@ impl Screen<'_> {
         );
 
         self.mark_dirty();
+        self.context_manager.autosave_on_change();
     }
 
     pub fn split_right(&mut self) {
@@ -1452,6 +1463,7 @@ impl Screen<'_> {
             .split(rich_text_id, false, &mut self.sugarloaf);
 
         self.mark_dirty();
+        self.context_manager.autosave_on_change();
     }
 
     pub fn split_down(&mut self) {
@@ -1460,6 +1472,7 @@ impl Screen<'_> {
             .split(rich_text_id, true, &mut self.sugarloaf);
 
         self.mark_dirty();
+        self.context_manager.autosave_on_change();
     }
 
     /// One grid cell per press, tmux-style — the canonical integer
@@ -1553,6 +1566,7 @@ impl Screen<'_> {
 
         self.cancel_search(clipboard);
         self.mark_dirty();
+        self.context_manager.autosave_on_change();
     }
 
     pub fn close_split_or_tab(&mut self, clipboard: &mut Clipboard) {
@@ -1569,6 +1583,7 @@ impl Screen<'_> {
             self.context_manager
                 .remove_current_grid(&mut self.sugarloaf);
             self.mark_dirty();
+            self.context_manager.autosave_on_change();
         } else {
             self.close_tab_confirmed(clipboard);
         }
@@ -1649,6 +1664,7 @@ impl Screen<'_> {
         self.clear_selection();
         self.context_manager
             .close_current_context(&mut self.sugarloaf);
+        self.context_manager.autosave_on_change();
         if let Some(ref mut island) = self.renderer.island {
             island.dismiss_color_picker();
         }
@@ -2330,9 +2346,23 @@ impl Screen<'_> {
     {
         #[cfg(unix)]
         {
-            let main_fd = *self.ctx().current().main_fd;
-            let shell_pid = &self.ctx().current().shell_pid;
-            match teletypewriter::spawn_daemon(program, args, main_fd, *shell_pid) {
+            // A remote pane's shell_pid is a foreign machine's pid;
+            // passing it would make spawn_daemon inherit an unrelated
+            // local process's cwd. Feed the invalid placeholders so it
+            // falls back to the default working directory.
+            let is_remote = matches!(
+                self.ctx().current().backend,
+                crate::context::PaneBackend::Ptyd { host: Some(_), .. }
+            );
+            let (main_fd, shell_pid) = if is_remote {
+                (-1, 0)
+            } else {
+                (
+                    *self.ctx().current().main_fd,
+                    self.ctx().current().shell_pid,
+                )
+            };
+            match teletypewriter::spawn_daemon(program, args, main_fd, shell_pid) {
                 Ok(_) => tracing::debug!("Launched {} with args {:?}", program, args),
                 Err(_) => {
                     tracing::warn!("Unable to launch {} with args {:?}", program, args)

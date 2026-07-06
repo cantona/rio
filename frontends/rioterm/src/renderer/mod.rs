@@ -83,8 +83,12 @@ pub struct Renderer {
     pub confirm_quit: confirm_quit::ConfirmQuit,
     pub confirm_close: confirm_close::ConfirmClose,
     pub session_prompt: session_prompt::SessionPrompt,
-    /// `[session]` config snapshot the prompt/save flows read — the
-    /// renderer is rebuilt on config reload so this stays current.
+    /// `[session]` persistence mode snapshot the prompt/save/close flows
+    /// read — the renderer is rebuilt on config reload so this stays
+    /// current. `is_on()` means panes run behind rio-ptyd daemons.
+    /// `[session]` restore mode snapshot (disable/prompt/always) the
+    /// prompt/save/close flows read — the renderer is rebuilt on config
+    /// reload so this stays current.
     pub session_restore: rio_backend::config::session::SessionRestore,
     pub session_max_scrollback: usize,
     /// Config snapshot for the close-confirm gate: when the quit

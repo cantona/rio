@@ -148,6 +148,9 @@ impl Route<'_> {
     pub fn quit(&mut self) {
         use rio_backend::config::session::SessionRestore;
         match self.window.screen.renderer.session_restore {
+            // Ask before saving: the "save session?" overlay gates the
+            // actual save/exit (see the key handler). Declining discards
+            // the session, killing any v2 daemons.
             SessionRestore::Prompt => {
                 self.window.screen.renderer.confirm_quit.set_active(false);
                 self.window
@@ -158,9 +161,13 @@ impl Route<'_> {
                 self.request_overlay_redraw();
                 return;
             }
+            // Fully automatic: save silently and exit. v2 daemons detach
+            // because process exit closes their sockets (EOF = detach).
             SessionRestore::Always => self.save_session(),
             SessionRestore::Never => {}
         }
+        // process::exit runs no destructors, so Context::drop never
+        // fires here.
         std::process::exit(0);
     }
 
@@ -173,6 +180,23 @@ impl Route<'_> {
                 rio_backend::config::session_named_path(name)
             }
             None => rio_backend::config::session_file_path(),
+        }
+    }
+
+    /// Window is closing (WM close / Cmd+Q, not the Quit action): mark
+    /// persistent panes to DETACH rather than kill, and save the session
+    /// so the next launch can reattach. Without this the window-close
+    /// path drops the contexts with `QUIT_DETACHING` still false — the
+    /// `Ptyd` drop then kills every persistent shell, and `exiting()`
+    /// runs too late (routes already removed) to save anything.
+    #[cfg(unix)]
+    pub fn detach_and_save_on_close(&mut self) {
+        // The detach flag only matters for v2 (daemon-backed) panes;
+        // it's harmless for v1 (no daemons to detach). Save whenever a
+        // session is being kept at all.
+        crate::context::set_quit_detaching();
+        if self.window.screen.renderer.session_restore.enabled() {
+            self.save_session();
         }
     }
 
@@ -192,13 +216,23 @@ impl Route<'_> {
         }
     }
 
+    /// Bind this window to a named session, tagging newly spawned
+    /// daemons with it so `rio-ptyd list` groups panes by session.
+    pub fn set_session_name(&mut self, name: Option<String>) {
+        self.session_name = name.clone();
+        #[cfg(unix)]
+        {
+            self.window.screen.context_manager.config.session_name = name;
+        }
+    }
+
     /// Palette "Save Session As": bind this window to `name` and save.
     pub fn save_session_as(&mut self, name: &str) {
         let name = crate::session::sanitize_name(name);
         if name.is_empty() {
             return;
         }
-        self.session_name = Some(name);
+        self.set_session_name(Some(name));
         self.save_session();
     }
 
@@ -207,7 +241,7 @@ impl Route<'_> {
     pub fn restore_session_named(&mut self, name: &str) {
         let path = rio_backend::config::session_named_path(name);
         if let Some(state) = crate::session::SessionState::load(&path) {
-            self.session_name = Some(name.to_string());
+            self.set_session_name(Some(name.to_string()));
             self.restore_session_inner(state, false);
         }
     }

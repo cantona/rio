@@ -4062,6 +4062,7 @@ dependencies = [
  "regex",
  "rio-backend",
  "rio-notifier",
+ "rio-ptyd",
  "rio-window",
  "rustc-hash 2.1.2",
  "serde",

@@ -202,7 +202,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             // configured restore mode, and saves write back to it.
             let name = crate::session::sanitize_name(&name);
             if let Some(route) = self.router.routes.values_mut().next() {
-                route.session_name = Some(name.clone());
+                route.set_session_name(Some(name.clone()));
                 if let Some(state) = crate::session::SessionState::load(
                     &rio_backend::config::session_named_path(&name),
                 ) {
@@ -1039,11 +1039,29 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     );
                 }
             }
-            #[cfg(target_os = "macos")]
+            // Cross-platform: `close_current_context` sends this on every
+            // OS when the last tab of a window closes, so the handler must
+            // not be macOS-gated (else Linux last-tab-close would send an
+            // event nobody consumes and the window would never close).
             RioEventType::Rio(RioEvent::CloseWindow) => {
+                #[cfg(unix)]
+                if let Some(route) = self.router.routes.get_mut(&window_id) {
+                    route.detach_and_save_on_close();
+                }
                 self.router.routes.remove(&window_id);
-                if self.router.routes.is_empty() && !self.config.confirm_before_quit {
-                    event_loop.exit();
+                #[cfg(unix)]
+                crate::context::clear_quit_detaching();
+                if self.router.routes.is_empty() {
+                    // macOS keeps the app alive with no windows (dock);
+                    // everywhere else the last window closing must exit
+                    // the process — otherwise it idles headless forever
+                    // (the route is already gone, so no prompt is even
+                    // possible). The `confirm_before_quit` gate here was
+                    // macOS-only semantics wrongly applied cross-platform.
+                    if cfg!(not(target_os = "macos")) || !self.config.confirm_before_quit
+                    {
+                        event_loop.exit();
+                    }
                 }
             }
             #[cfg(target_os = "macos")]
@@ -1228,7 +1246,17 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 // Either way, by the time we see `CloseRequested`
                 // the user has already confirmed — just close.
                 if cfg!(any(target_os = "macos", target_os = "windows")) {
+                    #[cfg(unix)]
+                    if let Some(route) = self.router.routes.get_mut(&window_id) {
+                        route.detach_and_save_on_close();
+                    }
+                    // Remove (drops the closing window's contexts under
+                    // the detach flag), then clear so the flag can't
+                    // make other windows' later tab-closes detach and
+                    // leak daemons.
                     self.router.routes.remove(&window_id);
+                    #[cfg(unix)]
+                    crate::context::clear_quit_detaching();
                     if self.router.routes.is_empty() {
                         event_loop.exit();
                     }
@@ -1239,7 +1267,13 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     route.confirm_quit();
                     return;
                 } else {
+                    #[cfg(unix)]
+                    if let Some(route) = self.router.routes.get_mut(&window_id) {
+                        route.detach_and_save_on_close();
+                    }
                     self.router.routes.remove(&window_id);
+                    #[cfg(unix)]
+                    crate::context::clear_quit_detaching();
                 }
 
                 if self.router.routes.is_empty() {
@@ -2275,9 +2309,13 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
     // This is irreversible - if this event is emitted, it is guaranteed to be the last event that gets emitted.
     // You generally want to treat this as an “do on quit” event.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        if self.config.session.restore
-            == rio_backend::config::session::SessionRestore::Always
-        {
+        // Quitting must detach persistent panes, not kill them: the
+        // flag flips Context::drop from Kill to Shutdown for ptyd
+        // panes before the routes (and their contexts) are dropped.
+        #[cfg(unix)]
+        crate::context::set_quit_detaching();
+
+        if self.config.session.restore.enabled() {
             let max = self.config.session.max_scrollback_lines;
             let windows: Vec<crate::session::WindowState> = self
                 .router
