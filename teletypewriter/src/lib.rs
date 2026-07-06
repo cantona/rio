@@ -29,6 +29,20 @@ pub trait ProcessReadWrite {
     fn write_token(&self) -> corcovado::Token;
     fn set_winsize(&mut self, _: WinsizeBuilder) -> Result<(), io::Error>;
 
+    /// Terminate the child this pty represents. Default: no-op —
+    /// backends whose child lives elsewhere (e.g. behind a session
+    /// daemon) translate this into their own kill mechanism.
+    fn kill(&mut self) {}
+
+    /// True when bytes delivered since the last call were replayed
+    /// history rather than live output. The io loop uses it to
+    /// suppress terminal query replies during replay — stale answers
+    /// would be injected into the application as input. Default:
+    /// everything is live.
+    fn take_replay_pending(&mut self) -> bool {
+        false
+    }
+
     fn register(
         &mut self,
         _: &corcovado::Poll,

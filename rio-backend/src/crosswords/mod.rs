@@ -454,6 +454,12 @@ where
     pub route_id: usize,
     title_stack: Vec<String>,
     pub current_directory: Option<std::path::PathBuf>,
+    /// True while parsing replayed (historical) output from a session
+    /// daemon: query replies (DA, DSR, DECRPM, XTVERSION, ...) must be
+    /// suppressed — the queries were already answered when live, and
+    /// re-answering injects stale bytes into the shell as input
+    /// (minicom reads them as command keys, tmux as keystrokes).
+    pub suppress_replies: bool,
 
     /// Whether a `TerminalDamaged` event is already in flight to the renderer.
     /// Set by PTY thread before sending; cleared by renderer after extracting damage.
@@ -513,6 +519,7 @@ impl<U: EventListener> Crosswords<U> {
             route_id,
             title_stack: Default::default(),
             current_directory: None,
+            suppress_replies: false,
             damage_event_in_flight: false,
             keyboard_mode_stack: Default::default(),
             keyboard_mode_idx: 0,
@@ -1641,6 +1648,17 @@ impl<U: EventListener> Crosswords<U> {
         text.strip_suffix('\n').map(str::to_owned).unwrap_or(text)
     }
 
+    /// Send a query reply to the application — dropped while replayed
+    /// history is being parsed (see `suppress_replies`).
+    #[inline]
+    pub(crate) fn reply(&self, text: String) {
+        if self.suppress_replies {
+            return;
+        }
+        self.event_proxy
+            .send_event(RioEvent::PtyWrite(self.route_id, text), self.window_id);
+    }
+
     /// Serialize history + visible rows into a styled ANSI stream: text
     /// plus minimal SGR runs, replayable through the parser to rebuild
     /// the same content in a fresh terminal. At most the last
@@ -2170,13 +2188,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
             AnsiMode::Unknown(_) => ModeState::NotSupported,
         };
 
-        self.event_proxy.send_event(
-            RioEvent::PtyWrite(
-                self.route_id,
-                format!("\x1b[{};{}$y", mode.raw(), state as u8,),
-            ),
-            self.window_id,
-        );
+        self.reply(format!("\x1b[{};{}$y", mode.raw(), state as u8,));
     }
 
     #[inline]
@@ -2381,13 +2393,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
             PrivateMode::Unknown(_) => ModeState::NotSupported,
         };
 
-        self.event_proxy.send_event(
-            RioEvent::PtyWrite(
-                self.route_id,
-                format!("\x1b[?{};{}$y", mode.raw(), state as u8,),
-            ),
-            self.window_id,
-        );
+        self.reply(format!("\x1b[?{};{}$y", mode.raw(), state as u8,));
     }
 
     #[inline]
@@ -3111,21 +3117,18 @@ impl<U: EventListener> Handler for Crosswords<U> {
         }
     }
 
-    #[inline]
     fn identify_terminal(&mut self, intermediate: Option<char>) {
         match intermediate {
             None => {
                 trace!("Reporting primary device attributes");
                 let text = String::from("\x1b[?62;4;6;22c");
-                self.event_proxy
-                    .send_event(RioEvent::PtyWrite(self.route_id, text), self.window_id);
+                self.reply(text);
             }
             Some('>') => {
                 trace!("Reporting secondary device attributes");
                 let version = version_number(env!("CARGO_PKG_VERSION"));
                 let text = format!("\x1b[>0;{version};1c");
-                self.event_proxy
-                    .send_event(RioEvent::PtyWrite(self.route_id, text), self.window_id);
+                self.reply(text);
             }
             _ => debug!("Unsupported device attributes intermediate"),
         }
@@ -3136,16 +3139,14 @@ impl<U: EventListener> Handler for Crosswords<U> {
         trace!("Reporting terminal version (XTVERSION)");
         let version = env!("CARGO_PKG_VERSION");
         let text = format!("\x1bP>|Rio {version}\x1b\\");
-        self.event_proxy
-            .send_event(RioEvent::PtyWrite(self.route_id, text), self.window_id);
+        self.reply(text);
     }
 
     #[inline]
     fn report_keyboard_mode(&mut self) {
         let current_mode = self.keyboard_mode_stack[self.keyboard_mode_idx];
         let text = format!("\x1b[?{current_mode}u");
-        self.event_proxy
-            .send_event(RioEvent::PtyWrite(self.route_id, text), self.window_id);
+        self.reply(text);
     }
 
     #[inline]
@@ -3200,14 +3201,12 @@ impl<U: EventListener> Handler for Crosswords<U> {
         match arg {
             5 => {
                 let text = String::from("\x1b[0n");
-                self.event_proxy
-                    .send_event(RioEvent::PtyWrite(self.route_id, text), self.window_id);
+                self.reply(text);
             }
             6 => {
                 let pos = self.grid.cursor.pos;
                 let text = format!("\x1b[{};{}R", pos.row + 1, pos.col + 1);
-                self.event_proxy
-                    .send_event(RioEvent::PtyWrite(self.route_id, text), self.window_id);
+                self.reply(text);
             }
             _ => debug!("unknown device status query: {}", arg),
         };
@@ -3628,8 +3627,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
             self.graphics.cell_height, self.graphics.cell_width
         );
         debug!("cells_size_pixels {:?}", text);
-        self.event_proxy
-            .send_event(RioEvent::PtyWrite(self.route_id, text), self.window_id);
+        self.reply(text);
     }
 
     #[inline]
@@ -3640,8 +3638,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
             self.grid.columns()
         );
         debug!("text_area_size_chars {:?}", text);
-        self.event_proxy
-            .send_event(RioEvent::PtyWrite(self.route_id, text), self.window_id);
+        self.reply(text);
     }
 
     #[inline]
@@ -3741,10 +3738,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
             }
         };
 
-        self.event_proxy.send_event(
-            RioEvent::PtyWrite(self.route_id, generate_response(pi, ps, pv)),
-            self.window_id,
-        );
+        self.reply(generate_response(pi, ps, pv));
     }
 
     #[inline]
@@ -4357,20 +4351,17 @@ impl<U: EventListener> Handler for Crosswords<U> {
     #[inline]
     fn kitty_graphics_response(&mut self, response: String) {
         // Send response back to the terminal
-        self.event_proxy
-            .send_event(RioEvent::PtyWrite(self.route_id, response), self.window_id);
+        self.reply(response);
     }
 
     #[inline]
     fn xtgettcap_response(&mut self, response: String) {
-        self.event_proxy
-            .send_event(RioEvent::PtyWrite(self.route_id, response), self.window_id);
+        self.reply(response);
     }
 
     #[inline]
     fn glyph_protocol_response(&mut self, response: String) {
-        self.event_proxy
-            .send_event(RioEvent::PtyWrite(self.route_id, response), self.window_id);
+        self.reply(response);
     }
 
     fn glyph_register(

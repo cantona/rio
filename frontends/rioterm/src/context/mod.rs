@@ -10,7 +10,7 @@ use crate::event::{Msg, RioEvent};
 use crate::ime::Ime;
 pub use crate::layout::{ContextDimension, ContextGrid, ContextGridItem};
 use crate::messenger::Messenger;
-use crate::performer::{self, Machine};
+use crate::performer::Machine;
 use renderable::Cursor;
 use renderable::RenderableContent;
 use rio_backend::config::layout::Margin;
@@ -59,7 +59,7 @@ pub struct Context<T: EventListener> {
     pub dimension: ContextDimension,
     pub title: ContextTitle,
     pub ime: Ime,
-    _io_thread: Option<JoinHandle<(Machine<teletypewriter::Pty, T>, performer::State)>>,
+    _io_thread: Option<JoinHandle<()>>,
 }
 
 impl<T: rio_backend::event::EventListener> Drop for Context<T> {
