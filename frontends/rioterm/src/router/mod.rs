@@ -203,7 +203,9 @@ impl Route<'_> {
     /// Persist this window's tabs/splits/CWDs/scrollback to disk.
     pub fn save_session(&mut self) {
         let max = self.window.screen.renderer.session_max_scrollback;
-        let state = crate::session::SessionState {
+        let path = self.session_path();
+        #[allow(unused_mut)]
+        let mut state = crate::session::SessionState {
             version: crate::session::SESSION_VERSION,
             windows: vec![crate::session::capture_window(
                 self.window.screen.ctx(),
@@ -211,7 +213,12 @@ impl Route<'_> {
                 &self.window.winit_window,
             )],
         };
-        if let Err(err) = state.save(&self.session_path()) {
+        // Carry forward any still-alive daemons the old file recorded
+        // that this session didn't reattach, so overwriting the file
+        // never orphans them (and "new + keep old" stays resumable).
+        #[cfg(unix)]
+        crate::session::merge_kept_daemons(&mut state, &path);
+        if let Err(err) = state.save(&path) {
             tracing::warn!("session save failed: {err}");
         }
     }
@@ -295,6 +302,7 @@ impl Route<'_> {
                 .set_outer_position(PhysicalPosition::new(x, y));
         }
         let screen = &mut self.window.screen;
+        let mut restored_any = false;
         for tab in &win.tabs {
             let first = tab.layout.first_leaf();
 
@@ -308,10 +316,21 @@ impl Route<'_> {
             screen.context_manager.contexts_mut()[old_index]
                 .update_dimensions(&mut screen.sugarloaf);
 
-            screen.ctx_mut().add_context_with_dir(
-                crate::context::next_rich_text_id(),
-                first.cwd.clone(),
-            );
+            let created = screen
+                .ctx_mut()
+                .add_context_with_dir(crate::context::next_rich_text_id(), first.spawn());
+            if !created {
+                // Skip the lost tab; applying its layout would rebuild
+                // it inside whichever tab is still current. Rows and
+                // columns were computed for the grown margin above, so
+                // recompute for the reverted one too.
+                screen.resize_top_or_bottom_line(num_tabs);
+                #[cfg(not(target_os = "macos"))]
+                screen.context_manager.contexts_mut()[old_index]
+                    .update_dimensions(&mut screen.sugarloaf);
+                continue;
+            }
+            restored_any = true;
             let new_index = screen.context_manager.current_index();
             screen.context_manager.switch_context_visibility(
                 &mut screen.sugarloaf,
@@ -325,13 +344,29 @@ impl Route<'_> {
                 &mut screen.sugarloaf,
             );
         }
-        if replace {
+        // With nothing restored there is no tab to hand the window to:
+        // removing the default one would be close_current_context's
+        // len==1 case, which is a quit request — the window would kill
+        // itself at launch. Keep the default shell instead.
+        if replace && restored_any {
             // Drop the default tab the window opened with; the restored
-            // tabs then sit at their saved indices.
+            // tabs then sit at their saved indices. Under
+            // persistent=true that default tab spawned its own daemon at
+            // launch — never part of the restored session — so kill it
+            // cleanly first. Without this its Context::drop would send
+            // Kill with QUIT_DETACHING unset, SIGHUPing the shell into a
+            // stray `exited(129)` daemon that survives every launch.
             screen.ctx_mut().select_tab(0);
+            #[cfg(unix)]
+            {
+                crate::context::set_quit_detaching();
+                crate::session::kill_current_tab_daemons(screen.ctx());
+            }
             screen
                 .context_manager
                 .close_current_context(&mut screen.sugarloaf);
+            #[cfg(unix)]
+            crate::context::clear_quit_detaching();
             let num_tabs = screen.ctx().len();
             screen.resize_top_or_bottom_line(num_tabs);
             screen
@@ -636,10 +671,20 @@ impl Route<'_> {
                     (Key::Character(c), SessionPromptKind::SaveOnExit)
                         if c.as_str() == "n" || c.as_str() == "N" =>
                     {
+                        // Declining the save discards the session,
+                        // processes included — kill this window's v2
+                        // daemons synchronously (exit() runs no
+                        // destructors, so Context::drop never fires).
+                        #[cfg(unix)]
+                        crate::session::kill_persistent_panes(self.window.screen.ctx());
                         std::process::exit(0);
                     }
+                    // Resume: reattach the saved daemons.
                     (Key::Character(c), SessionPromptKind::ResumeOnLaunch)
-                        if c.as_str() == "y" || c.as_str() == "Y" =>
+                        if c.as_str() == "r"
+                            || c.as_str() == "R"
+                            || c.as_str() == "y"
+                            || c.as_str() == "Y" =>
                     {
                         self.window.screen.renderer.session_prompt.set_active(None);
                         if let Some(state) = self.pending_session.take() {
@@ -647,18 +692,35 @@ impl Route<'_> {
                         }
                         self.request_overlay_redraw();
                     }
+                    // Start new + discard old: kill the saved session's
+                    // daemons (they were never restored, so the file is
+                    // the only handle on them) THEN delete the file.
+                    // Skipping the kill would strand those daemons
+                    // forever — no file, no context, nothing to reclaim.
                     (Key::Character(c), SessionPromptKind::ResumeOnLaunch)
                         if c.as_str() == "n" || c.as_str() == "N" =>
                     {
                         self.window.screen.renderer.session_prompt.set_active(None);
-                        self.pending_session = None;
-                        crate::session::SessionState::discard(
-                            &rio_backend::config::session_file_path(),
-                        );
+                        if let Some(state) = self.pending_session.take() {
+                            #[cfg(unix)]
+                            crate::session::kill_saved_session_daemons(&state);
+                        }
+                        crate::session::SessionState::discard(&self.session_path());
                         self.request_overlay_redraw();
                     }
-                    // Esc cancels: on exit it aborts the quit, on
-                    // launch it keeps the file for next time.
+                    // Start new + keep old: leave the saved daemons alive
+                    // and the file on disk so a later launch can still
+                    // resume them; just don't attach now.
+                    (Key::Character(c), SessionPromptKind::ResumeOnLaunch)
+                        if c.as_str() == "k" || c.as_str() == "K" =>
+                    {
+                        self.window.screen.renderer.session_prompt.set_active(None);
+                        self.pending_session = None;
+                        self.request_overlay_redraw();
+                    }
+                    // Esc cancels: on exit it aborts the quit, on launch
+                    // it keeps the file and daemons for next time (same
+                    // as "new + keep old").
                     (Key::Named(NamedKey::Escape), _) => {
                         self.window.screen.renderer.session_prompt.set_active(None);
                         self.pending_session = None;

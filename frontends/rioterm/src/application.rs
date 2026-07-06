@@ -196,6 +196,16 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             self.app_id.as_deref(),
         );
 
+        // Reap dead daemons' stale sockets in the background.
+        #[cfg(unix)]
+        {
+            let _ = std::process::Command::new(crate::ptyd::ptyd_binary())
+                .arg("gc")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+
         if let Some(name) = self.session_name.clone() {
             // `rio --session <name>`: explicit binding restores the
             // named session (when it exists) regardless of the
@@ -210,16 +220,15 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 }
             }
         } else {
+            use rio_backend::config::session::SessionRestore;
             match self.config.session.restore {
-                rio_backend::config::session::SessionRestore::Never => {}
+                SessionRestore::Never => {}
                 mode => {
                     if let Some(state) = crate::session::SessionState::load(
                         &rio_backend::config::session_file_path(),
                     ) {
                         if let Some(route) = self.router.routes.values_mut().next() {
-                            if mode
-                                == rio_backend::config::session::SessionRestore::Always
-                            {
+                            if mode == SessionRestore::Always {
                                 route.restore_session(state);
                             } else {
                                 route.prompt_session_resume(state);

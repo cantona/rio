@@ -62,12 +62,16 @@ pub enum PaneBackend {
         /// cwd probe can't run — this is what session capture stores
         /// for the dead-daemon fresh-spawn fallback.
         reported_cwd: Option<String>,
+        /// True when this pane reattached to a pre-existing daemon
+        /// (its ring replays the prior screen). False for a freshly
+        /// spawned daemon — including the dead-daemon restore fallback,
+        /// whose empty ring replays nothing, so saved scrollback must
+        /// still be injected just like a plain-local pane.
+        replayed: bool,
     },
 }
 
 /// Where a restored pane should attach instead of spawning fresh.
-/// Constructed by the session-restore layer.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum AttachTarget {
     Unix {
@@ -78,6 +82,14 @@ pub enum AttachTarget {
         host: String,
         pane_id: String,
     },
+}
+
+/// What a restored pane needs to come back: where to reattach (a
+/// live daemon) and the cwd for the fresh-spawn fallback.
+#[derive(Clone, Debug, Default)]
+pub struct PaneSpawn {
+    pub cwd: Option<String>,
+    pub attach: Option<AttachTarget>,
 }
 
 /// Set while the application is quitting: persistent panes then
@@ -94,6 +106,27 @@ pub fn set_quit_detaching() {
 /// (the flag is a process global read by every `Context::drop`).
 pub fn clear_quit_detaching() {
     QUIT_DETACHING.store(false, Ordering::SeqCst);
+}
+
+/// Synchronously tell a local rio-ptyd daemon to kill its shell and
+/// unlink, over a fresh short-lived client connection. Sent on a
+/// deliberate close (tab close, declined save/resume, discarded restore
+/// tab) so the daemon flushes and cleanup()s instead of reaping a dead
+/// shell detached and lingering as `exited(129)`. Best effort: a daemon
+/// that already went away just refuses the connection. The single place
+/// the client side speaks Kill over a unix socket — all callers route
+/// here rather than re-encoding the frame sequence.
+#[cfg(unix)]
+pub(crate) fn kill_local_daemon(socket: &std::path::Path) {
+    use rio_ptyd::protocol as p;
+    if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) {
+        let _ = p::write_frame(
+            &mut stream,
+            p::FrameType::ClientHello,
+            &p::encode_client_hello(),
+        );
+        let _ = p::write_frame(&mut stream, p::FrameType::Kill, &[]);
+    }
 }
 
 pub struct Context<T: EventListener> {
@@ -123,25 +156,36 @@ impl<T: rio_backend::event::EventListener> Drop for Context<T> {
                 #[cfg(not(target_os = "windows"))]
                 teletypewriter::kill_pid(self.shell_pid as i32);
             }
-            PaneBackend::Ptyd { host, .. } => {
+            PaneBackend::Ptyd { host, socket, .. } => {
                 if QUIT_DETACHING.load(Ordering::SeqCst) {
                     // Detach: the daemon keeps the shell; even an
                     // unprocessed Shutdown is fine — process exit
                     // closing the socket IS a detach.
                     let _ = self.messenger.channel.send(Msg::Shutdown);
                 } else {
-                    // Deliberate close: the io thread forwards Kill
-                    // to the daemon, which SIGHUPs the shell.
-                    let _ = self.messenger.channel.send(Msg::Kill);
+                    // Deliberate close: kill the shell and unlink the
+                    // daemon. For a LOCAL daemon send the Kill frame
+                    // synchronously over the socket while this client is
+                    // still connected — the daemon then flushes and
+                    // cleanup()s (unlink), rather than lingering as
+                    // exited(129). NEVER kill_pid the shell here: the
+                    // daemon owns it in its own session, and racing it
+                    // with a direct SIGHUP is what left the daemon
+                    // reaping a dead shell with no client attached, i.e.
+                    // the lingering-exited leak. A remote daemon has no
+                    // local socket, so its Kill still rides the io
+                    // thread's ssh transport.
                     #[cfg(unix)]
                     if host.is_none() {
-                        // Belt and braces for local daemons only —
-                        // this pid belongs to another machine when
-                        // host is set.
-                        teletypewriter::kill_pid(self.shell_pid as i32);
+                        kill_local_daemon(socket);
+                    } else {
+                        let _ = self.messenger.channel.send(Msg::Kill);
                     }
                     #[cfg(not(unix))]
-                    let _ = host;
+                    {
+                        let _ = host;
+                        let _ = self.messenger.channel.send(Msg::Kill);
+                    }
                 }
             }
         }
@@ -335,12 +379,14 @@ pub fn create_mock_context<
         dimension,
         &config,
         None,
+        false,
     )
     .unwrap()
 }
 
 impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn create_context(
         cursor_state: (&Cursor, bool),
         event_proxy: T,
@@ -349,9 +395,10 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         dimension: ContextDimension,
         config: &ContextManagerConfig,
         attach: Option<&AttachTarget>,
+        force_local: bool,
     ) -> Result<Context<T>, Box<dyn Error>> {
         #[cfg(unix)]
-        if attach.is_some() || config.persistence.is_some() {
+        if !force_local && (attach.is_some() || config.persistence.is_some()) {
             let ring_bytes = config
                 .persistence
                 .as_ref()
@@ -613,6 +660,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 socket,
                 host,
                 reported_cwd: hello.cwd.clone(),
+                replayed: attach.is_some(),
             },
             _io_thread: io_thread,
         })
@@ -639,6 +687,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             size,
             &ctx_config,
             None,
+            false,
         ) {
             Ok(context) => context,
             Err(err_message) => {
@@ -725,6 +774,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             ContextDimension::default(),
             &config,
             None,
+            false,
         )?;
 
         Ok(ContextManager {
@@ -1161,37 +1211,89 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
     }
 
-    /// Split the current pane, spawning the new pane's shell at `dir`.
-    /// Forces the spawn (non-fork) pty path — the fork path has no
-    /// working-directory support.
+    /// Attach-first creation shared by the restore paths: try the
+    /// saved daemon, fall back to a fresh spawn at the saved cwd.
+    /// The fallback forces the non-fork pty path (fork has no
+    /// working-directory support) and stays plain-local: only a Local
+    /// backend runs inject_scrollback and honors the saved cwd.
+    fn create_restored_context(
+        &self,
+        rich_text_id: usize,
+        dimension: ContextDimension,
+        spawn: &PaneSpawn,
+    ) -> Result<Context<T>, Box<dyn Error>> {
+        let current = self.current();
+        let cursor = current.cursor_from_ref();
+        let blinking = current.renderable_content.has_blinking_enabled;
+
+        if let Some(target) = &spawn.attach {
+            match ContextManager::create_context(
+                (&cursor, blinking),
+                self.event_proxy.clone(),
+                self.window_id,
+                rich_text_id,
+                dimension,
+                &self.config,
+                Some(target),
+                false,
+            ) {
+                Ok(ctx) => return Ok(ctx),
+                Err(e) => {
+                    tracing::warn!("session reattach failed, spawning fresh: {e}");
+                }
+            }
+        }
+
+        let mut cloned_config = self.config.clone();
+        if let Some(cwd) = &spawn.cwd {
+            // A saved cwd can be stale (deleted since the save) or
+            // foreign (a remote pane's path when its host is
+            // unreachable); spawning there fails and would lose the
+            // whole tab. Fall back to the default working dir.
+            if std::path::Path::new(cwd).is_dir() {
+                cloned_config.working_dir = spawn.cwd.clone();
+                #[cfg(not(target_os = "windows"))]
+                {
+                    cloned_config.use_fork = false;
+                }
+            } else {
+                tracing::warn!(
+                    "session restore: saved cwd {cwd} unavailable, using default"
+                );
+            }
+        }
+        // force_local stays false: a dead saved daemon must be
+        // replaced by a *fresh* daemon (persistence on), not a plain
+        // pty. Otherwise the pane silently drops to PaneBackend::Local
+        // and the next save records no v2 binding — persistence would
+        // be lost for good after the daemon dies once. A fresh daemon
+        // replays nothing, so inject_scrollback still repaints the
+        // saved screen (gated on `replayed`, not on Local-vs-Ptyd).
+        // Only a genuine daemon-spawn failure degrades to local.
+        ContextManager::create_context(
+            (&cursor, blinking),
+            self.event_proxy.clone(),
+            self.window_id,
+            rich_text_id,
+            dimension,
+            &cloned_config,
+            None,
+            false,
+        )
+    }
+
+    /// Split the current pane for session restore. Returns whether the
+    /// new pane was created; on `false` the grid is unchanged and the
+    /// caller must not treat the current pane as the new leaf.
     pub fn split_with_dir(
         &mut self,
         rich_text_id: usize,
         split_down: bool,
         sugarloaf: &mut Sugarloaf,
-        dir: Option<String>,
-    ) {
-        let mut cloned_config = self.config.clone();
-        if dir.is_some() {
-            cloned_config.working_dir = dir;
-            #[cfg(not(target_os = "windows"))]
-            {
-                cloned_config.use_fork = false;
-            }
-        }
-
-        let current = self.current();
-        let cursor = current.cursor_from_ref();
-
-        match ContextManager::create_context(
-            (&cursor, current.renderable_content.has_blinking_enabled),
-            self.event_proxy.clone(),
-            self.window_id,
-            rich_text_id,
-            self.current().dimension,
-            &cloned_config,
-            None,
-        ) {
+        spawn: PaneSpawn,
+    ) -> bool {
+        match self.create_restored_context(rich_text_id, self.current().dimension, &spawn)
+        {
             Ok(new_context) => {
                 let new_route_id = new_context.route_id;
                 if split_down {
@@ -1200,45 +1302,33 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                     self.contexts[self.current_index].split_right(new_context, sugarloaf);
                 }
                 self.current_route = new_route_id;
+                true
             }
             Err(..) => {
                 tracing::error!("session restore: not able to create a split context");
+                false
             }
         }
     }
 
-    /// Add a tab whose shell spawns at `dir` (session restore). Same
-    /// spawn-path requirement as `split_with_dir`.
-    pub fn add_context_with_dir(&mut self, rich_text_id: usize, dir: Option<String>) {
-        let mut cloned_config = self.config.clone();
-        if dir.is_some() {
-            cloned_config.working_dir = dir;
-            #[cfg(not(target_os = "windows"))]
-            {
-                cloned_config.use_fork = false;
-            }
-        }
-
+    /// Add a tab for session restore: attach to the saved daemon when
+    /// possible, else spawn at the saved cwd. Returns whether the tab
+    /// was created; on `false` the previous tab is still current.
+    pub fn add_context_with_dir(
+        &mut self,
+        rich_text_id: usize,
+        spawn: PaneSpawn,
+    ) -> bool {
         if self.contexts.len() >= self.capacity {
-            return;
+            return false;
         }
         let last_index = self.contexts.len();
-        let current = self.current();
-        let cursor = current.cursor_from_ref();
-        let mut dimension = current.dimension;
+        let mut dimension = self.current().dimension;
         if self.current_grid().len() > 1 {
             dimension = self.current_grid().grid_dimension();
         }
 
-        match ContextManager::create_context(
-            (&cursor, current.renderable_content.has_blinking_enabled),
-            self.event_proxy.clone(),
-            self.window_id,
-            rich_text_id,
-            dimension,
-            &cloned_config,
-            None,
-        ) {
+        match self.create_restored_context(rich_text_id, dimension, &spawn) {
             Ok(new_context) => {
                 let previous_scaled_margin =
                     self.contexts[self.current_index].scaled_margin;
@@ -1251,9 +1341,11 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 ));
                 self.current_index = last_index;
                 self.current_route = self.current().route_id;
+                true
             }
             Err(..) => {
                 tracing::error!("session restore: not able to create a tab context");
+                false
             }
         }
     }
@@ -1461,6 +1553,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             self.current().dimension,
             &cloned_config,
             None,
+            false,
         ) {
             Ok(new_context) => {
                 let new_route_id = new_context.route_id;
@@ -1532,6 +1625,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             self.current().dimension,
             &context_manager_config,
             None,
+            false,
         ) {
             Ok(new_context) => {
                 let new_route_id = new_context.route_id;
@@ -1602,6 +1696,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 dimension,
                 &cloned_config,
                 None,
+                false,
             ) {
                 Ok(new_context) => {
                     let previous_scaled_margin =

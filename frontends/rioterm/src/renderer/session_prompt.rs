@@ -7,7 +7,10 @@ const RESUME_CHOICES: &str = "resume (r)  /  new+discard old (n)  /  new+keep ol
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum SessionPromptKind {
+    /// Quit-time "save session?" (restore = "prompt"). Declining
+    /// discards the session and kills any v2 daemons.
     SaveOnExit,
+    /// Launch-time "resume last session?" (restore = "prompt").
     ResumeOnLaunch,
 }
 
