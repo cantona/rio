@@ -18,6 +18,8 @@ mod mouse;
 #[cfg(windows)]
 mod panic;
 mod platform;
+#[cfg(unix)]
+mod ptyd;
 mod renderer;
 mod router;
 mod scheduler;

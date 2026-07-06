@@ -46,6 +46,49 @@ use teletypewriter::create_pty;
 #[cfg(not(target_os = "windows"))]
 use teletypewriter::{create_pty_with_fork, create_pty_with_spawn};
 
+/// How this pane's shell is hosted. `Ptyd` panes live behind a
+/// rio-ptyd session daemon and survive rio exiting.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PaneBackend {
+    Local,
+    Ptyd {
+        pane_id: String,
+        socket: std::path::PathBuf,
+        /// ssh destination when the daemon lives on another machine.
+        host: Option<String>,
+        /// cwd the daemon reported at attach (from the shell's
+        /// /proc/<pid>/cwd). Cached here because a ptyd pane's
+        /// `main_fd` is a placeholder, so the usual foreground-process
+        /// cwd probe can't run — this is what session capture stores
+        /// for the dead-daemon fresh-spawn fallback.
+        reported_cwd: Option<String>,
+    },
+}
+
+/// Where a restored pane should attach instead of spawning fresh.
+/// Constructed by the session-restore layer.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub enum AttachTarget {
+    Unix {
+        pane_id: String,
+        socket: std::path::PathBuf,
+    },
+    Ssh {
+        host: String,
+        pane_id: String,
+    },
+}
+
+/// Set while the application is quitting: persistent panes then
+/// detach (daemon keeps the shell) instead of killing.
+static QUIT_DETACHING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_quit_detaching() {
+    QUIT_DETACHING.store(true, Ordering::SeqCst);
+}
+
 pub struct Context<T: EventListener> {
     pub route_id: usize,
     pub terminal: Arc<FairMutex<Crosswords<T>>>,
@@ -59,16 +102,42 @@ pub struct Context<T: EventListener> {
     pub dimension: ContextDimension,
     pub title: ContextTitle,
     pub ime: Ime,
+    pub backend: PaneBackend,
     _io_thread: Option<JoinHandle<()>>,
 }
 
 impl<T: rio_backend::event::EventListener> Drop for Context<T> {
     fn drop(&mut self) {
-        // Shutdown the terminal's PTY.
-        let _ = self.messenger.channel.send(Msg::Shutdown);
+        match &self.backend {
+            PaneBackend::Local => {
+                // Shutdown the terminal's PTY.
+                let _ = self.messenger.channel.send(Msg::Shutdown);
 
-        #[cfg(not(target_os = "windows"))]
-        teletypewriter::kill_pid(self.shell_pid as i32);
+                #[cfg(not(target_os = "windows"))]
+                teletypewriter::kill_pid(self.shell_pid as i32);
+            }
+            PaneBackend::Ptyd { host, .. } => {
+                if QUIT_DETACHING.load(Ordering::SeqCst) {
+                    // Detach: the daemon keeps the shell; even an
+                    // unprocessed Shutdown is fine — process exit
+                    // closing the socket IS a detach.
+                    let _ = self.messenger.channel.send(Msg::Shutdown);
+                } else {
+                    // Deliberate close: the io thread forwards Kill
+                    // to the daemon, which SIGHUPs the shell.
+                    let _ = self.messenger.channel.send(Msg::Kill);
+                    #[cfg(unix)]
+                    if host.is_none() {
+                        // Belt and braces for local daemons only —
+                        // this pid belongs to another machine when
+                        // host is set.
+                        teletypewriter::kill_pid(self.shell_pid as i32);
+                    }
+                    #[cfg(not(unix))]
+                    let _ = host;
+                }
+            }
+        }
     }
 }
 
@@ -118,9 +187,17 @@ impl<T: EventListener> Context<T> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PersistenceOptions {
+    pub ring_bytes: usize,
+}
+
 #[derive(Clone, Default)]
 pub struct ContextManagerConfig {
     pub shell: Shell,
+    /// Some = run every pane behind a rio-ptyd daemon so it survives
+    /// rio exiting. None on Windows or when [session] persistent=false.
+    pub persistence: Option<PersistenceOptions>,
     #[cfg(not(target_os = "windows"))]
     pub use_fork: bool,
     pub working_dir: Option<String>,
@@ -182,6 +259,7 @@ pub fn create_dead_context<T: rio_backend::event::EventListener>(
         dimension,
         title: ContextTitle::default(),
         ime: Ime::new(),
+        backend: PaneBackend::Local,
         _io_thread: None,
     }
 }
@@ -216,6 +294,7 @@ pub fn create_mock_context<
         rich_text_id,
         dimension,
         &config,
+        None,
     )
     .unwrap()
 }
@@ -229,7 +308,42 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         rich_text_id: usize,
         dimension: ContextDimension,
         config: &ContextManagerConfig,
+        attach: Option<&AttachTarget>,
     ) -> Result<Context<T>, Box<dyn Error>> {
+        #[cfg(unix)]
+        if attach.is_some() || config.persistence.is_some() {
+            let ring_bytes = config
+                .persistence
+                .as_ref()
+                .map(|p| p.ring_bytes)
+                .unwrap_or(rio_ptyd::ring::DEFAULT_RING_BYTES);
+            match Self::create_ptyd_context(
+                cursor_state,
+                event_proxy.clone(),
+                window_id,
+                rich_text_id,
+                dimension,
+                config,
+                attach,
+                ring_bytes,
+            ) {
+                Ok(ctx) => return Ok(ctx),
+                // Explicit attach requests propagate their failure —
+                // the session layer owns the fallback (fresh spawn +
+                // saved scrollback).
+                Err(e) if attach.is_some() => return Err(Box::new(e)),
+                // Persistence-on spawn failures degrade gracefully to
+                // a plain local pty: the terminal always opens.
+                Err(e) => {
+                    tracing::warn!(
+                        "persistence unavailable, falling back to local pty: {e}"
+                    );
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = attach;
+
         let route_id = ROUTE_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
         let cols: u16 = dimension.columns.try_into().unwrap_or(MIN_COLUMNS as u16);
         let rows: u16 = dimension.lines.try_into().unwrap_or(MIN_LINES as u16);
@@ -307,21 +421,14 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             }
         }
 
-        let machine = Machine::new(
-            Arc::clone(&terminal),
+        let (messenger, io_thread) = Self::finish_machine(
             pty,
+            &terminal,
             event_proxy.clone(),
             window_id,
             route_id,
+            config.spawn_performer,
         )?;
-        let channel = machine.channel();
-        let io_thread = if config.spawn_performer {
-            Some(machine.spawn())
-        } else {
-            None
-        };
-
-        let messenger = Messenger::new(channel);
 
         Ok(Context {
             route_id,
@@ -336,6 +443,132 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             dimension,
             title: ContextTitle::default(),
             ime: Ime::new(),
+            backend: PaneBackend::Local,
+            _io_thread: io_thread,
+        })
+    }
+
+    /// Shared tail for any pty backend: build the io Machine, hand
+    /// back the messenger + (optionally spawned) io thread.
+    #[allow(clippy::type_complexity)]
+    fn finish_machine<P>(
+        pty: P,
+        terminal: &Arc<FairMutex<Crosswords<T>>>,
+        event_proxy: T,
+        window_id: WindowId,
+        route_id: usize,
+        spawn_performer: bool,
+    ) -> Result<(Messenger, Option<JoinHandle<()>>), Box<dyn Error>>
+    where
+        P: teletypewriter::EventedPty + Send + 'static,
+    {
+        let machine =
+            Machine::new(Arc::clone(terminal), pty, event_proxy, window_id, route_id)?;
+        let channel = machine.channel();
+        let io_thread = if spawn_performer {
+            Some(machine.spawn())
+        } else {
+            None
+        };
+        Ok((Messenger::new(channel), io_thread))
+    }
+
+    /// Create a pane hosted by a rio-ptyd daemon: either attach to an
+    /// existing one (session restore / remote pane) or spawn a fresh
+    /// local daemon. On any failure the caller decides the fallback.
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    fn create_ptyd_context(
+        cursor_state: (&Cursor, bool),
+        event_proxy: T,
+        window_id: WindowId,
+        rich_text_id: usize,
+        dimension: ContextDimension,
+        config: &ContextManagerConfig,
+        attach: Option<&AttachTarget>,
+        ring_bytes: usize,
+    ) -> Result<Context<T>, crate::ptyd::AttachError> {
+        use std::time::Duration;
+
+        let route_id = ROUTE_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let winsize = crate::renderer::utils::terminal_dimensions(&dimension);
+
+        let (pty, hello, pane_id, socket, host) = match attach {
+            Some(AttachTarget::Unix { pane_id, socket }) => {
+                let (pty, hello) = crate::ptyd::RemotePty::attach_unix(
+                    socket,
+                    &winsize,
+                    Duration::from_secs(2),
+                )?;
+                (pty, hello, pane_id.clone(), socket.clone(), None)
+            }
+            Some(AttachTarget::Ssh { host, pane_id }) => {
+                let (pty, hello) = crate::ptyd::RemotePty::attach_ssh(
+                    host,
+                    pane_id,
+                    &winsize,
+                    Duration::from_secs(15),
+                )?;
+                (
+                    pty,
+                    hello,
+                    pane_id.clone(),
+                    std::path::PathBuf::new(),
+                    Some(host.clone()),
+                )
+            }
+            None => {
+                let (pty, hello, pane_id, socket) = crate::ptyd::RemotePty::spawn_local(
+                    &config.shell.program,
+                    &config.shell.args,
+                    &config.working_dir,
+                    &winsize,
+                    ring_bytes,
+                )?;
+                (pty, hello, pane_id, socket, None)
+            }
+        };
+
+        let mut terminal = Crosswords::new(
+            dimension,
+            CursorShape::from_char(cursor_state.0.content),
+            event_proxy.clone(),
+            window_id,
+            route_id,
+            config.scrollback_history_limit,
+        );
+        terminal.blinking_cursor = cursor_state.1;
+        let terminal: Arc<FairMutex<Crosswords<T>>> = Arc::new(FairMutex::new(terminal));
+
+        let (messenger, io_thread) = Self::finish_machine(
+            pty,
+            &terminal,
+            event_proxy,
+            window_id,
+            route_id,
+            config.spawn_performer,
+        )
+        .map_err(|e| {
+            crate::ptyd::AttachError::Io(std::io::Error::other(e.to_string()))
+        })?;
+
+        Ok(Context {
+            route_id,
+            main_fd: Arc::new(-1),
+            shell_pid: hello.shell_pid,
+            messenger,
+            terminal,
+            rich_text_id,
+            renderable_content: RenderableContent::new(cursor_state.0.clone()),
+            dimension,
+            title: ContextTitle::default(),
+            ime: Ime::new(),
+            backend: PaneBackend::Ptyd {
+                pane_id,
+                socket,
+                host,
+                reported_cwd: hello.cwd.clone(),
+            },
             _io_thread: io_thread,
         })
     }
@@ -360,6 +593,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             rich_text_id,
             size,
             &ctx_config,
+            None,
         ) {
             Ok(context) => context,
             Err(err_message) => {
@@ -445,6 +679,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             0,
             ContextDimension::default(),
             &config,
+            None,
         )?;
 
         Ok(ContextManager {
@@ -897,6 +1132,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             rich_text_id,
             self.current().dimension,
             &cloned_config,
+            None,
         ) {
             Ok(new_context) => {
                 let new_route_id = new_context.route_id;
@@ -943,6 +1179,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             rich_text_id,
             dimension,
             &cloned_config,
+            None,
         ) {
             Ok(new_context) => {
                 let previous_scaled_margin =
@@ -1175,6 +1412,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             rich_text_id,
             self.current().dimension,
             &cloned_config,
+            None,
         ) {
             Ok(new_context) => {
                 let new_route_id = new_context.route_id;
@@ -1211,6 +1449,13 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             shell,
             working_dir,
             spawn_performer: true,
+            persistence: if cfg!(unix) && config.session.persistent {
+                Some(PersistenceOptions {
+                    ring_bytes: config.session.ring_bytes,
+                })
+            } else {
+                None
+            },
             #[cfg(not(target_os = "windows"))]
             use_fork: config.use_fork,
             is_native: config.navigation.is_native(),
@@ -1235,6 +1480,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             rich_text_id,
             self.current().dimension,
             &context_manager_config,
+            None,
         ) {
             Ok(new_context) => {
                 let new_route_id = new_context.route_id;
@@ -1308,6 +1554,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 rich_text_id,
                 dimension,
                 &cloned_config,
+                None,
             ) {
                 Ok(new_context) => {
                     let previous_scaled_margin =

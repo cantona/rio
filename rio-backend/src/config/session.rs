@@ -21,6 +21,17 @@ pub struct Session {
         rename = "max-scrollback-lines"
     )]
     pub max_scrollback_lines: usize,
+    /// Run each pane's shell behind a rio-ptyd daemon so it survives
+    /// rio exiting; session restore reattaches to the live shells.
+    #[serde(default)]
+    pub persistent: bool,
+    /// Replay buffer size per persistent pane, in bytes.
+    #[serde(default = "default_ring_bytes", rename = "persistent-ring-bytes")]
+    pub ring_bytes: usize,
+}
+
+fn default_ring_bytes() -> usize {
+    1024 * 1024
 }
 
 fn default_max_scrollback_lines() -> usize {
@@ -32,6 +43,8 @@ impl Default for Session {
         Session {
             restore: SessionRestore::default(),
             max_scrollback_lines: default_max_scrollback_lines(),
+            persistent: false,
+            ring_bytes: default_ring_bytes(),
         }
     }
 }

@@ -2263,8 +2263,15 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
     // This is irreversible - if this event is emitted, it is guaranteed to be the last event that gets emitted.
     // You generally want to treat this as an “do on quit” event.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Quitting must detach persistent panes, not kill them: the
+        // flag flips Context::drop from Kill to Shutdown for ptyd
+        // panes before the routes (and their contexts) are dropped.
+        #[cfg(unix)]
+        crate::context::set_quit_detaching();
+
         if self.config.session.restore
             == rio_backend::config::session::SessionRestore::Always
+            || self.config.session.persistent
         {
             let max = self.config.session.max_scrollback_lines;
             let windows: Vec<crate::session::WindowState> = self

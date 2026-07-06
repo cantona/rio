@@ -217,6 +217,13 @@ impl Screen<'_> {
             shell,
             working_dir,
             spawn_performer: true,
+            persistence: if cfg!(unix) && config.session.persistent {
+                Some(crate::context::PersistenceOptions {
+                    ring_bytes: config.session.ring_bytes,
+                })
+            } else {
+                None
+            },
             #[cfg(not(target_os = "windows"))]
             use_fork: config.use_fork,
             is_native,
