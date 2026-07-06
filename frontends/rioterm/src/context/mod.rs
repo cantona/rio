@@ -66,8 +66,6 @@ pub enum PaneBackend {
 }
 
 /// Where a restored pane should attach instead of spawning fresh.
-/// Constructed by the session-restore layer.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum AttachTarget {
     Unix {
@@ -78,6 +76,14 @@ pub enum AttachTarget {
         host: String,
         pane_id: String,
     },
+}
+
+/// What a restored pane needs to come back: where to reattach (a
+/// live daemon) and the cwd for the fresh-spawn fallback.
+#[derive(Clone, Debug, Default)]
+pub struct PaneSpawn {
+    pub cwd: Option<String>,
+    pub attach: Option<AttachTarget>,
 }
 
 /// Set while the application is quitting: persistent panes then
@@ -1106,35 +1112,66 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     /// Split the current pane, spawning the new pane's shell at `dir`.
     /// Forces the spawn (non-fork) pty path — the fork path has no
     /// working-directory support.
-    pub fn split_with_dir(
-        &mut self,
+    /// Attach-first creation shared by the restore paths: try the
+    /// saved daemon, fall back to a fresh spawn at the saved cwd.
+    /// Returns `(context, attached)`.
+    fn create_restored_context(
+        &self,
         rich_text_id: usize,
-        split_down: bool,
-        sugarloaf: &mut Sugarloaf,
-        dir: Option<String>,
-    ) {
+        dimension: ContextDimension,
+        spawn: &PaneSpawn,
+    ) -> Result<(Context<T>, bool), Box<dyn Error>> {
+        let current = self.current();
+        let cursor = current.cursor_from_ref();
+        let blinking = current.renderable_content.has_blinking_enabled;
+
+        if let Some(target) = &spawn.attach {
+            match ContextManager::create_context(
+                (&cursor, blinking),
+                self.event_proxy.clone(),
+                self.window_id,
+                rich_text_id,
+                dimension,
+                &self.config,
+                Some(target),
+            ) {
+                Ok(ctx) => return Ok((ctx, true)),
+                Err(e) => {
+                    tracing::warn!("session reattach failed, spawning fresh: {e}");
+                }
+            }
+        }
+
         let mut cloned_config = self.config.clone();
-        if dir.is_some() {
-            cloned_config.working_dir = dir;
+        if spawn.cwd.is_some() {
+            cloned_config.working_dir = spawn.cwd.clone();
             #[cfg(not(target_os = "windows"))]
             {
                 cloned_config.use_fork = false;
             }
         }
-
-        let current = self.current();
-        let cursor = current.cursor_from_ref();
-
-        match ContextManager::create_context(
-            (&cursor, current.renderable_content.has_blinking_enabled),
+        ContextManager::create_context(
+            (&cursor, blinking),
             self.event_proxy.clone(),
             self.window_id,
             rich_text_id,
-            self.current().dimension,
+            dimension,
             &cloned_config,
             None,
-        ) {
-            Ok(new_context) => {
+        )
+        .map(|ctx| (ctx, false))
+    }
+
+    pub fn split_with_dir(
+        &mut self,
+        rich_text_id: usize,
+        split_down: bool,
+        sugarloaf: &mut Sugarloaf,
+        spawn: PaneSpawn,
+    ) -> bool {
+        match self.create_restored_context(rich_text_id, self.current().dimension, &spawn)
+        {
+            Ok((new_context, attached)) => {
                 let new_route_id = new_context.route_id;
                 if split_down {
                     self.contexts[self.current_index].split_down(new_context, sugarloaf);
@@ -1142,46 +1179,34 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                     self.contexts[self.current_index].split_right(new_context, sugarloaf);
                 }
                 self.current_route = new_route_id;
+                attached
             }
             Err(..) => {
                 tracing::error!("session restore: not able to create a split context");
+                false
             }
         }
     }
 
-    /// Add a tab whose shell spawns at `dir` (session restore). Same
-    /// spawn-path requirement as `split_with_dir`.
-    pub fn add_context_with_dir(&mut self, rich_text_id: usize, dir: Option<String>) {
-        let mut cloned_config = self.config.clone();
-        if dir.is_some() {
-            cloned_config.working_dir = dir;
-            #[cfg(not(target_os = "windows"))]
-            {
-                cloned_config.use_fork = false;
-            }
-        }
-
+    /// Add a tab for session restore: attach to the saved daemon when
+    /// possible, else spawn at the saved cwd. Returns `true` when a
+    /// live daemon was attached (its replay repaints the pane).
+    pub fn add_context_with_dir(
+        &mut self,
+        rich_text_id: usize,
+        spawn: PaneSpawn,
+    ) -> bool {
         if self.contexts.len() >= self.capacity {
-            return;
+            return false;
         }
         let last_index = self.contexts.len();
-        let current = self.current();
-        let cursor = current.cursor_from_ref();
-        let mut dimension = current.dimension;
+        let mut dimension = self.current().dimension;
         if self.current_grid().len() > 1 {
             dimension = self.current_grid().grid_dimension();
         }
 
-        match ContextManager::create_context(
-            (&cursor, current.renderable_content.has_blinking_enabled),
-            self.event_proxy.clone(),
-            self.window_id,
-            rich_text_id,
-            dimension,
-            &cloned_config,
-            None,
-        ) {
-            Ok(new_context) => {
+        match self.create_restored_context(rich_text_id, dimension, &spawn) {
+            Ok((new_context, attached)) => {
                 let previous_scaled_margin =
                     self.contexts[self.current_index].scaled_margin;
                 self.contexts.push(ContextGrid::new(
@@ -1193,9 +1218,11 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 ));
                 self.current_index = last_index;
                 self.current_route = self.current().route_id;
+                attached
             }
             Err(..) => {
                 tracing::error!("session restore: not able to create a tab context");
+                false
             }
         }
     }
