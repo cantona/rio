@@ -1,5 +1,6 @@
 pub mod assistant;
 pub mod command_palette;
+pub mod confirm_close;
 pub mod confirm_quit;
 pub mod custom_cursor;
 pub mod helpers;
@@ -80,11 +81,16 @@ pub struct Renderer {
     pub search: search::SearchOverlay,
     pub assistant: assistant::AssistantOverlay,
     pub confirm_quit: confirm_quit::ConfirmQuit,
+    pub confirm_close: confirm_close::ConfirmClose,
     pub session_prompt: session_prompt::SessionPrompt,
     /// `[session]` config snapshot the prompt/save flows read — the
     /// renderer is rebuilt on config reload so this stays current.
     pub session_restore: rio_backend::config::session::SessionRestore,
     pub session_max_scrollback: usize,
+    /// Config snapshot for the close-confirm gate: when the quit
+    /// prompt will fire anyway, a "close this window?" ask is
+    /// redundant and skipped.
+    pub confirm_before_quit: bool,
     pub scrollbar: scrollbar::Scrollbar,
     #[allow(unused)]
     pub option_as_alt: String,
@@ -146,6 +152,8 @@ impl Renderer {
                     config.navigation.tab_fill_active,
                 );
                 island.close_on_hover = config.navigation.tab_close_on_hover;
+                island.close_confirm = config.navigation.tab_close_confirm
+                    == rio_backend::config::navigation::TabCloseConfirm::DoubleClick;
                 island
             })
         } else {
@@ -183,9 +191,11 @@ impl Renderer {
             search: search::SearchOverlay::default(),
             assistant: assistant::AssistantOverlay::default(),
             confirm_quit: confirm_quit::ConfirmQuit::default(),
+            confirm_close: confirm_close::ConfirmClose::default(),
             session_prompt: session_prompt::SessionPrompt::default(),
             session_restore: config.session.restore,
             session_max_scrollback: config.session.max_scrollback_lines,
+            confirm_before_quit: config.confirm_before_quit,
             scrollbar: scrollbar::Scrollbar::new(config.enable_scroll_bar),
             is_game_mode_enabled: config.renderer.strategy.is_game(),
             custom_mouse_cursor: config.effects.custom_mouse_cursor,
@@ -650,6 +660,11 @@ impl Renderer {
         );
 
         self.session_prompt.render(
+            sugarloaf,
+            (window_size.width, window_size.height, scale_factor),
+        );
+
+        self.confirm_close.render(
             sugarloaf,
             (window_size.width, window_size.height, scale_factor),
         );

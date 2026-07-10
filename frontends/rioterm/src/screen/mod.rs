@@ -452,6 +452,8 @@ impl Screen<'_> {
                 config.navigation.tab_fill_active,
             );
             island.close_on_hover = config.navigation.tab_close_on_hover;
+            island.close_confirm = config.navigation.tab_close_confirm
+                == rio_backend::config::navigation::TabCloseConfirm::DoubleClick;
             self.renderer.island = Some(island);
         }
 
@@ -1536,17 +1538,96 @@ impl Screen<'_> {
     }
 
     pub fn close_split_or_tab(&mut self, clipboard: &mut Clipboard) {
+        if !self.confirm_close_gate(crate::renderer::confirm_close::PendingClose::Current)
+        {
+            return;
+        }
+        self.close_split_or_tab_confirmed(clipboard);
+    }
+
+    pub fn close_split_or_tab_confirmed(&mut self, clipboard: &mut Clipboard) {
         if self.context_manager.current_grid_len() > 1 {
             self.clear_selection();
             self.context_manager
                 .remove_current_grid(&mut self.sugarloaf);
             self.mark_dirty();
         } else {
-            self.close_tab(clipboard);
+            self.close_tab_confirmed(clipboard);
         }
     }
 
+    /// Misclick guard shared by every close entry point. Returns true
+    /// when the close may proceed; false when it was consumed (overlay
+    /// shown, or double-click arm set).
+    fn confirm_close_gate(
+        &mut self,
+        pending: crate::renderer::confirm_close::PendingClose,
+    ) -> bool {
+        use crate::renderer::confirm_close::PendingClose;
+        use rio_backend::config::navigation::TabCloseConfirm;
+        match self.renderer.navigation.tab_close_confirm {
+            TabCloseConfirm::Never => true,
+            TabCloseConfirm::Ask => {
+                let pending = if self.context_manager.len() <= 1 {
+                    // Closing the last tab closes the window. When the
+                    // quit prompt will ask anyway, a second "close this
+                    // window?" is redundant — let the close proceed
+                    // into that prompt.
+                    if self.renderer.confirm_before_quit {
+                        return true;
+                    }
+                    PendingClose::Window
+                } else {
+                    pending
+                };
+                self.renderer.confirm_close.set_pending(Some(pending));
+                self.mark_dirty();
+                false
+            }
+            TabCloseConfirm::DoubleClick => {
+                // With a single tab there is no visible close button to
+                // arm — invisible arming would just eat the keypress.
+                if self.context_manager.len() <= 1 {
+                    return true;
+                }
+                let idx = match pending {
+                    PendingClose::Tab(i) => i,
+                    PendingClose::Current | PendingClose::Window => {
+                        self.context_manager.current_index()
+                    }
+                };
+                let confirmed = self
+                    .renderer
+                    .island
+                    .as_mut()
+                    .is_none_or(|island| island.confirm_close_click(idx));
+                if !confirmed {
+                    self.mark_dirty();
+                    self.context_manager.notify_close_armed();
+                }
+                confirmed
+            }
+        }
+    }
+
+    /// Close a specific tab by index, guard already passed.
+    pub fn close_tab_at(&mut self, tab_index: usize, clipboard: &mut Clipboard) {
+        if tab_index != self.context_manager.current_index() {
+            self.context_manager.select_tab(tab_index);
+        }
+        self.close_tab_confirmed(clipboard);
+    }
+
     pub fn close_tab(&mut self, clipboard: &mut Clipboard) {
+        if !self.confirm_close_gate(crate::renderer::confirm_close::PendingClose::Tab(
+            self.context_manager.current_index(),
+        )) {
+            return;
+        }
+        self.close_tab_confirmed(clipboard);
+    }
+
+    pub fn close_tab_confirmed(&mut self, clipboard: &mut Clipboard) {
         self.clear_selection();
         self.context_manager
             .close_current_context(&mut self.sugarloaf);
@@ -2872,10 +2953,12 @@ impl Screen<'_> {
         {
             self.stop_hint_mode_if_active();
             self.last_close_press = Some((std::time::Instant::now(), mouse_x_unscaled));
-            if clicked_tab != self.context_manager.current_index() {
-                self.context_manager.select_tab(clicked_tab);
+            if !self.confirm_close_gate(
+                crate::renderer::confirm_close::PendingClose::Tab(clicked_tab),
+            ) {
+                return true;
             }
-            self.close_tab(clipboard);
+            self.close_tab_at(clicked_tab, clipboard);
             return true;
         }
 
