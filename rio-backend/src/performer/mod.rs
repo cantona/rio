@@ -205,7 +205,9 @@ where
                 }),
             };
 
-            // Parse the incoming bytes.
+            // Parse the incoming bytes; replayed history must not
+            // generate query replies (stale answers become input).
+            terminal.suppress_replies = self.pty.take_replay_pending();
             state.parser.advance(&mut **terminal, &buf[..unprocessed]);
 
             processed += unprocessed;
@@ -246,6 +248,10 @@ where
                     let _ = self.pty.set_winsize(window_size);
                 }
                 Msg::Shutdown => return false,
+                Msg::Kill => {
+                    self.pty.kill();
+                    return false;
+                }
             }
         }
 
@@ -308,7 +314,7 @@ where
         self.sender.clone()
     }
 
-    pub fn spawn(mut self) -> JoinHandle<(Self, State)> {
+    pub fn spawn(mut self) -> JoinHandle<()> {
         spawn_named("PTY reader", move || {
             let mut state = State::default();
             let mut buf = [0u8; READ_BUFFER_SIZE];
@@ -458,8 +464,6 @@ where
             // The evented instances are not dropped here so deregister them explicitly.
             let _ = self.poll.deregister(&self.receiver.rx);
             let _ = self.pty.deregister(&self.poll);
-
-            (self, state)
         })
     }
 }

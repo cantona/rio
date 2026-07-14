@@ -164,6 +164,10 @@ impl ProcessReadWrite for Pty {
         self.child.set_winsize(winsize)
     }
 
+    fn kill(&mut self) {
+        kill_pid(*self.child.pid);
+    }
+
     #[inline]
     fn register(
         &mut self,
