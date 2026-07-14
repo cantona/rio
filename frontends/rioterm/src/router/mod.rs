@@ -274,10 +274,9 @@ impl Route<'_> {
             screen.context_manager.contexts_mut()[old_index]
                 .update_dimensions(&mut screen.sugarloaf);
 
-            screen.ctx_mut().add_context_with_dir(
-                crate::context::next_rich_text_id(),
-                first.cwd.clone(),
-            );
+            screen
+                .ctx_mut()
+                .add_context_with_dir(crate::context::next_rich_text_id(), first.spawn());
             let new_index = screen.context_manager.current_index();
             screen.context_manager.switch_context_visibility(
                 &mut screen.sugarloaf,
@@ -602,6 +601,12 @@ impl Route<'_> {
                     (Key::Character(c), SessionPromptKind::SaveOnExit)
                         if c.as_str() == "n" || c.as_str() == "N" =>
                     {
+                        // Declining the save discards the session,
+                        // processes included — kill this window's
+                        // persistent daemons synchronously (exit()
+                        // runs no destructors, so Context::drop's
+                        // Msg::Kill path never fires here).
+                        crate::session::kill_persistent_panes(self.window.screen.ctx());
                         std::process::exit(0);
                     }
                     (Key::Character(c), SessionPromptKind::ResumeOnLaunch)

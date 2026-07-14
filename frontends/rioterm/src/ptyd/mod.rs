@@ -485,7 +485,14 @@ impl RemotePty {
                             "daemon hello timeout",
                         )));
                     }
-                    let mut tmp = [0u8; 65536];
+                    // Byte-at-a-time on purpose: everything after the
+                    // hello frame (the replay stream) must stay in the
+                    // socket buffer so the io loop's epoll sees it the
+                    // moment the fd registers — bytes hoarded in our
+                    // decoder would wake nothing and leave the pane
+                    // blank until fresh output arrives. Hello is ~40
+                    // bytes; the syscall cost is irrelevant.
+                    let mut tmp = [0u8; 1];
                     let r =
                         unsafe { libc::read(rfd, tmp.as_mut_ptr() as *mut _, tmp.len()) };
                     if r > 0 {

@@ -8,7 +8,7 @@ use std::path::Path;
 
 /// Bumped whenever the on-disk shape changes; mismatched files are
 /// discarded rather than migrated.
-pub const SESSION_VERSION: u32 = 1;
+pub const SESSION_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 pub struct SessionState {
@@ -56,7 +56,44 @@ pub struct PaneState {
     pub cwd: Option<String>,
     pub title: Option<String>,
     pub is_active: bool,
+    /// Fallback repaint for panes without a live daemon.
     pub scrollback: String,
+    /// rio-ptyd binding: present for persistent panes; restore
+    /// reattaches to the daemon (its replay repaints the pane).
+    #[serde(default)]
+    pub pane_id: Option<String>,
+    #[serde(default)]
+    pub socket: Option<String>,
+    /// ssh destination when the daemon lives on another machine.
+    #[serde(default)]
+    pub host: Option<String>,
+}
+
+impl PaneState {
+    /// Attach target when this pane recorded a daemon binding.
+    pub fn attach_target(&self) -> Option<context::AttachTarget> {
+        let pane_id = self.pane_id.clone()?;
+        match &self.host {
+            Some(host) => Some(context::AttachTarget::Ssh {
+                host: host.clone(),
+                pane_id,
+            }),
+            None => self
+                .socket
+                .as_ref()
+                .map(|socket| context::AttachTarget::Unix {
+                    pane_id: pane_id.clone(),
+                    socket: std::path::PathBuf::from(socket),
+                }),
+        }
+    }
+
+    pub fn spawn(&self) -> context::PaneSpawn {
+        context::PaneSpawn {
+            cwd: self.cwd.clone(),
+            attach: self.attach_target(),
+        }
+    }
 }
 
 impl LayoutNode {
@@ -86,6 +123,35 @@ impl SessionState {
 
     pub fn discard(path: &Path) {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Synchronously kill every local persistent pane of this window:
+/// used when the user declines the save prompt — "don't save" means
+/// discard the session including its processes. Blocking socket
+/// writes so the frames are delivered before the caller exits.
+/// Remote (ssh-hosted) panes are left alone: their lifecycle belongs
+/// to the remote machine.
+pub fn kill_persistent_panes<T: EventListener + Clone + Send + 'static>(
+    ctx_manager: &ContextManager<T>,
+) {
+    for grid in ctx_manager.grids() {
+        for item in grid.contexts().values() {
+            if let context::PaneBackend::Ptyd {
+                socket, host: None, ..
+            } = &item.val.backend
+            {
+                if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) {
+                    use rio_ptyd::protocol as p;
+                    let _ = p::write_frame(
+                        &mut stream,
+                        p::FrameType::ClientHello,
+                        &p::encode_client_hello(),
+                    );
+                    let _ = p::write_frame(&mut stream, p::FrameType::Kill, &[]);
+                }
+            }
+        }
     }
 }
 
@@ -173,11 +239,27 @@ fn capture_pane<T: EventListener>(
     let scrollback = terminal.scrollback_to_ansi(max_scrollback_lines);
     drop(terminal);
 
+    let (pane_id, socket, host) = match &ctx.backend {
+        context::PaneBackend::Local => (None, None, None),
+        context::PaneBackend::Ptyd {
+            pane_id,
+            socket,
+            host,
+        } => (
+            Some(pane_id.clone()),
+            Some(socket.to_string_lossy().into_owned()).filter(|s| !s.is_empty()),
+            host.clone(),
+        ),
+    };
+
     PaneState {
         cwd,
         title: Some(ctx.title.content.clone()).filter(|t| !t.is_empty()),
         is_active,
         scrollback,
+        pane_id,
+        socket,
+        host,
     }
 }
 
@@ -216,7 +298,7 @@ fn build_node<T: EventListener + Clone + Send + 'static>(
                     context::next_rich_text_id(),
                     *direction == SplitDir::Vertical,
                     sugarloaf,
-                    child.first_leaf().cwd.clone(),
+                    child.first_leaf().spawn(),
                 );
                 leaves.push(ctx_manager.current_grid().current);
             }
@@ -236,6 +318,11 @@ fn inject_scrollback<T: EventListener + Clone + Send + 'static>(
         return;
     }
     let ctx = ctx_manager.current_mut();
+    // A pane attached to a live daemon repaints from the daemon's
+    // replay stream; injecting saved scrollback would duplicate it.
+    if !matches!(ctx.backend, context::PaneBackend::Local) {
+        return;
+    }
     let mut processor = rio_backend::performer::handler::Processor::default();
     let mut terminal = ctx.terminal.lock();
     processor.advance(&mut *terminal, pane.scrollback.as_bytes());
