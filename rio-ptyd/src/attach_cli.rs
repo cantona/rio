@@ -187,20 +187,38 @@ fn interactive_loop(stream: &mut UnixStream) -> io::Result<i32> {
                 }
                 Ok(n) => {
                     let data = &buf[..n];
-                    // Detach chord: two consecutive Ctrl-\ bytes.
+                    // Detach chord: two consecutive Ctrl-\ (0x1C) bytes.
+                    // The first 0x1C is withheld from the pane until we
+                    // know whether the chord completes — forwarding it
+                    // eagerly would deliver a stray SIGQUIT to the app
+                    // (dtach/screen behave the same). `prev_quit` marks a
+                    // withheld 0x1C carried across reads.
+                    let mut forward: Vec<u8> = Vec::with_capacity(n);
+                    let mut detached = false;
                     for &b in data {
                         if b == 0x1C {
                             if prev_quit {
                                 let _ =
                                     protocol::write_frame(stream, FrameType::Detach, &[]);
-                                return Ok(-1);
+                                detached = true;
+                                break;
                             }
                             prev_quit = true;
                         } else {
-                            prev_quit = false;
+                            if prev_quit {
+                                // Chord aborted: release the withheld byte.
+                                forward.push(0x1C);
+                                prev_quit = false;
+                            }
+                            forward.push(b);
                         }
                     }
-                    queue_frame(&mut pending_out, FrameType::Stdin, data);
+                    if detached {
+                        return Ok(-1);
+                    }
+                    if !forward.is_empty() {
+                        queue_frame(&mut pending_out, FrameType::Stdin, &forward);
+                    }
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {
                     // Possibly SIGWINCH via poll EINTR: resend size.

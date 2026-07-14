@@ -261,6 +261,11 @@ pub fn configure_window(winit_window: &Window, config: &Config) {
     // Toggle decorations at runtime so `window.decorations` hot-reloads
     // without a restart. Mirrors the build-time mapping: only `Disabled`
     // turns the server-side decorations off.
+    //
+    // The macOS `Transparent` / `Buttonless` axes map to build-time
+    // WindowAttributes (with_titlebar_transparent /
+    // with_titlebar_buttons_hidden) with no runtime setter, so changing
+    // between those and other modes still requires a restart.
     winit_window
         .set_decorations(!matches!(config.window.decorations, Decorations::Disabled));
 }

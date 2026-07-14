@@ -865,10 +865,17 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             _ => return false,
         };
 
-        const MIN_PANE: f32 = 50.0;
+        // Scale the floor by DPI so the keyboard minimum matches the
+        // mouse-resize floor (50.0 * scale) rather than shrinking on
+        // HiDPI displays. Floor against the smallest leaf pane inside
+        // each subtree — flooring the subtrees alone lets a nested pane
+        // be squeezed to a sliver while its parent still clears the min.
+        let min_pane = 50.0 * self.scale;
+        let min_a = self.subtree_axis_min(child_a, horizontal, min_pane);
+        let min_b = self.subtree_axis_min(child_b, horizontal, min_pane);
         let new_a = size_a + delta;
         let new_b = size_b - delta;
-        if new_a < MIN_PANE || new_b < MIN_PANE {
+        if new_a < min_a || new_b < min_b {
             return false;
         }
 
@@ -908,6 +915,36 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             request_b -= residual;
         }
         applied
+    }
+
+    /// Minimum extent (physical px) that `node`'s subtree needs along
+    /// the resize axis so every leaf pane inside it stays at least
+    /// `leaf_min` wide/tall. A leaf contributes `leaf_min`; a container
+    /// stacking along the axis sums its children (they share the axis);
+    /// one splitting across the axis takes the max (they overlap on it).
+    fn subtree_axis_min(&self, node: NodeId, horizontal: bool, leaf_min: f32) -> f32 {
+        let children = match self.tree.children(node) {
+            Ok(c) if !c.is_empty() => c,
+            _ => return leaf_min,
+        };
+        let along_axis = match self.tree.style(node) {
+            Ok(s) => {
+                let is_row = matches!(
+                    s.flex_direction,
+                    taffy::FlexDirection::Row | taffy::FlexDirection::RowReverse
+                );
+                is_row == horizontal
+            }
+            Err(_) => return leaf_min,
+        };
+        let child_mins = children
+            .iter()
+            .map(|&c| self.subtree_axis_min(c, horizontal, leaf_min));
+        if along_axis {
+            child_mins.sum()
+        } else {
+            child_mins.fold(leaf_min, f32::max)
+        }
     }
 
     /// The two children of the deepest common flex container (with the

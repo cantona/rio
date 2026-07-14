@@ -1502,6 +1502,7 @@ impl Screen<'_> {
             .move_divider_up(amount, &mut self.sugarloaf)
         {
             self.mark_dirty();
+            self.context_manager.autosave_on_change();
         }
     }
 
@@ -1512,6 +1513,7 @@ impl Screen<'_> {
             .move_divider_down(amount, &mut self.sugarloaf)
         {
             self.mark_dirty();
+            self.context_manager.autosave_on_change();
         }
     }
 
@@ -1522,6 +1524,7 @@ impl Screen<'_> {
             .move_divider_left(amount, &mut self.sugarloaf)
         {
             self.mark_dirty();
+            self.context_manager.autosave_on_change();
         }
     }
 
@@ -1532,6 +1535,7 @@ impl Screen<'_> {
             .move_divider_right(amount, &mut self.sugarloaf)
         {
             self.mark_dirty();
+            self.context_manager.autosave_on_change();
         }
     }
 

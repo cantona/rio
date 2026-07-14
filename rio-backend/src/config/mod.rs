@@ -658,6 +658,7 @@ impl Config {
             crate::config::navigation::clamp_unfocused_split_opacity(
                 self.navigation.unfocused_split_opacity,
             );
+        self.navigation.clamp_tab_geometry();
 
         // Merge renderer fields individually
         if let Some(renderer_overwrite) = &platform_config.renderer {

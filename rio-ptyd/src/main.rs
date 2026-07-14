@@ -139,30 +139,40 @@ fn run(args: Vec<String>) -> i32 {
                     serde_json::to_string(&entries).unwrap_or_else(|_| "[]".into())
                 );
             } else {
+                // Strip control bytes from attacker-influenced fields
+                // (comm via PR_SET_NAME, cwd, session) so a crafted name
+                // can't inject escape sequences into this terminal.
+                let sanitize = |s: &str| -> String {
+                    s.chars()
+                        .map(|c| if c.is_control() { '?' } else { c })
+                        .collect()
+                };
                 for m in &panes {
+                    let alive = sockdir::pid_alive(m.daemon_pid);
                     let state = if let Some(code) = m.exited_status {
                         format!("exited({code})")
-                    } else if sockdir::pid_alive(m.daemon_pid) {
+                    } else if alive {
                         "running".into()
                     } else {
                         "dead".into()
                     };
                     // Show what the pane is doing: the foreground
                     // program when one is running, else the cwd (an
-                    // idle prompt). Exited panes have no live foreground.
-                    let activity = m
-                        .exited_status
-                        .is_none()
+                    // idle prompt). Only a live daemon has a foreground
+                    // — for a dead one shell_pid may already be reused
+                    // by an unrelated process.
+                    let activity = (m.exited_status.is_none() && alive)
                         .then(|| sockdir::foreground_activity(m.shell_pid))
                         .flatten()
                         .or_else(|| m.cwd.clone())
+                        .map(|s| sanitize(&s))
                         .unwrap_or_else(|| "-".into());
                     println!(
                         "{}  {:8}  pid {:>7}  [{}]  {}",
                         m.pane_id,
                         state,
                         m.shell_pid,
-                        m.session.as_deref().unwrap_or("-"),
+                        sanitize(m.session.as_deref().unwrap_or("-")),
                         activity,
                     );
                 }
@@ -188,6 +198,7 @@ fn run(args: Vec<String>) -> i32 {
             let sock = sockdir::socket_path(&base, id);
             let killed = std::os::unix::net::UnixStream::connect(&sock)
                 .and_then(|mut s| {
+                    use std::io::Read;
                     rio_ptyd::protocol::write_frame(
                         &mut s,
                         rio_ptyd::protocol::FrameType::ClientHello,
@@ -197,14 +208,35 @@ fn run(args: Vec<String>) -> i32 {
                         &mut s,
                         rio_ptyd::protocol::FrameType::Kill,
                         &[],
-                    )
+                    )?;
+                    // A daemon that actually processed the Kill exits and
+                    // closes the socket. Read until EOF so we don't treat
+                    // a write into a doomed connection as success and skip
+                    // the fallback; drain to a small scratch buffer.
+                    let mut scratch = [0u8; 256];
+                    loop {
+                        match s.read(&mut scratch) {
+                            Ok(0) => break,
+                            Ok(_) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    Ok(())
                 })
                 .is_ok();
             if !killed {
                 if let Ok(meta) = sockdir::read_meta(&base, id) {
+                    // The pids in stale metadata may have been recycled
+                    // by unrelated same-uid processes; only signal one
+                    // that still matches the daemon we recorded.
                     unsafe {
-                        libc::kill(meta.shell_pid, libc::SIGHUP);
-                        libc::kill(meta.daemon_pid, libc::SIGTERM);
+                        if sockdir::pid_matches_start(meta.shell_pid, meta.created_at) {
+                            libc::kill(meta.shell_pid, libc::SIGHUP);
+                        }
+                        if sockdir::pid_matches_start(meta.daemon_pid, meta.created_at) {
+                            libc::kill(meta.daemon_pid, libc::SIGTERM);
+                        }
                     }
                 }
                 sockdir::remove_pane_files(&base, id);
@@ -229,7 +261,11 @@ fn run(args: Vec<String>) -> i32 {
                 if daemon_dead && unreachable && old_enough {
                     if dry {
                         println!("would remove {}", m.pane_id);
-                    } else {
+                    } else if std::os::unix::net::UnixStream::connect(&sock).is_err() {
+                        // Re-check liveness right before unlinking: on
+                        // pane-id reuse a fresh daemon may have bound this
+                        // socket since the scan above, and removing its
+                        // files would orphan a healthy pane.
                         sockdir::remove_pane_files(&base, &m.pane_id);
                     }
                 }

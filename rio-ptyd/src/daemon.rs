@@ -216,7 +216,8 @@ fn daemon_main(
     }) {
         Ok(c) => c,
         Err(e) => {
-            let _ = writeln_fd(&handshake, &format!("{{\"error\":\"{e}\"}}"));
+            let line = serde_json::json!({ "error": e.to_string() }).to_string();
+            let _ = writeln_fd(&handshake, &line);
             std::process::exit(1);
         }
     };
@@ -237,13 +238,13 @@ fn daemon_main(
         std::process::exit(1);
     }
 
-    let hello = format!(
-        "{{\"pane_id\":\"{}\",\"socket\":\"{}\",\"daemon_pid\":{},\"shell_pid\":{}}}",
-        pane_id,
-        sock_path.display(),
-        meta.daemon_pid,
-        meta.shell_pid
-    );
+    let hello = serde_json::json!({
+        "pane_id": pane_id,
+        "socket": sock_path.display().to_string(),
+        "daemon_pid": meta.daemon_pid,
+        "shell_pid": meta.shell_pid,
+    })
+    .to_string();
     let _ = writeln_fd(&handshake, &hello);
     drop(handshake);
 
@@ -587,7 +588,11 @@ impl Daemon {
             }
             if hello && promote.is_none() {
                 promote = Some(i);
-            } else if closed {
+            } else if hello || closed {
+                // A second connection that also completed its hello in
+                // this pass has had its ClientHello consumed and can no
+                // longer be promoted; drop it now (the peer retries)
+                // rather than leave it parked until the hello deadline.
                 drop_idx.push(i);
             }
         }
@@ -855,6 +860,13 @@ impl Daemon {
             // the remainder is an unparseable partial that will never
             // complete — a genuinely stuck or hostile peer. Drop it.
             if c.dec.buffered() > DECODER_BACKLOG_CAP {
+                drop_client = true;
+            }
+            // Bound the reply queue on the input path too: a peer that
+            // floods Ping (each answered with a queued Pong) but never
+            // reads would grow outbuf without limit. The pty-out path
+            // has its own cap; this covers control-frame replies.
+            if c.outbuf.len() - c.outbuf_off > CLIENT_OUTBUF_CAP {
                 drop_client = true;
             }
         }

@@ -142,6 +142,55 @@ pub fn pid_alive(pid: i32) -> bool {
     pid > 0 && unsafe { libc::kill(pid, 0) } == 0
 }
 
+/// True when `pid` still looks like the process the pane recorded, so a
+/// blind signal can't hit an unrelated same-uid process that recycled
+/// the pid. A recycled pid started long after the pane's `created_at`;
+/// the pane's own daemon/shell started at or before it. Linux reads the
+/// process start-time from `/proc`; other platforms only check liveness.
+pub fn pid_matches_start(pid: i32, created_at: u64) -> bool {
+    if !pid_alive(pid) {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match proc_start_epoch(pid) {
+            // A generous slack absorbs clock skew and the gap between
+            // fork and the meta write; a recycled pid is off by far more.
+            Some(start) => start <= created_at.saturating_add(5),
+            // Can't read start-time: fall back to liveness alone.
+            None => true,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = created_at;
+        true
+    }
+}
+
+/// Wall-clock epoch (seconds) at which `pid` started, from
+/// `/proc/<pid>/stat` field 22 (starttime, in clock ticks since boot)
+/// plus the system boot time from `/proc/stat` `btime`.
+#[cfg(target_os = "linux")]
+fn proc_start_epoch(pid: i32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm (field 2) is parenthesized and may hold spaces/parens; split
+    // on the last ')' to reach the space-delimited tail. After it the
+    // fields are state(3)..starttime(22), so starttime is token index 19.
+    let tail = &stat[stat.rfind(')')? + 1..];
+    let starttime_ticks: u64 = tail.split_whitespace().nth(19)?.parse().ok()?;
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz <= 0 {
+        return None;
+    }
+    let btime = fs::read_to_string("/proc/stat").ok().and_then(|s| {
+        s.lines()
+            .find_map(|l| l.strip_prefix("btime "))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })?;
+    Some(btime + starttime_ticks / hz as u64)
+}
+
 /// Name of the program currently in the foreground of `shell_pid`'s
 /// controlling terminal, or None when the shell itself is foreground
 /// (idle prompt) or nothing can be read. Lets `list` show "vim"/"ssh"

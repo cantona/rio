@@ -37,12 +37,19 @@ pub struct TabGeom {
 
 impl TabGeom {
     pub fn from_navigation(nav: &rio_backend::config::navigation::Navigation) -> Self {
+        // Defend the renderer against unclamped config: negative or NaN
+        // sizes here would yield garbage padding / an inverted island.
+        let non_negative = |v: f32| if v.is_finite() { v.max(0.0) } else { 0.0 };
         Self {
-            bar_height: nav.tab_bar_height,
-            gap: nav.tab_gap,
-            inset_y: nav.tab_inset_y,
-            radius: nav.tab_radius,
-            max_tab_width: nav.tab_max_width,
+            bar_height: if nav.tab_bar_height.is_finite() {
+                nav.tab_bar_height.max(1.0)
+            } else {
+                1.0
+            },
+            gap: non_negative(nav.tab_gap),
+            inset_y: non_negative(nav.tab_inset_y),
+            radius: non_negative(nav.tab_radius),
+            max_tab_width: non_negative(nav.tab_max_width),
         }
     }
 }
@@ -290,8 +297,10 @@ fn island_rect(slot_x: f32, tab_width: f32, geom: TabGeom) -> (f32, f32, f32, f3
     let x = slot_x + geom.gap / 2.0;
     let w = (tab_width - geom.gap).max(0.0);
     let y = geom.inset_y;
-    let h = geom.bar_height - geom.inset_y * 2.0;
-    let radius = geom.radius.min(w / 2.0).min(h / 2.0);
+    // A bar-height smaller than twice the inset would make the island
+    // height negative; floor it so the rect and its radius stay valid.
+    let h = (geom.bar_height - geom.inset_y * 2.0).max(0.0);
+    let radius = geom.radius.max(0.0).min(w / 2.0).min(h / 2.0);
     (x, y, w, h, radius)
 }
 

@@ -41,7 +41,7 @@ pub fn default_tab_radius() -> f32 {
 }
 
 pub fn default_tab_bar_height() -> f32 {
-    34.0
+    38.0
 }
 
 /// Clamp `unfocused_split_opacity` to `[0.15, 1.0]`.
@@ -52,6 +52,31 @@ pub fn default_tab_bar_height() -> f32 {
 #[inline]
 pub fn clamp_unfocused_split_opacity(v: f32) -> f32 {
     v.clamp(0.15, 1.0)
+}
+
+/// Sanitize tab-strip geometry after load: NaN and negative or zero
+/// sizes would produce a negative island height, garbage padding, or an
+/// oversized hover circle. Fields that may legitimately be `0` (gap,
+/// inset, radius, max-width) are only floored at `0`; the two sizes that
+/// must stay positive (font size, bar height) get a small lower bound.
+impl Navigation {
+    #[inline]
+    pub fn clamp_tab_geometry(&mut self) {
+        let non_negative = |v: f32| if v.is_finite() { v.max(0.0) } else { 0.0 };
+        let positive = |v: f32, floor: f32| {
+            if v.is_finite() {
+                v.max(floor)
+            } else {
+                floor
+            }
+        };
+        self.tab_font_size = positive(self.tab_font_size, 1.0);
+        self.tab_bar_height = positive(self.tab_bar_height, 1.0);
+        self.tab_max_width = non_negative(self.tab_max_width);
+        self.tab_gap = non_negative(self.tab_gap);
+        self.tab_inset_y = non_negative(self.tab_inset_y);
+        self.tab_radius = non_negative(self.tab_radius);
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
