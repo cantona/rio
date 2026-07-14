@@ -1100,11 +1100,11 @@ fn test_place_nonexistent_graphic() {
 
 #[test]
 fn test_no_double_push_on_graphic_cell_drop() {
-    use crate::ansi::graphics::{GraphicCell, TextureRef};
+    use crate::ansi::graphics::{GraphicCell, GraphicRemoval, TextureRef};
     use parking_lot::Mutex;
     use std::sync::Arc;
 
-    let texture_ops: Arc<Mutex<Vec<GraphicId>>> = Arc::new(Mutex::new(Vec::new()));
+    let texture_ops: Arc<Mutex<Vec<GraphicRemoval>>> = Arc::new(Mutex::new(Vec::new()));
 
     let texture = Arc::new(TextureRef {
         id: GraphicId::new(99),
@@ -1146,7 +1146,7 @@ fn test_no_double_push_on_graphic_cell_drop() {
         "TextureRef drop should push exactly once, got {}",
         ops.len()
     );
-    assert_eq!(ops[0], GraphicId::new(99));
+    assert_eq!(ops[0], GraphicRemoval::Atlas(GraphicId::new(99)));
 }
 
 #[test]

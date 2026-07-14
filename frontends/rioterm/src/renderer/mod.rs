@@ -472,20 +472,36 @@ impl Renderer {
                         if image_bottom_row <= 0 || screen_row >= screen_lines {
                             continue;
                         }
+                        let mut y = origin_y
+                            + screen_row as f32 * cell_height
+                            + p.cell_y_offset as f32;
+                        let mut height = p.pixel_height as f32;
+                        let mut src_top = 0.0;
+                        // Clip the top against the grid origin: a placement
+                        // whose first rows scrolled above the viewport must
+                        // not draw up into the tab bar. Crop the hidden band
+                        // out of the source rect and pin y to origin_y.
+                        if y < origin_y {
+                            let hidden = origin_y - y;
+                            if height > 0.0 {
+                                src_top = (hidden / height).min(1.0);
+                            }
+                            height -= hidden;
+                            y = origin_y;
+                        }
                         overlays.push(rio_backend::sugarloaf::GraphicOverlay {
                             image_id: p.image_id,
                             // kitty X=/Y= offset, supports sub-cell positioning
                             x: origin_x
                                 + p.dest_col as f32 * cell_width
                                 + p.cell_x_offset as f32,
-                            y: origin_y
-                                + screen_row as f32 * cell_height
-                                + p.cell_y_offset as f32,
+                            y,
                             width: p.pixel_width as f32,
-                            height: p.pixel_height as f32,
+                            height,
                             z_index: p.z_index,
-                            source_rect:
-                                rio_backend::sugarloaf::GraphicOverlay::FULL_SOURCE_RECT,
+                            // source_rect is [u0, v0, u1, v1]; crop the
+                            // hidden top band by raising v0.
+                            source_rect: [0.0, src_top, 1.0, 1.0],
                         });
                     }
                 }

@@ -13,6 +13,23 @@ use std::mem;
 use std::sync::{Arc, Weak};
 use tracing::debug;
 
+/// A graphic scheduled for removal, tagged with the id space it lives in.
+///
+/// Atlas graphics (sixel/iTerm2) and kitty images share neither their id
+/// space nor their `image_data` key: atlas graphics are stored under
+/// `atlas_image_key(GraphicId)` (high bit set) while kitty images use the
+/// protocol `image_id: u32` directly. A bare id can't tell the removal
+/// handler which map/key to target — mapping a kitty id through the atlas
+/// key deletes the wrong entry and leaks the real one. The tag keeps the
+/// two disjoint.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum GraphicRemoval {
+    /// Sixel/iTerm2 atlas graphic (keyed by `atlas_image_key`).
+    Atlas(GraphicId),
+    /// Kitty image (keyed by the raw protocol `image_id`).
+    Kitty(u32),
+}
+
 #[derive(Debug, Clone)]
 pub struct UpdateQueues {
     /// Atlas graphics (sixel/iTerm2) read from the PTY.
@@ -21,8 +38,8 @@ pub struct UpdateQueues {
     /// Image textures (kitty) keyed by image_id.
     pub pending_images: Vec<(u32, GraphicData)>,
 
-    /// Graphics removed from the grid.
-    pub remove_queue: Vec<GraphicId>,
+    /// Graphics removed from the grid, tagged with their id space.
+    pub remove_queue: Vec<GraphicRemoval>,
 }
 
 #[derive(Clone, Debug)]
@@ -43,7 +60,7 @@ pub struct TextureRef {
     pub cell_height: usize,
 
     /// Queue to track removed textures.
-    pub texture_operations: Weak<Mutex<Vec<GraphicId>>>,
+    pub texture_operations: Weak<Mutex<Vec<GraphicRemoval>>>,
 }
 
 impl PartialEq for TextureRef {
@@ -58,7 +75,9 @@ impl Eq for TextureRef {}
 impl Drop for TextureRef {
     fn drop(&mut self) {
         if let Some(texture_operations) = self.texture_operations.upgrade() {
-            texture_operations.lock().push(self.id);
+            texture_operations
+                .lock()
+                .push(GraphicRemoval::Atlas(self.id));
         }
     }
 }
@@ -179,8 +198,8 @@ pub struct Graphics {
     /// New image textures (kitty), keyed by image_id.
     pub pending_images: Vec<(u32, GraphicData)>,
 
-    /// Graphics removed from the grid.
-    pub texture_operations: Arc<Mutex<Vec<GraphicId>>>,
+    /// Graphics removed from the grid, tagged with their id space.
+    pub texture_operations: Arc<Mutex<Vec<GraphicRemoval>>>,
 
     /// Shared palette for Sixel graphics.
     pub sixel_shared_palette: Option<Vec<ColorRgb>>,
@@ -221,6 +240,11 @@ pub struct Graphics {
     /// Tracks when each graphic was added (for eviction priority)
     /// Maps GraphicId to insertion timestamp
     pub image_timestamps: FxHashMap<GraphicId, std::time::Instant>,
+
+    /// Byte size of each tracked atlas graphic, so `untrack_graphic` can
+    /// subtract the exact amount from `total_bytes` when a graphic's last
+    /// referencing cell is dropped (the removal path only knows the id).
+    pub graphic_bytes: FxHashMap<GraphicId, usize>,
 
     /// Weak references to placed textures, for O(1) liveness checks.
     /// Avoids scanning the entire grid to find which graphics are in use.
@@ -272,6 +296,7 @@ impl Default for Graphics {
             total_bytes: 0,
             total_limit: 320 * 1024 * 1024, // 320MB per kitty spec
             image_timestamps: FxHashMap::default(),
+            graphic_bytes: FxHashMap::default(),
             placed_textures: FxHashMap::default(),
             kitty_placements: FxHashMap::default(),
             kitty_inactive_screen: KittyScreenState::default(),
@@ -320,6 +345,15 @@ impl Graphics {
             && self.pending_images.is_empty()
         {
             return None;
+        }
+
+        // Deflate the byte accounting for atlas graphics whose last
+        // referencing cell was just dropped. Kitty removals already
+        // subtracted their bytes at eviction / delete time.
+        for removal in &remove_queue {
+            if let GraphicRemoval::Atlas(id) = removal {
+                self.untrack_graphic_by_id(*id);
+            }
         }
 
         Some(UpdateQueues {
@@ -614,28 +648,37 @@ impl Graphics {
         // Actually remove the evicted graphics from the right home.
         for (id, source) in evicted {
             let evicted_u32 = id.get() as u32;
-            match source {
+            // Tag the removal with its id space so the handler targets the
+            // correct `image_data` key — an atlas key for `Pending`, the
+            // raw protocol id for either kitty screen.
+            let removal = match source {
                 CandidateSource::Pending => {
                     self.pending.retain(|g| g.id != id);
+                    // Byte size is already accounted below via freed_bytes,
+                    // but the per-id bookkeeping still needs clearing.
+                    self.graphic_bytes.remove(&id);
+                    GraphicRemoval::Atlas(id)
                 }
                 CandidateSource::ActiveKitty => {
                     self.kitty_images.remove(&evicted_u32);
                     self.kitty_image_numbers.retain(|_, v| *v != evicted_u32);
                     self.kitty_graphics_dirty = true;
+                    GraphicRemoval::Kitty(evicted_u32)
                 }
                 CandidateSource::InactiveKitty => {
                     self.kitty_inactive_screen.kitty_images.remove(&evicted_u32);
                     self.kitty_inactive_screen
                         .kitty_image_numbers
                         .retain(|_, v| *v != evicted_u32);
+                    GraphicRemoval::Kitty(evicted_u32)
                 }
-            }
+            };
 
             // Remove timestamp (only used for pending atlas graphics)
             self.image_timestamps.remove(&id);
 
             // Add to removal queue so GPU textures get cleaned up
-            self.texture_operations.lock().push(id);
+            self.texture_operations.lock().push(removal);
         }
 
         // Sweep dangling placements on both screens. A placement is
@@ -705,6 +748,7 @@ impl Graphics {
     pub fn track_graphic(&mut self, graphic_id: GraphicId, bytes: usize) {
         self.image_timestamps
             .insert(graphic_id, std::time::Instant::now());
+        self.graphic_bytes.insert(graphic_id, bytes);
         self.total_bytes += bytes;
         debug!(
             "Tracked graphic id={}, bytes={}, total_bytes={}",
@@ -715,11 +759,30 @@ impl Graphics {
     /// Update total_bytes when a graphic is removed
     pub fn untrack_graphic(&mut self, graphic_id: GraphicId, bytes: usize) {
         self.image_timestamps.remove(&graphic_id);
+        self.graphic_bytes.remove(&graphic_id);
         self.total_bytes = self.total_bytes.saturating_sub(bytes);
         debug!(
             "Untracked graphic id={}, bytes={}, total_bytes={}",
             graphic_id.0, bytes, self.total_bytes
         );
+    }
+
+    /// Untrack an atlas graphic whose last referencing cell was just
+    /// dropped (id known, byte size looked up from `graphic_bytes`).
+    ///
+    /// Called from the removal queue drain so `total_bytes` deflates as
+    /// soon as a graphic is freed rather than ratcheting forever — the
+    /// 320MB accounting then reflects live pixel data. No-op if the id
+    /// was already untracked (idempotent under duplicate queue entries).
+    pub fn untrack_graphic_by_id(&mut self, graphic_id: GraphicId) {
+        if let Some(bytes) = self.graphic_bytes.remove(&graphic_id) {
+            self.image_timestamps.remove(&graphic_id);
+            self.total_bytes = self.total_bytes.saturating_sub(bytes);
+            debug!(
+                "Untracked graphic id={}, bytes={}, total_bytes={}",
+                graphic_id.0, bytes, self.total_bytes
+            );
+        }
     }
 }
 

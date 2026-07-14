@@ -1668,6 +1668,13 @@ impl<U: EventListener> Crosswords<U> {
         use crate::crosswords::style::{Style, StyleFlags};
         use std::fmt::Write as _;
 
+        // `max_lines == 0` means emit nothing. The `bottom - span` range
+        // below can't express an empty span (it always includes `bottom`),
+        // so special-case it. Values >= 1 are already exact.
+        if max_lines == 0 {
+            return String::new();
+        }
+
         fn push_color(out: &mut String, color: AnsiColor, is_fg: bool) {
             let (normal, bright, extended) =
                 if is_fg { (30, 90, 38) } else { (40, 100, 48) };
@@ -2074,22 +2081,45 @@ impl<U: EventListener> Crosswords<U> {
         }
     }
 
-    /// Delete graphic at a specific position.
+    /// Delete the graphic at a specific position.
     ///
-    /// Every covered cell of an image row shares ONE extras slot, so
-    /// clearing just the target cell would free that slot while its
-    /// siblings still point at it — a later reuse of the freed id then
-    /// aliases them to a different image, and the snapshot builder drops
-    /// the whole row. Clear the entire row the cell belongs to so no
-    /// dangling reference to the freed slot survives.
+    /// Only the cells belonging to the *same graphic* as the target are
+    /// cleared, so a second image sharing the row (a different slot) is
+    /// left intact. Covered cells of one image row still share ONE extras
+    /// slot, so clearing must span every cell of that image — clearing a
+    /// single cell would free the shared slot while its siblings still
+    /// point at it, and a later slot reuse would then alias them to an
+    /// unrelated image. Matching by graphic id gives us the exact cell set
+    /// to clear without over-clearing the whole row.
     fn delete_graphic_at_position(&mut self, col: Column, row: Line) {
-        if row.0 >= 0
-            && (row.0 as usize) < self.grid.screen_lines()
-            && col.0 < self.grid.columns()
-            && self.grid.raw[row][col].has_graphics()
+        if row.0 < 0
+            || (row.0 as usize) >= self.grid.screen_lines()
+            || col.0 >= self.grid.columns()
+            || !self.grid.raw[row][col].has_graphics()
         {
-            self.delete_graphics_in_row(row);
+            return;
         }
+
+        let target_id = self.cell_graphic(row, col).map(|gc| gc.texture.id);
+        let Some(target_id) = target_id else {
+            // Flag set but no readable graphic (bg-only aliasing etc.);
+            // fall back to the whole-row clear so nothing dangles.
+            self.delete_graphics_in_row(row);
+            return;
+        };
+
+        for col_idx in 0..self.grid.columns() {
+            let pos = Column(col_idx);
+            let same = self
+                .cell_graphic(row, pos)
+                .map(|gc| gc.texture.id == target_id)
+                .unwrap_or(false);
+            if same {
+                let cell = &mut self.grid.raw[row][pos];
+                Self::clear_cell_graphic(&mut self.grid.extras_table, cell);
+            }
+        }
+        self.mark_line_damaged(row);
     }
 
     /// Delete all graphics in a column. Each hit clears its whole row
@@ -3965,14 +3995,29 @@ impl<U: EventListener> Handler for Crosswords<U> {
                     cell_ref.clear();
                 }
 
-                // A cell that already has an extras slot (e.g. hyperlink)
-                // gets the graphic merged into its own slot — never into
-                // the shared one, which other cells read. Bare cells all
-                // point at the single shared slot.
-                if let Some(eid) = cell_ref.extras_id() {
-                    if let Some(extras) = self.grid.extras_table.get_mut(eid) {
-                        extras.graphic = Some(smallvec::smallvec![graphic_cell.clone()]);
-                    }
+                // A cell that already has an extras slot needs a PRIVATE
+                // slot for the graphic. The existing slot may be shared —
+                // a previous image's per-row slot, or a multi-cell
+                // hyperlink span — and mutating it in place would corrupt
+                // every sibling cell that reads it. Allocate a fresh slot
+                // carrying this cell's own zerowidth/hyperlink plus the
+                // graphic, and repoint only this cell (the old slot, if
+                // private, is reclaimed by gc_extras; if shared, its
+                // siblings keep it untouched). Bare cells share the single
+                // per-row slot as before.
+                if let Some(old_eid) = cell_ref.extras_id() {
+                    let (zerowidth, hyperlink) = self
+                        .grid
+                        .extras_table
+                        .get(old_eid)
+                        .map(|e| (e.zerowidth.clone(), e.hyperlink.clone()))
+                        .unwrap_or_default();
+                    let eid = self.grid.extras_table.alloc(square::Extras {
+                        zerowidth,
+                        hyperlink,
+                        graphic: Some(smallvec::smallvec![graphic_cell.clone()]),
+                    });
+                    cell_ref.set_extras_id(Some(eid));
                 } else {
                     let eid = match shared_eid {
                         Some(eid) => eid,
@@ -6994,6 +7039,21 @@ mod tests {
                 != crate::crosswords::style::Style::default().bg
         };
         assert!(has_bg, "blue background lost in round trip");
+    }
+
+    /// `max_lines == 0` must emit nothing. The `bottom - span` range can't
+    /// express an empty span, so without the special-case it leaked one
+    /// row (off-by-one). Values >= 1 keep their existing exact behaviour.
+    #[test]
+    fn scrollback_ansi_max_lines_zero_is_empty() {
+        use crate::performer::handler::Processor;
+        let mut cw = new_term(20, 5);
+        let mut processor = Processor::default();
+        processor.advance(&mut cw, b"one\r\ntwo\r\nthree");
+
+        assert_eq!(cw.scrollback_to_ansi(0), "");
+        // Sanity: a non-zero bound still produces output.
+        assert!(!cw.scrollback_to_ansi(100).is_empty());
     }
 
     #[test]

@@ -1058,6 +1058,20 @@ impl Renderer {
             self.image_draws.clear();
         }
 
+        // Evict GPU textures whose CPU-side pixels are gone. `image_data`
+        // is the source of truth: a texture is only ever inserted for a
+        // key that exists in `image_data`, and rio drops that entry when
+        // the graphic is freed (atlas graphic's last cell dropped, kitty
+        // image deleted). A texture with no matching `image_data` key can
+        // never be drawn again and would otherwise leak forever (upstream
+        // #1591 — atlas ids are monotonic, so every image was a fresh
+        // texture kept for the life of the window). An off-screen-but-
+        // scrollable image keeps its `image_data` entry and so keeps its
+        // texture. The sweep is O(live GPU textures) — a set this eviction
+        // itself keeps small — so it adds no meaningful per-frame cost.
+        self.image_textures
+            .retain(|id, _| image_data.contains_key(id));
+
         // Upload pending background image (if any) before the render pass
         // begins. The texture stays cached until a new image arrives or
         // `set_background_image_pixels(None)` is called.
@@ -1153,9 +1167,10 @@ impl Renderer {
         >,
         overlays: &[&crate::sugarloaf::graphics::GraphicOverlay],
     ) {
-        // Note: don't evict textures not in the current overlay set —
-        // images may be temporarily off-screen and need their texture
-        // when scrolling back into view.
+        // Note: don't evict textures merely absent from the current
+        // overlay set — images may be temporarily off-screen and need
+        // their texture when scrolling back into view. Genuinely-freed
+        // textures (no `image_data` entry) are swept in `prepare`.
 
         // Upload/update per-image textures
         for overlay in overlays {

@@ -29,6 +29,19 @@ const MAX_OSC_PARAMS: usize = 16;
 /// `OscBuffer::overflow`.
 const OSC_FIXED_LEN: usize = 2048;
 
+/// Hard ceiling on a single OSC sequence's accumulated bytes.
+///
+/// A hostile stream can emit an OSC (e.g. OSC 1337 inline image) that
+/// never terminates, buffering unbounded base64 into `overflow` long
+/// before the per-image decode caps (`iterm2_image_protocol` bounds the
+/// *decoded* image to 256MB) ever apply. The cap sits comfortably above
+/// the base64 encoding of a max-size image (256MB decoded ≈ 358MB of
+/// base64) so legitimate images are never truncated, while a runaway OSC
+/// stops growing memory. Bytes past the cap are dropped; the sequence
+/// then fails to decode/parse, which is the correct outcome for an
+/// oversized payload.
+const OSC_MAX_LEN: usize = 384 * 1024 * 1024;
+
 /// Parser for raw _VTE_ protocol which delegates actions to a [`Perform`].
 #[derive(Default)]
 pub(crate) struct Parser {
@@ -94,6 +107,12 @@ impl OscBuffer {
             // so the `is_empty()` check above stays false until `clear`.
             self.overflow
                 .extend_from_slice(&self.fixed[..self.fixed_len]);
+        }
+        // Cap heap growth: a never-terminating OSC can't buffer past the
+        // ceiling. Dropping trailing bytes only affects payloads already
+        // larger than any legitimate image, which fail to parse anyway.
+        if self.overflow.len() >= OSC_MAX_LEN {
+            return;
         }
         self.overflow.push(byte);
     }
