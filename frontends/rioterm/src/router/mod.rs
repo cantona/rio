@@ -161,10 +161,11 @@ impl Route<'_> {
                 self.request_overlay_redraw();
                 return;
             }
-            // Fully automatic: save silently and exit. v2 daemons detach
-            // because process exit closes their sockets (EOF = detach).
-            SessionRestore::Always => self.save_session(),
-            SessionRestore::Never => {}
+            // Fully automatic: the all-windows save happens in the
+            // application Quit handler (this route can't reach the
+            // others). v2 daemons detach because process exit closes
+            // their sockets (EOF = detach).
+            SessionRestore::Always | SessionRestore::Never => {}
         }
         // process::exit runs no destructors, so Context::drop never
         // fires here.
@@ -184,20 +185,15 @@ impl Route<'_> {
     }
 
     /// Window is closing (WM close / Cmd+Q, not the Quit action): mark
-    /// persistent panes to DETACH rather than kill, and save the session
-    /// so the next launch can reattach. Without this the window-close
-    /// path drops the contexts with `QUIT_DETACHING` still false — the
-    /// `Ptyd` drop then kills every persistent shell, and `exiting()`
-    /// runs too late (routes already removed) to save anything.
+    /// persistent panes to DETACH rather than kill so the next launch
+    /// can reattach. Without this the window-close path drops the
+    /// contexts with `QUIT_DETACHING` still false — the `Ptyd` drop then
+    /// kills every persistent shell. The session WRITE is done by the
+    /// caller (application close handler), gated to `always`, capturing
+    /// every window: `prompt` must never silently overwrite the file.
     #[cfg(unix)]
-    pub fn detach_and_save_on_close(&mut self) {
-        // The detach flag only matters for v2 (daemon-backed) panes;
-        // it's harmless for v1 (no daemons to detach). Save whenever a
-        // session is being kept at all.
+    pub fn detach_on_close(&mut self) {
         crate::context::set_quit_detaching();
-        if self.window.screen.renderer.session_restore.enabled() {
-            self.save_session();
-        }
     }
 
     /// Persist this window's tabs/splits/CWDs/scrollback to disk.
@@ -244,12 +240,16 @@ impl Route<'_> {
     }
 
     /// Palette "Restore Session": append a named session's tabs to
-    /// this window. Named sessions are workspaces — never consumed.
+    /// this window. Named sessions are workspaces — never consumed and
+    /// restored into the current window only (extra saved windows, if
+    /// any, are ignored here rather than opened).
     pub fn restore_session_named(&mut self, name: &str) {
         let path = rio_backend::config::session_named_path(name);
         if let Some(state) = crate::session::SessionState::load(&path) {
-            self.set_session_name(Some(name.to_string()));
-            self.restore_session_inner(state, false);
+            if let Some(win) = state.windows.into_iter().next() {
+                self.set_session_name(Some(name.to_string()));
+                self.restore_session_inner(win, false, false, true);
+            }
         }
     }
 
@@ -314,19 +314,49 @@ impl Route<'_> {
     }
 
     /// Rebuild tabs/splits/scrollback from a saved session, replacing
-    /// the window's default tab (launch-time restore).
-    pub fn restore_session(&mut self, state: crate::session::SessionState) {
-        self.restore_session_inner(state, true);
+    /// the window's default tab (launch-time restore). Consumes the
+    /// first saved window into this route and returns the remaining
+    /// windows so the caller (which owns the event loop) can open a new
+    /// window per leftover. Returning them instead of dropping them is
+    /// what stops a multi-window save from losing every window but one.
+    #[must_use]
+    pub fn restore_session(
+        &mut self,
+        state: crate::session::SessionState,
+    ) -> Vec<crate::session::WindowState> {
+        let mut windows = state.windows.into_iter();
+        let Some(win) = windows.next() else {
+            return Vec::new();
+        };
+        let rest: Vec<crate::session::WindowState> = windows.collect();
+        // A named session is a workspace that keeps its file; the
+        // implicit slot is consumed. In `always` re-save immediately
+        // after a successful restore so the file references the daemons
+        // we just reattached (not the ones about to be replaced) —
+        // otherwise a crash before the next save orphans them.
+        let named = self.session_name.is_some();
+        let resave = !named
+            && self.window.screen.renderer.session_restore
+                == rio_backend::config::session::SessionRestore::Always;
+        self.restore_session_inner(win, true, resave, rest.is_empty());
+        rest
+    }
+
+    /// Restore one saved window into this (freshly created) route
+    /// without touching the on-disk file — the caller re-saves once
+    /// after every extra window is opened, so a per-window write here
+    /// would clobber the others.
+    pub fn restore_window_state(&mut self, win: crate::session::WindowState) {
+        self.restore_session_inner(win, true, false, false);
     }
 
     fn restore_session_inner(
         &mut self,
-        state: crate::session::SessionState,
+        win: crate::session::WindowState,
         replace: bool,
+        resave: bool,
+        consumed_all: bool,
     ) {
-        let Some(win) = state.windows.into_iter().next() else {
-            return;
-        };
         if win.tabs.is_empty() {
             return;
         }
@@ -427,10 +457,20 @@ impl Route<'_> {
         // The implicit last-session slot is consumed once restored;
         // quitting offers a fresh save, so a stale copy must not
         // re-prompt next launch. Named sessions persist.
-        if replace && self.session_name.is_none() {
-            crate::session::SessionState::discard(
-                &rio_backend::config::session_file_path(),
-            );
+        //
+        // In `always` (resave) re-save instead of discarding, but only
+        // once every saved window is consumed: discarding a file that
+        // still holds unopened windows would orphan their daemons and
+        // lose those windows. The re-save keeps the file pointing at the
+        // live, reattached daemons so a crash can't strand them.
+        if replace && self.session_name.is_none() && consumed_all {
+            if resave {
+                self.save_session();
+            } else {
+                crate::session::SessionState::discard(
+                    &rio_backend::config::session_file_path(),
+                );
+            }
         }
         self.request_redraw();
     }
@@ -747,7 +787,13 @@ impl Route<'_> {
                             PendingClose::Tab(tab) => {
                                 self.window.screen.close_tab_at(tab, clipboard);
                             }
-                            PendingClose::Current | PendingClose::Window => {
+                            // The prompt said "close this window?" — honor
+                            // it by closing the whole window (every split),
+                            // not just the current split.
+                            PendingClose::Window => {
+                                self.window.screen.close_window_confirmed(clipboard);
+                            }
+                            PendingClose::Current => {
                                 self.window
                                     .screen
                                     .close_split_or_tab_confirmed(clipboard);
@@ -775,6 +821,10 @@ impl Route<'_> {
                     (Key::Character(c), SessionPromptKind::SaveOnExit)
                         if c.as_str() == "y" || c.as_str() == "Y" =>
                     {
+                        // Prompt mode, explicit consent. This overlay is
+                        // per-window and can't reach the other routes, so
+                        // it saves this window only; the multi-window
+                        // writers cover `always` and the close paths.
                         self.save_session();
                         std::process::exit(0);
                     }
@@ -787,6 +837,9 @@ impl Route<'_> {
                         // destructors, so Context::drop never fires).
                         #[cfg(unix)]
                         crate::session::kill_persistent_panes(self.window.screen.ctx());
+                        // Drop the file too: leaving it would point next
+                        // launch at the daemons we just killed.
+                        crate::session::SessionState::discard(&self.session_path());
                         std::process::exit(0);
                     }
                     // Resume: reattach the saved daemons.
@@ -798,7 +851,17 @@ impl Route<'_> {
                     {
                         self.window.screen.renderer.session_prompt.set_active(None);
                         if let Some(state) = self.pending_session.take() {
-                            self.restore_session(state);
+                            let leftover = self.restore_session(state);
+                            // Re-save so the file references the daemons
+                            // we just reattached rather than the ones the
+                            // window replaced; a crash before quit would
+                            // otherwise orphan them. This overlay has no
+                            // event loop, so extra saved windows can't be
+                            // opened here — keep the file (do not discard)
+                            // so their daemons stay resumable next launch.
+                            if leftover.is_empty() {
+                                self.save_session();
+                            }
                         }
                         self.request_overlay_redraw();
                     }
@@ -812,6 +875,12 @@ impl Route<'_> {
                     {
                         self.window.screen.renderer.session_prompt.set_active(None);
                         if let Some(state) = self.pending_session.take() {
+                            // Accepted race: another instance may have
+                            // resumed these daemons between our load and
+                            // this keypress. A bare socket connect can't
+                            // tell "idle" from "already attached", so we
+                            // kill by socket regardless. Widening this
+                            // needs a protocol probe on the daemon side.
                             #[cfg(unix)]
                             crate::session::kill_saved_session_daemons(&state);
                         }

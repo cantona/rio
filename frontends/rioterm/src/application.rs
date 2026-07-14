@@ -144,6 +144,105 @@ impl Application<'_> {
         rio_notifier::send_notification(title, body, urgency);
     }
 
+    /// Capture every open window into the implicit last-session slot,
+    /// focused window first so it restores into the launch route. A
+    /// single per-window writer would drop all the other windows; this
+    /// is the writer for autosave, Ctrl+Shift+S, window close and quit.
+    /// `merge_kept_daemons` carries forward any still-live daemon the
+    /// old file referenced but no live window reattached.
+    fn save_last_session(&self, focused: Option<WindowId>) {
+        let max = self.config.session.max_scrollback_lines;
+        let mut windows: Vec<crate::session::WindowState> = Vec::new();
+        // Focused window first when known, so restore lands it in the
+        // current route (restore consumes windows[0] into the launch
+        // window and opens the rest as new windows).
+        if let Some(id) = focused {
+            if let Some(route) = self.router.routes.get(&id) {
+                windows.push(crate::session::capture_window(
+                    route.window.screen.ctx(),
+                    max,
+                    &route.window.winit_window,
+                ));
+            }
+        }
+        for (id, route) in self.router.routes.iter() {
+            if Some(*id) == focused {
+                continue;
+            }
+            windows.push(crate::session::capture_window(
+                route.window.screen.ctx(),
+                max,
+                &route.window.winit_window,
+            ));
+        }
+        if windows.is_empty() {
+            return;
+        }
+        #[allow(unused_mut)]
+        let mut state = crate::session::SessionState {
+            version: crate::session::SESSION_VERSION,
+            windows,
+        };
+        let path = rio_backend::config::session_file_path();
+        #[cfg(unix)]
+        crate::session::merge_kept_daemons(&mut state, &path);
+        if let Err(err) = state.save(&path) {
+            tracing::warn!("session save failed: {err}");
+        }
+    }
+
+    /// A window is about to close. In `always` mode persist the whole
+    /// session (every window, this one included) so the remaining
+    /// windows survive; `prompt`/`disable` never write silently here.
+    /// A named window always saves its own workspace. Call BEFORE the
+    /// route is removed so the closing window is still captured.
+    fn save_session_on_window_close(&mut self, window_id: WindowId) {
+        use rio_backend::config::session::SessionRestore;
+        if let Some(route) = self.router.routes.get_mut(&window_id) {
+            if route.session_name.is_some() {
+                route.save_session();
+                return;
+            }
+        }
+        if self.config.session.restore == SessionRestore::Always {
+            self.save_last_session(Some(window_id));
+        }
+    }
+
+    /// Restore each leftover saved window into a freshly created window.
+    /// The launch route consumed the first saved window; without this
+    /// the rest would be silently dropped. After opening them all,
+    /// re-save (always mode) so the implicit file references the live
+    /// daemons across every window instead of the pre-restore ones.
+    fn restore_extra_windows(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        leftover: Vec<crate::session::WindowState>,
+    ) {
+        for win in leftover {
+            let before: std::collections::HashSet<WindowId> =
+                self.router.routes.keys().copied().collect();
+            self.router.create_window(
+                event_loop,
+                self.event_proxy.clone(),
+                &self.config,
+                None,
+                self.app_id.as_deref(),
+            );
+            let new_id = self
+                .router
+                .routes
+                .keys()
+                .find(|id| !before.contains(*id))
+                .copied();
+            if let Some(id) = new_id {
+                if let Some(route) = self.router.routes.get_mut(&id) {
+                    route.restore_window_state(win);
+                }
+            }
+        }
+    }
+
     pub fn run(
         &mut self,
         event_loop: EventLoop<EventPayload>,
@@ -211,12 +310,21 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             // named session (when it exists) regardless of the
             // configured restore mode, and saves write back to it.
             let name = crate::session::sanitize_name(&name);
+            let mut leftover = Vec::new();
             if let Some(route) = self.router.routes.values_mut().next() {
                 route.set_session_name(Some(name.clone()));
                 if let Some(state) = crate::session::SessionState::load(
                     &rio_backend::config::session_named_path(&name),
                 ) {
-                    route.restore_session(state);
+                    leftover = route.restore_session(state);
+                }
+            }
+            // A named workspace that saved several windows reopens them
+            // all; each carries its own name binding.
+            self.restore_extra_windows(event_loop, leftover);
+            for route in self.router.routes.values_mut() {
+                if route.session_name.is_none() {
+                    route.set_session_name(Some(name.clone()));
                 }
             }
         } else {
@@ -227,12 +335,25 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     if let Some(state) = crate::session::SessionState::load(
                         &rio_backend::config::session_file_path(),
                     ) {
-                        if let Some(route) = self.router.routes.values_mut().next() {
-                            if mode == SessionRestore::Always {
-                                route.restore_session(state);
-                            } else {
-                                route.prompt_session_resume(state);
+                        if mode == SessionRestore::Always {
+                            let leftover = self
+                                .router
+                                .routes
+                                .values_mut()
+                                .next()
+                                .map(|route| route.restore_session(state))
+                                .unwrap_or_default();
+                            let had_extra = !leftover.is_empty();
+                            self.restore_extra_windows(event_loop, leftover);
+                            // One write after every window is open so the
+                            // file references the whole live session.
+                            if had_extra {
+                                let focused = self.router.get_focused_route();
+                                self.save_last_session(focused);
                             }
+                        } else if let Some(route) = self.router.routes.values_mut().next()
+                        {
+                            route.prompt_session_resume(state);
                         }
                     }
                 }
@@ -509,8 +630,22 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 }
             }
             RioEventType::Rio(RioEvent::SaveSession) => {
+                // A window bound to a named session is a single-window
+                // workspace: save it under its name. The implicit
+                // last-session slot spans every window.
+                let named = self
+                    .router
+                    .routes
+                    .get(&window_id)
+                    .is_some_and(|route| route.session_name.is_some());
+                if named {
+                    if let Some(route) = self.router.routes.get_mut(&window_id) {
+                        route.save_session();
+                    }
+                } else {
+                    self.save_last_session(Some(window_id));
+                }
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
-                    route.save_session();
                     route
                         .window
                         .screen
@@ -606,6 +741,23 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 }
             }
             RioEventType::Rio(RioEvent::Exit | RioEvent::Quit) => {
+                // The Quit action ends the process; `route.quit()`
+                // calls process::exit for the Always/Never modes, so the
+                // all-windows save must run here first. `always` saves
+                // silently; `prompt` defers to the SaveOnExit overlay.
+                use rio_backend::config::session::SessionRestore;
+                if !self.config.confirm_before_quit
+                    && self.config.session.restore == SessionRestore::Always
+                {
+                    #[cfg(unix)]
+                    crate::context::set_quit_detaching();
+                    for route in self.router.routes.values_mut() {
+                        if route.session_name.is_some() {
+                            route.save_session();
+                        }
+                    }
+                    self.save_last_session(Some(window_id));
+                }
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
                     if self.config.confirm_before_quit {
                         route.confirm_quit();
@@ -1082,8 +1234,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             RioEventType::Rio(RioEvent::CloseWindow) => {
                 #[cfg(unix)]
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
-                    route.detach_and_save_on_close();
+                    route.detach_on_close();
                 }
+                self.save_session_on_window_close(window_id);
                 self.router.routes.remove(&window_id);
                 #[cfg(unix)]
                 crate::context::clear_quit_detaching();
@@ -1284,8 +1437,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 if cfg!(any(target_os = "macos", target_os = "windows")) {
                     #[cfg(unix)]
                     if let Some(route) = self.router.routes.get_mut(&window_id) {
-                        route.detach_and_save_on_close();
+                        route.detach_on_close();
                     }
+                    self.save_session_on_window_close(window_id);
                     // Remove (drops the closing window's contexts under
                     // the detach flag), then clear so the flag can't
                     // make other windows' later tab-closes detach and
@@ -1305,8 +1459,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 } else {
                     #[cfg(unix)]
                     if let Some(route) = self.router.routes.get_mut(&window_id) {
-                        route.detach_and_save_on_close();
+                        route.detach_on_close();
                     }
+                    self.save_session_on_window_close(window_id);
                     self.router.routes.remove(&window_id);
                     #[cfg(unix)]
                     crate::context::clear_quit_detaching();
@@ -2351,27 +2506,20 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
         #[cfg(unix)]
         crate::context::set_quit_detaching();
 
-        if self.config.session.restore.enabled() {
-            let max = self.config.session.max_scrollback_lines;
-            let windows: Vec<crate::session::WindowState> = self
-                .router
-                .routes
-                .values()
-                .map(|route| {
-                    crate::session::capture_window(
-                        route.window.screen.ctx(),
-                        max,
-                        &route.window.winit_window,
-                    )
-                })
-                .collect();
-            if !windows.is_empty() {
-                let state = crate::session::SessionState {
-                    version: crate::session::SESSION_VERSION,
-                    windows,
-                };
-                let _ = state.save(&rio_backend::config::session_file_path());
+        // Only `always` writes on exit without an explicit yes; `prompt`
+        // must never silently overwrite the session (the SaveOnExit
+        // overlay handles its consent). Named-session windows persist to
+        // their own file regardless. Use the shared all-windows +
+        // merge_kept_daemons writer so no window is dropped.
+        use rio_backend::config::session::SessionRestore;
+        for route in self.router.routes.values_mut() {
+            if route.session_name.is_some() {
+                route.save_session();
             }
+        }
+        if self.config.session.restore == SessionRestore::Always {
+            let focused = self.router.get_focused_route();
+            self.save_last_session(focused);
         }
 
         // Ensure that all the windows are dropped, so the destructors for

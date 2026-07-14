@@ -512,6 +512,20 @@ impl Screen<'_> {
         // Update keyboard config in context manager
         self.context_manager.config.keyboard = config.keyboard;
 
+        // Session mode can change on reload: recompute autosave (only
+        // `always` writes without a prompt) and the daemon persistence
+        // option so later structural changes honor the new mode.
+        self.context_manager.config.autosave = config.session.restore
+            == rio_backend::config::session::SessionRestore::Always;
+        self.context_manager.config.persistence =
+            if cfg!(unix) && config.session.uses_daemons() {
+                Some(crate::context::PersistenceOptions {
+                    ring_bytes: config.session.ring_bytes,
+                })
+            } else {
+                None
+            };
+
         // Rebuild key bindings so binding edits hot-reload like the rest
         // of the config (default bindings + user `[bindings]` overrides).
         self.bindings = crate::bindings::default_key_bindings(config);
@@ -1591,6 +1605,14 @@ impl Screen<'_> {
         } else {
             self.close_tab_confirmed(clipboard);
         }
+    }
+
+    /// Close the whole current tab — every split it holds — as a single
+    /// window close. Reached only when the "close this window?" prompt
+    /// fired (single tab), so closing the tab closes the window; unlike
+    /// `close_split_or_tab_confirmed` it does not peel off one split.
+    pub fn close_window_confirmed(&mut self, clipboard: &mut Clipboard) {
+        self.close_tab_confirmed(clipboard);
     }
 
     /// Misclick guard shared by every close entry point. Returns true
@@ -2810,6 +2832,11 @@ impl Screen<'_> {
     }
 
     pub fn update_close_button_hover(&mut self, mouse_x: f64, mouse_y: f64) -> bool {
+        use rio_backend::config::navigation::TabCloseConfirm;
+        let close_on_hover = self.renderer.navigation.tab_close_on_hover;
+        let double_click =
+            self.renderer.navigation.tab_close_confirm == TabCloseConfirm::DoubleClick;
+
         let num_tabs = self.context_manager.len();
         let scale_factor = self.sugarloaf.scale_factor();
 
@@ -2818,12 +2845,14 @@ impl Screen<'_> {
             && mouse_y <= (self.renderer.navigation.tab_bar_height * scale_factor) as f64;
         let layout = self.island_tab_layout(num_tabs);
         let x_unscaled = mouse_x as f32 / scale_factor;
-        let hovered_tab = (in_bar && layout.tab_width > 0.0)
-            .then(|| ((x_unscaled - layout.left_margin) / layout.tab_width) as usize)
+        // Guard x below the first tab: the cast to usize would wrap a
+        // negative offset to tab 0 (mirrors the click path).
+        let x_in_tabs = x_unscaled - layout.left_margin;
+        let hovered_tab = (in_bar && x_in_tabs >= 0.0 && layout.tab_width > 0.0)
+            .then(|| (x_in_tabs / layout.tab_width) as usize)
             .filter(|idx| *idx < num_tabs);
         let hovering = hovered_tab.is_some_and(|idx| {
-            (self.renderer.navigation.tab_close_on_hover
-                || idx == self.context_manager.current_index())
+            (close_on_hover || idx == self.context_manager.current_index())
                 && island::close_button_hit(
                     &layout,
                     idx,
@@ -2832,11 +2861,21 @@ impl Screen<'_> {
                 )
         });
 
+        // Only the active tab shows a × unless close-on-hover is set, and
+        // only double-click confirm arms non-active tabs. When neither
+        // mode is on, restrict the tracked tab to the active one so
+        // crossing between background tabs no longer forces a repaint.
+        let tracked = if close_on_hover || double_click {
+            hovered_tab
+        } else {
+            hovered_tab.filter(|idx| *idx == self.context_manager.current_index())
+        };
+
         let tab_changed = self
             .renderer
             .island
             .as_mut()
-            .is_some_and(|island| island.set_hovered_tab(hovered_tab));
+            .is_some_and(|island| island.set_hovered_tab(tracked));
         if tab_changed {
             self.mark_dirty();
         }

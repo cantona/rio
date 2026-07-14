@@ -130,9 +130,23 @@ impl LayoutNode {
 }
 
 impl SessionState {
+    /// Reject a whole file larger than this; a legitimate session of
+    /// scrollback dumps stays well under it, so anything bigger is
+    /// corrupt or hostile and is not worth parsing into memory.
+    const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+    /// Per-pane scrollback is truncated to this many bytes on load so a
+    /// tampered file can't replay an unbounded stream into a terminal.
+    const MAX_PANE_SCROLLBACK_BYTES: usize = 8 * 1024 * 1024;
+
     pub fn load(path: &Path) -> Option<SessionState> {
+        // Bound the read before allocating: an oversized file is
+        // rejected without slurping it whole.
+        if std::fs::metadata(path).ok()?.len() > Self::MAX_FILE_BYTES {
+            tracing::warn!("session: discarding oversized file");
+            return None;
+        }
         let bytes = std::fs::read(path).ok()?;
-        let state: SessionState = serde_json::from_slice(&bytes).ok()?;
+        let mut state: SessionState = serde_json::from_slice(&bytes).ok()?;
         if state.version != SESSION_VERSION || state.windows.is_empty() {
             return None;
         }
@@ -147,7 +161,35 @@ impl SessionState {
             tracing::warn!("session: discarding file with a malformed layout tree");
             return None;
         }
+        // Cap per-pane scrollback so a tampered file can't replay an
+        // unbounded stream on restore.
+        for w in &mut state.windows {
+            for t in &mut w.tabs {
+                Self::cap_scrollback(&mut t.layout);
+            }
+        }
         Some(state)
+    }
+
+    fn cap_scrollback(node: &mut LayoutNode) {
+        match node {
+            LayoutNode::Leaf(p) => {
+                if p.scrollback.len() > Self::MAX_PANE_SCROLLBACK_BYTES {
+                    // Truncate to the most recent bytes on a char
+                    // boundary; older history is the safe part to drop.
+                    let start = p.scrollback.len() - Self::MAX_PANE_SCROLLBACK_BYTES;
+                    let start = (start..p.scrollback.len())
+                        .find(|i| p.scrollback.is_char_boundary(*i))
+                        .unwrap_or(p.scrollback.len());
+                    p.scrollback = p.scrollback.split_off(start);
+                }
+            }
+            LayoutNode::Split { children, .. } => {
+                for (_, c) in children {
+                    Self::cap_scrollback(c);
+                }
+            }
+        }
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
@@ -285,23 +327,59 @@ fn pane_ids(state: &SessionState) -> std::collections::HashSet<String> {
     out
 }
 
-/// True when a layout leaf still points at a live daemon this session
-/// did not reattach — a "kept" pane worth carrying forward so the file
-/// keeps a handle on it. A leaf is kept only if it is a single-pane
-/// tab: a partially-live split can't be faithfully reattached, so it is
-/// dropped (its dead panes are gone anyway).
+/// True when a single leaf still points at a live local daemon this
+/// session did not reattach.
 #[cfg(unix)]
-fn leaf_is_kept_alive(
-    node: &LayoutNode,
-    already: &std::collections::HashSet<String>,
-) -> bool {
-    let LayoutNode::Leaf(p) = node else {
-        return false;
-    };
+fn leaf_alive(p: &PaneState, already: &std::collections::HashSet<String>) -> bool {
     let (Some(id), Some(sock)) = (&p.pane_id, &p.socket) else {
         return false;
     };
     p.host.is_none() && !already.contains(id) && daemon_alive(sock)
+}
+
+/// True when an entire tab is worth carrying forward: every leaf points
+/// at a live local daemon this session did not reattach. A single-pane
+/// tab qualifies when its leaf is live; a split qualifies only when ALL
+/// its leaves are live, so it can be faithfully reattached as a whole.
+/// A split with any dead leaf is dropped — but that means its still-live
+/// leaves would be stranded, so those are handled separately by the
+/// caller. Here we only accept fully-live tabs.
+#[cfg(unix)]
+fn tab_is_fully_live(
+    node: &LayoutNode,
+    already: &std::collections::HashSet<String>,
+) -> bool {
+    match node {
+        LayoutNode::Leaf(p) => leaf_alive(p, already),
+        LayoutNode::Split { children, .. } => {
+            !children.is_empty()
+                && children.iter().all(|(_, c)| tab_is_fully_live(c, already))
+        }
+    }
+}
+
+/// Collect every still-live local leaf of a subtree that this session
+/// did not reattach. Used to rescue the live panes of a split whose
+/// other leaves died: the split can't be reattached faithfully, but its
+/// surviving daemons must not be silently stranded.
+#[cfg(unix)]
+fn collect_live_leaves<'a>(
+    node: &'a LayoutNode,
+    already: &std::collections::HashSet<String>,
+    out: &mut Vec<&'a PaneState>,
+) {
+    match node {
+        LayoutNode::Leaf(p) => {
+            if leaf_alive(p, already) {
+                out.push(p);
+            }
+        }
+        LayoutNode::Split { children, .. } => {
+            for (_, c) in children {
+                collect_live_leaves(c, already, out);
+            }
+        }
+    }
 }
 
 /// Merge still-alive daemons from a previously saved session into a
@@ -310,8 +388,13 @@ fn leaf_is_kept_alive(
 /// the old file recorded but the new session never reattached — no file
 /// references it, so no future launch can reclaim it. This is what
 /// makes the resume prompt's "new + keep old" honest: the kept daemons
-/// survive AND stay resumable across the overwrite. Only single-pane
-/// tabs on local, live daemons are carried; dead ones are dropped.
+/// survive AND stay resumable across the overwrite.
+///
+/// A fully-live tab (single pane or a split whose leaves are all live)
+/// is carried forward whole so its layout reattaches intact. A split
+/// with some dead leaves can't be rebuilt faithfully, so each of its
+/// surviving leaves is carried as its own single-pane tab — dropping
+/// them would strand their live daemons. Dead daemons are dropped.
 #[cfg(unix)]
 pub fn merge_kept_daemons(new_state: &mut SessionState, old_path: &Path) {
     let Some(old) = SessionState::load(old_path) else {
@@ -321,8 +404,27 @@ pub fn merge_kept_daemons(new_state: &mut SessionState, old_path: &Path) {
     let mut kept: Vec<TabState> = Vec::new();
     for w in old.windows {
         for tab in w.tabs {
-            if leaf_is_kept_alive(&tab.layout, &already) {
+            if tab_is_fully_live(&tab.layout, &already) {
                 kept.push(tab);
+            } else {
+                // Rescue the still-live leaves of a partially-dead
+                // split as standalone single-pane tabs.
+                let mut live = Vec::new();
+                collect_live_leaves(&tab.layout, &already, &mut live);
+                for pane in live {
+                    kept.push(TabState {
+                        custom_title: None,
+                        layout: LayoutNode::Leaf(PaneState {
+                            cwd: pane.cwd.clone(),
+                            title: pane.title.clone(),
+                            is_active: true,
+                            scrollback: pane.scrollback.clone(),
+                            pane_id: pane.pane_id.clone(),
+                            socket: pane.socket.clone(),
+                            host: pane.host.clone(),
+                        }),
+                    });
+                }
             }
         }
     }
@@ -523,7 +625,14 @@ fn inject_scrollback<T: EventListener + Clone + Send + 'static>(
     }
     let mut processor = rio_backend::performer::handler::Processor::default();
     let mut terminal = ctx.terminal.lock();
+    // Saved scrollback is replayed history, not live input: any query
+    // it contains (DA, cursor-position, …) must not generate a reply,
+    // or a stale answer would be fed back as input. Mirrors the daemon
+    // replay path (performer::mod suppress_replies).
+    let prev_suppress = terminal.suppress_replies;
+    terminal.suppress_replies = true;
     processor.advance(&mut *terminal, pane.scrollback.as_bytes());
+    terminal.suppress_replies = prev_suppress;
 }
 
 fn restore_active_pane<T: EventListener + Clone + Send + 'static>(
