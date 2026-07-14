@@ -3819,6 +3819,12 @@ impl Screen<'_> {
     /// and dispatch their actions. No-op when no triggers are configured.
     fn run_triggers(&mut self) {
         if self.triggers.is_empty() {
+            // Rules were all removed: drop any highlights left on the
+            // focused pane so they don't drift as the text scrolls.
+            self.context_manager
+                .current_mut()
+                .renderable_content
+                .trigger_highlights = None;
             return;
         }
 
@@ -3834,14 +3840,19 @@ impl Screen<'_> {
             (actions, highlights)
         };
 
-        self.context_manager
-            .current_mut()
-            .renderable_content
-            .trigger_highlights = if highlights.is_empty() {
-            None
-        } else {
-            Some(highlights)
-        };
+        // `None` means no terminal content changed this frame: keep the
+        // highlights already on the pane. `Some(empty)` means recompute
+        // produced nothing, so clear them.
+        if let Some(highlights) = highlights {
+            self.context_manager
+                .current_mut()
+                .renderable_content
+                .trigger_highlights = if highlights.is_empty() {
+                None
+            } else {
+                Some(highlights)
+            };
+        }
 
         use crate::triggers::ResolvedAction as Action;
         use rio_backend::event::{RioEvent, TriggerEventAction as Event};

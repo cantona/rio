@@ -4,7 +4,7 @@ use rio_backend::crosswords::grid::Dimensions;
 use rio_backend::crosswords::pos::{Column, Line, Pos};
 use rio_backend::crosswords::search::Match;
 use rio_backend::crosswords::Crosswords;
-use rio_backend::event::EventListener;
+use rio_backend::event::{EventListener, TerminalDamage};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::hash::{Hash, Hasher};
 
@@ -16,11 +16,36 @@ const LINE_SCAN_CAP: usize = 4096;
 /// off the top is still captured whole.
 const FEED_HISTORY_LINES: i32 = 200;
 
+/// Upper bound (bytes) on a feed_screen payload. The consumer writes stdin
+/// before draining stdout, so a payload larger than the OS pipe buffer (~64KB
+/// on Linux) could deadlock; keep the capture comfortably under it. Truncated
+/// at a char boundary from the newest (bottom) end so the visible prompt is
+/// always kept.
+const FEED_PAYLOAD_CAP: usize = 48 * 1024;
+
 struct CompiledTrigger {
     regex: onig::Regex,
     instant: bool,
     once: bool,
     action: TriggerAction,
+    /// Stable identity (regex + action), independent of the rule's index in
+    /// the list, so `once` dedup survives a config reload that inserts or
+    /// reorders rules (an index would then point at a different rule).
+    id: u64,
+}
+
+/// The cursor (live prompt) line's fire state for one route: the row the
+/// cursor last sat on, and which (rule, match text) pairs already fired there.
+/// The set is cleared only when the cursor ROW NUMBER changes, so an action
+/// whose output echoes back into the same line (`send_text "y"` -> `[y/n]y`)
+/// does not re-fire the rule, yet a fresh prompt drawn at a new row does.
+#[derive(Default)]
+struct CursorFired {
+    /// The cursor's ABSOLUTE line (history + screen row) when these matches
+    /// fired — not the screen row, which stays constant on a scrolling
+    /// console and would suppress every re-drawn prompt as an echo.
+    row: i64,
+    fired: FxHashSet<(u64, u64)>,
 }
 
 /// Compiled trigger rules plus per-route dedup. Owned on the main thread
@@ -36,14 +61,20 @@ pub struct Triggers {
     /// content rather than a cursor counter so prompt redraws and TUIs
     /// (which don't scroll) still register new output.
     seen: FxHashMap<usize, FxHashSet<(i64, u64, bool)>>,
-    /// (route, rule index) of `once` rules that have already fired. Reset on
-    /// rebuild (config reload).
-    fired_once: FxHashSet<(usize, usize)>,
-    /// Per route, the content hash of the cursor (live prompt) line last
-    /// evaluated. The cursor line re-fires whenever its content changes rather
-    /// than deduping forever, so a prompt that recurs at a redrawn position
-    /// (e.g. a second `login:` under tmux, which doesn't scroll) fires again.
-    last_cursor: FxHashMap<usize, u64>,
+    /// (route, stable rule id) of `once` rules that have already fired.
+    /// Retained across rebuild (config reload) — a stable id keeps the match
+    /// correct even when the rule list changes.
+    fired_once: FxHashSet<(usize, u64)>,
+    /// Per route, the cursor line's fire state (row + fired rule/match pairs).
+    /// A rule fires again on the cursor line only when a genuinely new match
+    /// appears; an echo of an action's own output, or the line merely growing
+    /// by a chunk, does not re-fire. See `CursorFired`.
+    cursor_fired: FxHashMap<usize, CursorFired>,
+    /// Per route, the last (screen_lines, columns) seen. A change means a
+    /// resize/font-zoom reflowed the grid, rewriting absolute line numbers and
+    /// wrapping, which invalidates `seen`'s (abs_line, content) keys; the next
+    /// scan then re-seeds `seen` without firing so reflow doesn't mass re-fire.
+    dims: FxHashMap<usize, (usize, usize)>,
 }
 
 /// A one-shot trigger action with captures already substituted.
@@ -83,6 +114,29 @@ fn hash_text(s: &str) -> u64 {
     h.finish()
 }
 
+/// Stable identity for a rule: its regex plus a textual rendering of its
+/// action. Unlike the rule's list index, this survives inserting/reordering
+/// rules across a config reload, so `once` dedup stays attached to the same
+/// rule rather than being re-armed or leaking onto a different one.
+fn rule_id(regex: &str, action: &TriggerAction) -> u64 {
+    let mut h = rustc_hash::FxHasher::default();
+    regex.hash(&mut h);
+    format!("{action:?}").hash(&mut h);
+    h.finish()
+}
+
+/// Hash of the matched substring (whole match), used to dedup cursor-line
+/// fires by what matched rather than by the whole line's content, so an echo
+/// or a mid-line chunk append that reproduces an already-fired match is
+/// suppressed while a genuinely new match still fires.
+#[inline]
+fn match_hash(text: &str, caps: &onig::Captures) -> u64 {
+    match caps.pos(0) {
+        Some((s, e)) => hash_text(&text[s..e]),
+        None => 0,
+    }
+}
+
 impl Triggers {
     pub fn new(config: &TriggersConfig) -> Self {
         let mut rules = Vec::with_capacity(config.rules.len());
@@ -92,6 +146,7 @@ impl Triggers {
                     regex,
                     instant: rule.instant,
                     once: rule.once,
+                    id: rule_id(&rule.regex, &rule.action),
                     action: rule.action.clone(),
                 }),
                 Err(err) => {
@@ -117,7 +172,8 @@ impl Triggers {
             has_feed_screen,
             seen: FxHashMap::default(),
             fired_once: FxHashSet::default(),
-            last_cursor: FxHashMap::default(),
+            cursor_fired: FxHashMap::default(),
+            dims: FxHashMap::default(),
         }
     }
 
@@ -132,15 +188,18 @@ impl Triggers {
         self.rules = fresh.rules;
         self.has_highlight = fresh.has_highlight;
         self.has_feed_screen = fresh.has_feed_screen;
-        // seen / fired_once / last_cursor intentionally retained.
+        // seen / fired_once / cursor_fired / dims intentionally retained;
+        // fired_once is keyed on stable rule ids so retention stays correct
+        // even when the rule list is edited.
     }
 
     /// Forget a route's accumulated dedup state when its pane closes,
-    /// so `seen`/`fired_once`/`last_cursor` don't grow without bound
+    /// so `seen`/`fired_once`/`cursor_fired`/`dims` don't grow without bound
     /// over a long session that opens and closes many tabs.
     pub fn forget_route(&mut self, route_id: usize) {
         self.seen.remove(&route_id);
-        self.last_cursor.remove(&route_id);
+        self.cursor_fired.remove(&route_id);
+        self.dims.remove(&route_id);
         self.fired_once.retain(|(r, _)| *r != route_id);
     }
 
@@ -155,7 +214,7 @@ impl Triggers {
         for seen in self.seen.values_mut() {
             seen.retain(|(_, _, finalized)| *finalized);
         }
-        self.last_cursor.clear();
+        self.cursor_fired.clear();
     }
 
     #[inline]
@@ -177,19 +236,39 @@ impl Triggers {
         }
 
         let grid = &term.grid;
-        // Only the live bottom — don't re-fire history while scrolled back.
-        if grid.display_offset() != 0 {
-            return Vec::new();
-        }
         let history = grid.history_size() as i64;
         let cursor_row = grid.cursor.pos.row.0 as i64;
         let screen_lines = grid.screen_lines();
+        let columns = term.columns();
+
+        // A resize / font-zoom reflows the grid: absolute line numbers and
+        // wrapping are rewritten, so `seen`'s (abs_line, content) keys no
+        // longer identify the same output and every visible line would look
+        // new. Detect it by a dimension change and re-seed `seen` from the
+        // current screen WITHOUT firing, so already-visible finalized output
+        // is suppressed while genuinely new output still fires.
+        let reflowed = self.dims.insert(route_id, (screen_lines, columns))
+            != Some((screen_lines, columns));
+
+        // Skip when the terminal content did not change since the last render.
+        // scan() runs at the top of every render() — cursor blink, mouse hover
+        // and other UI-only repaints included — but only Full/Partial damage
+        // means cells actually changed. Noop/CursorOnly frames do no scan work
+        // (this walks and hashes every visible line under the terminal lock).
+        // A reflow always reports Full damage, so the re-seed above is reached.
+        match term.peek_damage_event() {
+            Some(TerminalDamage::Full) | Some(TerminalDamage::Partial) => {}
+            _ => return Vec::new(),
+        }
 
         // Captured lazily on the first feed_screen match (see below) so the
         // common path — and every non-matching frame — pays nothing.
         let mut screen_text: Option<String> = None;
 
         let seen = self.seen.entry(route_id).or_default();
+        if reflowed {
+            seen.clear();
+        }
         // Drop lines that have scrolled out of the live view.
         seen.retain(|(abs, _, _)| *abs >= history);
         // In the alternate screen history never advances, so the retain
@@ -201,9 +280,30 @@ impl Triggers {
             seen.clear();
         }
 
+        // Reset the cursor line's fire set when the cursor moved to a new
+        // ABSOLUTE line, so a fresh prompt fires while an echo/growth on the
+        // same line cannot. Keying on the screen row broke a scrolling
+        // console (minicom on serial): the cursor sits on the bottom row
+        // forever, so every re-drawn `login:` prompt reused the same
+        // (row, match) key and was suppressed as an echo. The absolute line
+        // (history + cursor_row) advances as the buffer scrolls, so a new
+        // prompt scrolled to the same bottom row still gets a new key. A
+        // scrolled-back view (offset != 0) is not the live prompt, so leave
+        // the fire set untouched.
+        let live = grid.display_offset() == 0;
+        if live {
+            let cursor_abs = history + cursor_row;
+            let cf = self.cursor_fired.entry(route_id).or_default();
+            if cf.row != cursor_abs {
+                cf.row = cursor_abs;
+                cf.fired.clear();
+            }
+        }
+
         let mut actions = Vec::new();
         for i in 0..screen_lines {
             let abs = history + i as i64;
+            let is_cursor = live && (i as i64) == cursor_row;
             let finalized = (i as i64) < cursor_row;
             let text = extract_line_text(term, Line(i as i32));
             if text.is_empty() {
@@ -218,35 +318,48 @@ impl Triggers {
                 &text
             };
 
-            let hash = hash_text(text);
-
-            // The live prompt (cursor line) re-fires when its content changes,
-            // so a prompt that recurs at a redrawn (non-scrolling) position —
-            // e.g. a second login: under tmux — isn't deduped forever. Other
-            // lines fire once each, keyed on (line, content, phase).
-            if (i as i64) == cursor_row {
-                if self.last_cursor.get(&route_id) == Some(&hash) {
+            // The cursor (live prompt) line is handled per-match below so an
+            // echo of an action's own output doesn't re-fire it (findings on
+            // send_text/coprocess feedback and growing instant matches). Other
+            // lines fire once each, keyed on (line, content, phase). When
+            // re-seeding after a reflow, record the key but don't fire.
+            if !is_cursor {
+                let fresh = seen.insert((abs, hash_text(text), finalized));
+                if !fresh || reflowed {
                     continue;
                 }
-                self.last_cursor.insert(route_id, hash);
-            } else if !seen.insert((abs, hash, finalized)) {
-                continue;
             }
 
-            for (idx, rule) in self.rules.iter().enumerate() {
+            for rule in &self.rules {
                 if matches!(rule.action, TriggerAction::Highlight { .. }) {
                     continue;
                 }
                 // Finalized lines run non-instant rules; the cursor line
                 // runs instant rules (prompts with no trailing newline).
-                if rule.instant == finalized {
+                if rule.instant != is_cursor {
                     continue;
                 }
-                if rule.once && self.fired_once.contains(&(route_id, idx)) {
+                if rule.once && self.fired_once.contains(&(route_id, rule.id)) {
                     continue;
                 }
                 let mut matched = false;
                 for caps in rule.regex.captures_iter(text) {
+                    // On the cursor line, dedup by the matched substring so an
+                    // action's echo (or the line growing by a chunk) that
+                    // reproduces an already-fired match is suppressed, while a
+                    // new match on the same row still fires.
+                    if is_cursor {
+                        let key = (rule.id, match_hash(text, &caps));
+                        if !self
+                            .cursor_fired
+                            .get_mut(&route_id)
+                            .expect("cursor_fired seeded above")
+                            .fired
+                            .insert(key)
+                        {
+                            continue;
+                        }
+                    }
                     if self.has_feed_screen
                         && screen_text.is_none()
                         && matches!(
@@ -270,21 +383,31 @@ impl Triggers {
                     }
                 }
                 if matched && rule.once {
-                    self.fired_once.insert((route_id, idx));
+                    self.fired_once.insert((route_id, rule.id));
                 }
             }
         }
         actions
     }
 
-    /// Recompute highlight ranges over the visible region. Highlights are a
-    /// visual state, re-evaluated each frame so they track the live text.
+    /// Recompute highlight ranges over the visible region, or `None` when the
+    /// terminal content did not change since the last render so the caller
+    /// should keep the highlights it already has. Highlights are a visual
+    /// state, but re-running onig over every visible line each frame — under
+    /// the terminal lock, on cursor-blink and hover repaints too — is wasted
+    /// work when no cell changed. Content change (Full/Partial damage) forces
+    /// a recompute; an empty `Vec` still means "clear", e.g. when the last
+    /// matching text scrolled off or the highlight rules were removed.
     pub fn highlights<T: EventListener>(
         &self,
         term: &Crosswords<T>,
-    ) -> Vec<(Match, [u8; 4])> {
+    ) -> Option<Vec<(Match, [u8; 4])>> {
         if !self.has_highlight {
-            return Vec::new();
+            return Some(Vec::new());
+        }
+        match term.peek_damage_event() {
+            Some(TerminalDamage::Full) | Some(TerminalDamage::Partial) => {}
+            _ => return None,
         }
         let grid = &term.grid;
         let display_offset = grid.display_offset() as i32;
@@ -315,7 +438,7 @@ impl Triggers {
                 }
             }
         }
-        out
+        Some(out)
     }
 }
 
@@ -326,10 +449,19 @@ fn capture_screen<T: EventListener>(term: &Crosswords<T>) -> String {
     let grid = &term.grid;
     let screen_lines = grid.screen_lines() as i32;
     let start = grid.topmost_line().0.max(-FEED_HISTORY_LINES);
-    (start..screen_lines)
+    let text = (start..screen_lines)
         .map(|i| extract_line_text(term, Line(i)))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    if text.len() <= FEED_PAYLOAD_CAP {
+        return text;
+    }
+    // Keep the newest end (visible prompt); drop the oldest scrollback.
+    let cut = text.len() - FEED_PAYLOAD_CAP;
+    match text.char_indices().find(|(i, _)| *i >= cut) {
+        Some((byte, _)) => text[byte..].to_string(),
+        None => text,
+    }
 }
 
 /// Match span as cell columns (onig reports byte offsets; columns are
@@ -428,5 +560,30 @@ mod tests {
         assert_eq!(substitute(r"\9", &c), "");
         assert_eq!(substitute(r"a\\b", &c), r"a\b");
         assert_eq!(substitute("plain", &c), "plain");
+    }
+
+    #[test]
+    fn rule_id_is_stable_and_distinct() {
+        let color = [0.0, 0.0, 0.0, 1.0];
+        let a = TriggerAction::TabColor { color };
+        let b = TriggerAction::SendText { text: "y\n".into() };
+        // Same regex + same action -> same id across calls (survives reload).
+        assert_eq!(rule_id("done", &a), rule_id("done", &a));
+        // A different regex or a different action -> different id.
+        assert_ne!(rule_id("done", &a), rule_id("finished", &a));
+        assert_ne!(rule_id("done", &a), rule_id("done", &b));
+    }
+
+    #[test]
+    fn match_hash_tracks_matched_substring() {
+        let re = onig::Regex::new(r"\[y/n\]").unwrap();
+        // The whole line grows as an echo appends, but the match text is the
+        // same, so the cursor-line dedup key is unchanged -> no re-fire.
+        let c1 = re.captures("Continue? [y/n]").unwrap();
+        let c2 = re.captures("Continue? [y/n]y").unwrap();
+        assert_eq!(
+            match_hash("Continue? [y/n]", &c1),
+            match_hash("Continue? [y/n]y", &c2)
+        );
     }
 }

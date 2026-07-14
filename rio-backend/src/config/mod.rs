@@ -498,17 +498,7 @@ impl Config {
                             }
                         }
 
-                        let triggers_path = triggers_file_path();
-                        if triggers_path.exists() {
-                            match Config::load_triggers(&triggers_path) {
-                                Ok(loaded) => decoded.triggers = loaded,
-                                Err(err_message) => {
-                                    return Err(ConfigError::ErrLoadingTriggers(
-                                        err_message,
-                                    ));
-                                }
-                            }
-                        }
+                        Config::apply_triggers(&mut decoded);
 
                         Ok(decoded)
                     }
@@ -521,7 +511,28 @@ impl Config {
                 }
             }
         } else {
-            Err(ConfigError::PathNotFound)
+            // No config.toml, but triggers.toml is loaded independently so a
+            // triggers-only setup still works.
+            let mut decoded = Config::default();
+            Config::apply_triggers(&mut decoded);
+            Ok(decoded)
+        }
+    }
+
+    /// Load `triggers.toml` into `config`, if present. A parse error keeps the
+    /// config's existing (default) triggers and is only logged: a triggers
+    /// typo must not discard the rest of a live config (fonts, colors, binds)
+    /// by turning into a whole-config load failure.
+    fn apply_triggers(config: &mut Config) {
+        let triggers_path = triggers_file_path();
+        if !triggers_path.exists() {
+            return;
+        }
+        match Config::load_triggers(&triggers_path) {
+            Ok(loaded) => config.triggers = loaded,
+            Err(err_message) => {
+                warn!("failed to load triggers, keeping previous config: {err_message}");
+            }
         }
     }
 

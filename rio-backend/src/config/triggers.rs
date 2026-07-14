@@ -109,14 +109,11 @@ pub enum TriggerAction {
 mod tests {
     use super::*;
 
-    #[derive(Deserialize)]
-    struct Root {
-        #[serde(default)]
-        triggers: Triggers,
-    }
-
+    /// `triggers.toml` puts the rule list at the file's top level (`[[rules]]`,
+    /// loaded as `Triggers` directly), so the tests parse the same shape rather
+    /// than a `[[triggers.rules]]` wrapper that never appears in the real file.
     fn parse(content: &str) -> Triggers {
-        toml::from_str::<Root>(content).unwrap().triggers
+        toml::from_str::<Triggers>(content).unwrap()
     }
 
     #[test]
@@ -128,36 +125,36 @@ mod tests {
     fn parses_each_action() {
         let triggers = parse(
             r##"
-            [[triggers.rules]]
+            [[rules]]
             regex = "error: (.*)"
-            [triggers.rules.action]
+            [rules.action]
             notify = { title = "Error", body = "\\1", urgency = "critical" }
 
-            [[triggers.rules]]
+            [[rules]]
             regex = "(?i)warn"
             instant = true
-            [triggers.rules.action]
+            [rules.action]
             highlight = { color = "#FFAA00" }
 
-            [[triggers.rules]]
+            [[rules]]
             regex = "done"
-            [triggers.rules.action]
+            [rules.action]
             tab_color = { color = "#00FF00" }
 
-            [[triggers.rules]]
+            [[rules]]
             regex = "deploy"
-            [triggers.rules.action]
+            [rules.action]
             run = { program = "notify-send", args = ["deploy"] }
 
-            [[triggers.rules]]
+            [[rules]]
             regex = "password:"
             once = true
-            [triggers.rules.action]
+            [rules.action]
             send_text = { text = "hunter2\n" }
 
-            [[triggers.rules]]
+            [[rules]]
             regex = "now"
-            [triggers.rules.action]
+            [rules.action]
             coprocess = { program = "date" }
         "##,
         );
@@ -186,9 +183,9 @@ mod tests {
     fn regex_compiles() {
         for rule in parse(
             r#"
-            [[triggers.rules]]
+            [[rules]]
             regex = "error: (.*)"
-            [triggers.rules.action]
+            [rules.action]
             notify = { title = "e", body = "\\1" }
         "#,
         )

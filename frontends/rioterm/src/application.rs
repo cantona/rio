@@ -815,9 +815,16 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                                     return;
                                 }
                             };
+                            // Write stdin on its own thread so we can drain
+                            // stdout concurrently: a coprocess that emits more
+                            // than one pipe buffer before reading its input
+                            // would otherwise deadlock against a blocking
+                            // write_all here.
                             if let Some(input) = stdin {
                                 if let Some(mut pipe) = child.stdin.take() {
-                                    let _ = pipe.write_all(input.as_bytes());
+                                    std::thread::spawn(move || {
+                                        let _ = pipe.write_all(input.as_bytes());
+                                    });
                                 }
                             }
                             match child.wait_with_output() {
