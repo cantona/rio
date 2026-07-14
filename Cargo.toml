@@ -7,6 +7,7 @@ members = [
     "rio-grapheme-width",
     "rio-window",
     "rio-notifier",
+    "rio-ptyd",
     "frontends/rioterm",
 ]
 resolver = "2"
