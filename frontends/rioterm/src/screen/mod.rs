@@ -3804,8 +3804,11 @@ impl Screen<'_> {
                 // palette just closes without side effects.
             }
             // Handled in the router before dispatch (they swap the
-            // palette into sessions mode and keep it open).
-            PaletteAction::SaveSessionAs | PaletteAction::RestoreSessionPicker => {}
+            // palette into sessions / remote-attach mode and keep it
+            // open).
+            PaletteAction::SaveSessionAs
+            | PaletteAction::RestoreSessionPicker
+            | PaletteAction::AttachRemotePane => {}
             PaletteAction::Quit => {
                 self.context_manager.quit();
             }

@@ -71,6 +71,10 @@ const ORDER: u8 = 20;
 pub enum PaletteAction {
     SaveSessionAs,
     RestoreSessionPicker,
+    /// Switch the palette to the ssh-destination input; the follow-up
+    /// pane listing and pick stay inside the palette. Handled by the
+    /// router, not `Screen::execute_palette_action`.
+    AttachRemotePane,
     TabCreate,
     TabClose,
     TabCloseUnfocused,
@@ -244,6 +248,11 @@ const COMMANDS: &[Command] = &[
         shortcut: "",
         action: PaletteAction::RestoreSessionPicker,
     },
+    Command {
+        title: "Attach Remote Pane...",
+        shortcut: "",
+        action: PaletteAction::AttachRemotePane,
+    },
 ];
 
 /// What the palette is currently browsing and filtering over.
@@ -265,6 +274,23 @@ enum PaletteMode {
         names: Vec<String>,
         saving: bool,
     },
+    /// "Attach Remote Pane" flow: type an ssh destination, list its
+    /// rio-ptyd panes off-thread, pick one to attach as a new tab.
+    Remote {
+        host: String,
+        phase: RemotePhase,
+    },
+}
+
+enum RemotePhase {
+    /// Typing the ssh destination; the query itself is the host.
+    EnterHost,
+    /// `ssh <host> rio-ptyd list --json` is running on a worker
+    /// thread; the RemotePanesListed event resolves this phase.
+    Loading,
+    /// Attachable panes on the host: `(pane_id, label)`.
+    Panes(Vec<(String, String)>),
+    Failed(String),
 }
 
 /// One row in the filtered result list. Variants carry exactly the
@@ -282,6 +308,19 @@ enum PaletteRow<'a> {
     Font {
         family: &'a str,
     },
+    /// "Connect to <host>" — Enter launches the remote pane listing
+    /// (the host is read from the live query in `get_remote_connect`).
+    RemoteConnect {
+        label: String,
+    },
+    RemotePane {
+        pane_id: &'a str,
+        label: &'a str,
+    },
+    /// Non-actionable status row (loading / error / empty list).
+    Info {
+        text: std::borrow::Cow<'a, str>,
+    },
 }
 
 impl<'a> PaletteRow<'a> {
@@ -290,24 +329,47 @@ impl<'a> PaletteRow<'a> {
             PaletteRow::Command { title, .. } => title,
             PaletteRow::Font { family } => family,
             PaletteRow::Session { name } => name,
+            PaletteRow::RemoteConnect { label, .. } => label,
+            PaletteRow::RemotePane { label, .. } => label,
+            PaletteRow::Info { text } => text,
         }
     }
 
     fn shortcut(&self) -> &'a str {
         match *self {
             PaletteRow::Command { shortcut, .. } => shortcut,
-            PaletteRow::Font { .. } => "",
-            PaletteRow::Session { .. } => "",
+            _ => "",
         }
     }
 
     fn action(&self) -> Option<PaletteAction> {
         match *self {
             PaletteRow::Command { action, .. } => Some(action),
-            PaletteRow::Font { .. } => None,
-            PaletteRow::Session { .. } => None,
+            _ => None,
         }
     }
+}
+
+/// A typed ssh destination, validated with the SAME allowlist the
+/// spawn layer enforces (`ptyd::is_safe_ssh_dest`). Using the strict
+/// rule here too means the palette only offers a "Connect to <host>"
+/// row for a destination that will actually pass at spawn time —
+/// otherwise `host;id` would render as a valid-looking row and then
+/// fail with "invalid ssh destination" on Enter.
+fn sanitize_ssh_dest(query: &str) -> Option<String> {
+    let dest = query.trim();
+    #[cfg(unix)]
+    if crate::ptyd::is_safe_ssh_dest(dest) {
+        return Some(dest.to_string());
+    }
+    #[cfg(not(unix))]
+    if !dest.is_empty()
+        && !dest.starts_with('-')
+        && !dest.chars().any(char::is_whitespace)
+    {
+        return Some(dest.to_string());
+    }
+    None
 }
 
 /// Paint a rounded-rect outline by layering two filled rounded rects:
@@ -501,6 +563,10 @@ impl CommandPalette {
 
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
+        // Reset to Commands mode on both edges — a stale Fonts list
+        // or an in-flight remote-listing phase surviving a close would
+        // be misleading the next time anything touches the palette.
+        self.mode = PaletteMode::Commands;
         if enabled {
             self.query.clear();
             self.selected_index = 0;
@@ -509,11 +575,6 @@ impl CommandPalette {
             // Clear scrollbar history so reopening the palette never
             // flashes a leftover scrollbar from the previous session.
             self.last_scroll_time = None;
-            // Always re-open into Commands mode — a stale Fonts list
-            // from a previous session would be misleading (fonts may
-            // have changed) and surprising (user toggles palette and
-            // finds themselves on the font list).
-            self.mode = PaletteMode::Commands;
         }
     }
 
@@ -553,6 +614,104 @@ impl CommandPalette {
         self.scroll_offset = 0;
         self.caret_blink_start = Instant::now();
         self.last_scroll_time = None;
+    }
+
+    /// Swap into the "Attach Remote Pane" flow, starting at the ssh
+    /// destination input.
+    pub fn enter_remote_host_mode(&mut self) {
+        self.mode = PaletteMode::Remote {
+            host: String::new(),
+            phase: RemotePhase::EnterHost,
+        };
+        self.query.clear();
+        self.selected_index = 0;
+        self.scroll_offset = 0;
+        self.caret_blink_start = Instant::now();
+        self.last_scroll_time = None;
+    }
+
+    /// Typed ssh destination, when Enter should launch the pane
+    /// listing for it.
+    pub fn get_remote_connect(&self) -> Option<String> {
+        let PaletteMode::Remote {
+            phase: RemotePhase::EnterHost,
+            ..
+        } = &self.mode
+        else {
+            return None;
+        };
+        sanitize_ssh_dest(&self.query)
+    }
+
+    /// The listing worker was started for `host`.
+    pub fn set_remote_loading(&mut self, host: String) {
+        if let PaletteMode::Remote { host: h, phase } = &mut self.mode {
+            *h = host;
+            *phase = RemotePhase::Loading;
+            self.query.clear();
+            self.selected_index = 0;
+            self.scroll_offset = 0;
+        }
+    }
+
+    /// Worker-thread listing result. Ignored unless the palette is
+    /// still waiting on this host — the user may have Esc'd out and
+    /// moved on before ssh came back.
+    pub fn set_remote_result(
+        &mut self,
+        host: &str,
+        panes: Vec<(String, String)>,
+        error: Option<String>,
+    ) {
+        let PaletteMode::Remote { host: h, phase } = &mut self.mode else {
+            return;
+        };
+        if h != host || !matches!(phase, RemotePhase::Loading) {
+            return;
+        }
+        *phase = match error {
+            Some(e) => RemotePhase::Failed(e),
+            None => RemotePhase::Panes(panes),
+        };
+        // Anything typed while loading would silently filter the
+        // fresh list down to nothing.
+        self.query.clear();
+        self.selected_index = 0;
+        self.scroll_offset = 0;
+    }
+
+    /// Jump straight to the failed phase for `host` — used when an
+    /// attach picked from the pane list fails, so the palette reopens
+    /// showing why.
+    pub fn show_remote_error(&mut self, host: String, error: String) {
+        self.mode = PaletteMode::Remote {
+            host,
+            phase: RemotePhase::Failed(error),
+        };
+        self.query.clear();
+        self.selected_index = 0;
+        self.scroll_offset = 0;
+        self.caret_blink_start = Instant::now();
+        self.last_scroll_time = None;
+    }
+
+    /// Selected `(host, pane_id)` in the remote pane picker.
+    pub fn get_selected_remote_pane(&self) -> Option<(String, String)> {
+        let PaletteMode::Remote {
+            host,
+            phase: RemotePhase::Panes(_),
+        } = &self.mode
+        else {
+            return None;
+        };
+        self.filtered_rows()
+            .get(self.selected_index)
+            .and_then(|(_, row)| match row {
+                PaletteRow::RemotePane { pane_id, .. } => {
+                    Some((host.clone(), (*pane_id).to_string()))
+                }
+                _ => None,
+            })
     }
 
     pub fn set_query(&mut self, query: String) {
@@ -618,6 +777,10 @@ impl CommandPalette {
                         if cmd.action == PaletteAction::ToggleAppearanceTheme {
                             return has_adaptive;
                         }
+                        // rio-ptyd daemons are unix-only.
+                        if cmd.action == PaletteAction::AttachRemotePane {
+                            return cfg!(unix);
+                        }
                         true
                     })
                     .filter_map(|cmd| {
@@ -669,6 +832,50 @@ impl CommandPalette {
                 }
                 rows
             }
+            PaletteMode::Remote { phase, .. } => match phase {
+                RemotePhase::EnterHost => sanitize_ssh_dest(&self.query)
+                    .map(|host| {
+                        vec![(
+                            i32::MAX,
+                            PaletteRow::RemoteConnect {
+                                label: format!("Connect to {host}"),
+                            },
+                        )]
+                    })
+                    .unwrap_or_default(),
+                RemotePhase::Loading => vec![(
+                    0,
+                    PaletteRow::Info {
+                        text: std::borrow::Cow::Borrowed("Listing panes..."),
+                    },
+                )],
+                RemotePhase::Panes(panes) => {
+                    if panes.is_empty() {
+                        vec![(
+                            0,
+                            PaletteRow::Info {
+                                text: std::borrow::Cow::Borrowed(
+                                    "No attachable panes on this host",
+                                ),
+                            },
+                        )]
+                    } else {
+                        panes
+                            .iter()
+                            .filter_map(|(pane_id, label)| {
+                                let score = fuzzy_score(&self.query, label)?;
+                                Some((score, PaletteRow::RemotePane { pane_id, label }))
+                            })
+                            .collect()
+                    }
+                }
+                RemotePhase::Failed(e) => vec![(
+                    0,
+                    PaletteRow::Info {
+                        text: std::borrow::Cow::Borrowed(e.as_str()),
+                    },
+                )],
+            },
         };
 
         results.sort_by_key(|r| std::cmp::Reverse(r.0));
@@ -788,6 +995,22 @@ impl CommandPalette {
             PaletteMode::Fonts(_) => "Type a font name...",
             PaletteMode::Sessions { saving: true, .. } => "Type a session name...",
             PaletteMode::Sessions { saving: false, .. } => "Pick a session to restore...",
+            PaletteMode::Remote {
+                phase: RemotePhase::EnterHost,
+                ..
+            } => "user@host to attach from...",
+            PaletteMode::Remote {
+                phase: RemotePhase::Panes(_),
+                ..
+            } => "Pick a pane to attach...",
+            PaletteMode::Remote {
+                phase: RemotePhase::Loading,
+                ..
+            } => "Listing panes...",
+            PaletteMode::Remote {
+                phase: RemotePhase::Failed(_),
+                ..
+            } => "ssh failed",
         };
         let display_text = if self.query.is_empty() {
             placeholder
@@ -1291,6 +1514,77 @@ mod tests {
         palette.set_enabled(false);
         palette.set_enabled(true);
         assert!(palette.last_scroll_time.is_none());
+    }
+
+    #[test]
+    fn remote_host_input_offers_connect_row_for_valid_dest() {
+        let mut palette = CommandPalette::new();
+        palette.enter_remote_host_mode();
+        assert!(palette.get_remote_connect().is_none());
+        palette.set_query("user@host".to_string());
+        assert_eq!(palette.get_remote_connect().as_deref(), Some("user@host"));
+        let rows = palette.filtered_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.title(), "Connect to user@host");
+    }
+
+    #[test]
+    fn remote_host_rejects_injection_and_whitespace() {
+        let mut palette = CommandPalette::new();
+        palette.enter_remote_host_mode();
+        for bad in ["-oProxyCommand=x", "a b", "  ", "-lroot"] {
+            palette.set_query(bad.to_string());
+            assert!(
+                palette.get_remote_connect().is_none(),
+                "should reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_result_ignored_for_stale_host() {
+        let mut palette = CommandPalette::new();
+        palette.enter_remote_host_mode();
+        palette.set_remote_loading("hostA".to_string());
+        // Result for a host we're no longer waiting on is dropped.
+        palette.set_remote_result(
+            "hostB",
+            vec![("id".into(), "bash  /tmp  running".into())],
+            None,
+        );
+        assert!(palette.get_selected_remote_pane().is_none());
+    }
+
+    #[test]
+    fn remote_panes_are_selectable_after_result() {
+        let mut palette = CommandPalette::new();
+        palette.enter_remote_host_mode();
+        palette.set_remote_loading("h".to_string());
+        palette.set_remote_result(
+            "h",
+            vec![
+                ("aaa".into(), "bash  /tmp  running".into()),
+                ("bbb".into(), "zsh  /etc  running".into()),
+            ],
+            None,
+        );
+        assert_eq!(palette.filtered_rows().len(), 2);
+        assert_eq!(
+            palette.get_selected_remote_pane(),
+            Some(("h".to_string(), "aaa".to_string()))
+        );
+    }
+
+    #[test]
+    fn remote_failure_shows_info_row_no_pane() {
+        let mut palette = CommandPalette::new();
+        palette.enter_remote_host_mode();
+        palette.set_remote_loading("h".to_string());
+        palette.set_remote_result("h", Vec::new(), Some("ssh exited with 255".into()));
+        let rows = palette.filtered_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.title(), "ssh exited with 255");
+        assert!(palette.get_selected_remote_pane().is_none());
     }
 
     #[test]

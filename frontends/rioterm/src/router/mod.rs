@@ -253,6 +253,55 @@ impl Route<'_> {
         }
     }
 
+    /// Palette "Attach Remote Pane": open a new tab attached to a
+    /// pane hosted by a rio-ptyd daemon on `host`. Returns an error
+    /// string (for the palette to show) when the attach fails; no
+    /// look-alike local shell is spawned in its place.
+    #[cfg(unix)]
+    pub fn attach_remote_pane(
+        &mut self,
+        host: &str,
+        pane_id: &str,
+    ) -> Result<(), String> {
+        let target = crate::context::AttachTarget::Ssh {
+            host: host.to_string(),
+            pane_id: pane_id.to_string(),
+        };
+        let screen = &mut self.window.screen;
+
+        // Mirror restore's per-tab ceremony: grow the top margin for
+        // the incoming tab and reflow the current one before it exists.
+        let num_tabs = screen.ctx().len();
+        let old_index = screen.context_manager.current_index();
+        screen.resize_top_or_bottom_line(num_tabs + 1);
+        #[cfg(not(target_os = "macos"))]
+        screen.context_manager.contexts_mut()[old_index]
+            .update_dimensions(&mut screen.sugarloaf);
+
+        match screen
+            .ctx_mut()
+            .add_context_attach(crate::context::next_rich_text_id(), &target)
+        {
+            Ok(()) => {
+                let new_index = screen.context_manager.current_index();
+                screen.context_manager.switch_context_visibility(
+                    &mut screen.sugarloaf,
+                    old_index,
+                    new_index,
+                );
+                screen.resize_all_contexts();
+                self.request_redraw();
+                Ok(())
+            }
+            Err(e) => {
+                // Undo the margin growth; the tab never materialized.
+                screen.resize_top_or_bottom_line(num_tabs);
+                self.request_overlay_redraw();
+                Err(e)
+            }
+        }
+    }
+
     /// Offer to resume `state` (activates the launch prompt).
     pub fn prompt_session_resume(&mut self, state: crate::session::SessionState) {
         self.pending_session = Some(state);
@@ -464,6 +513,57 @@ impl Route<'_> {
                             .get_selected_action();
                         use crate::renderer::command_palette::PaletteAction;
 
+                        // Remote-attach Enter, phase 1: a typed ssh
+                        // destination. Kick off the pane listing on a
+                        // worker thread; the palette stays open in its
+                        // loading phase until RemotePanesListed lands.
+                        #[cfg(unix)]
+                        if let Some(host) = self
+                            .window
+                            .screen
+                            .renderer
+                            .command_palette
+                            .get_remote_connect()
+                        {
+                            self.window
+                                .screen
+                                .context_manager
+                                .request_remote_pane_list(host.clone());
+                            self.window
+                                .screen
+                                .renderer
+                                .command_palette
+                                .set_remote_loading(host);
+                            self.request_overlay_redraw();
+                            return true;
+                        }
+
+                        // Remote-attach Enter, phase 2: a picked pane.
+                        // Close the palette, attach as a new tab, and
+                        // on failure reopen the palette showing why.
+                        #[cfg(unix)]
+                        if let Some((host, pane_id)) = self
+                            .window
+                            .screen
+                            .renderer
+                            .command_palette
+                            .get_selected_remote_pane()
+                        {
+                            self.window
+                                .screen
+                                .renderer
+                                .command_palette
+                                .set_enabled(false);
+                            if let Err(e) = self.attach_remote_pane(&host, &pane_id) {
+                                let palette =
+                                    &mut self.window.screen.renderer.command_palette;
+                                palette.set_enabled(true);
+                                palette.show_remote_error(host, e);
+                            }
+                            self.request_overlay_redraw();
+                            return true;
+                        }
+
                         // Sessions-mode Enter: save-as or restore the
                         // picked name, then close the palette.
                         if let Some((name, saving)) = self
@@ -539,6 +639,16 @@ impl Route<'_> {
                                         names,
                                         action == PaletteAction::SaveSessionAs,
                                     );
+                            }
+                            // Remote attach opens the ssh-host input;
+                            // the flow continues inside the palette.
+                            #[cfg(unix)]
+                            Some(PaletteAction::AttachRemotePane) => {
+                                self.window
+                                    .screen
+                                    .renderer
+                                    .command_palette
+                                    .enter_remote_host_mode();
                             }
                             // Any other command is a one-shot: close
                             // the palette first, then dispatch.

@@ -1057,6 +1057,25 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             .send_event(RioEvent::RestoreSessionByName(name), self.window_id);
     }
 
+    /// Palette "Attach Remote Pane": list the destination's panes on
+    /// a worker thread (even BatchMode ssh takes seconds) and deliver
+    /// the result through the event loop.
+    #[cfg(unix)]
+    pub fn request_remote_pane_list(&self, host: String) {
+        let event_proxy = self.event_proxy.clone();
+        let window_id = self.window_id;
+        std::thread::spawn(move || {
+            let (panes, error) = match crate::ptyd::list_remote_panes(&host) {
+                Ok(panes) => (panes, None),
+                Err(e) => (Vec::new(), Some(e)),
+            };
+            event_proxy.send_event(
+                RioEvent::RemotePanesListed { host, panes, error },
+                window_id,
+            );
+        });
+    }
+
     #[cfg(target_os = "macos")]
     #[inline]
     pub fn hide_other_apps(&mut self) {
@@ -1308,6 +1327,55 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 tracing::error!("session restore: not able to create a split context");
                 false
             }
+        }
+    }
+
+    /// Add a tab attached to an explicit target (palette remote
+    /// attach). No fresh-spawn fallback: the user asked for this
+    /// exact pane, so failure must surface instead of materializing
+    /// a look-alike local shell.
+    #[cfg(unix)]
+    pub fn add_context_attach(
+        &mut self,
+        rich_text_id: usize,
+        attach: &AttachTarget,
+    ) -> Result<(), String> {
+        if self.contexts.len() >= self.capacity {
+            return Err("tab limit reached".into());
+        }
+        let last_index = self.contexts.len();
+        let mut dimension = self.current().dimension;
+        if self.current_grid().len() > 1 {
+            dimension = self.current_grid().grid_dimension();
+        }
+        let current = self.current();
+        let cursor = current.cursor_from_ref();
+        let blinking = current.renderable_content.has_blinking_enabled;
+        match ContextManager::create_context(
+            (&cursor, blinking),
+            self.event_proxy.clone(),
+            self.window_id,
+            rich_text_id,
+            dimension,
+            &self.config,
+            Some(attach),
+            false,
+        ) {
+            Ok(new_context) => {
+                let previous_scaled_margin =
+                    self.contexts[self.current_index].scaled_margin;
+                self.contexts.push(ContextGrid::new(
+                    new_context,
+                    previous_scaled_margin,
+                    self.config.split_color,
+                    self.config.split_active_color,
+                    self.config.panel,
+                ));
+                self.current_index = last_index;
+                self.current_route = self.current().route_id;
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
         }
     }
 

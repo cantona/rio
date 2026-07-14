@@ -260,6 +260,15 @@ pub enum RioEvent {
     /// Restore a named session into the current window (append tabs).
     RestoreSessionByName(String),
 
+    /// Result of listing rio-ptyd panes on an ssh destination
+    /// (palette "Attach Remote Pane"), sent from the worker thread:
+    /// `(pane_id, label)` per attachable pane, or the ssh error.
+    RemotePanesListed {
+        host: String,
+        panes: Vec<(String, String)>,
+        error: Option<String>,
+    },
+
     /// Leave current terminal.
     CloseTerminal(usize),
 
@@ -347,6 +356,7 @@ impl Debug for RioEvent {
             RioEvent::DisarmCloseButton => write!(f, "DisarmCloseButton"),
             RioEvent::SaveSessionAs(_) => write!(f, "SaveSessionAs"),
             RioEvent::RestoreSessionByName(_) => write!(f, "RestoreSessionByName"),
+            RioEvent::RemotePanesListed { .. } => write!(f, "RemotePanesListed"),
             RioEvent::CloseTerminal(route) => write!(f, "CloseTerminal {route}"),
             RioEvent::CreateWindow => write!(f, "CreateWindow"),
             RioEvent::CloseWindow => write!(f, "CloseWindow"),

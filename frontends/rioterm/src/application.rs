@@ -547,6 +547,18 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     route.restore_session_named(&name);
                 }
             }
+            #[cfg(unix)]
+            RioEventType::Rio(RioEvent::RemotePanesListed { host, panes, error }) => {
+                if let Some(route) = self.router.routes.get_mut(&window_id) {
+                    route
+                        .window
+                        .screen
+                        .renderer
+                        .command_palette
+                        .set_remote_result(&host, panes, error);
+                    route.request_overlay_redraw();
+                }
+            }
             RioEventType::Rio(RioEvent::CloseButtonArmed) => {
                 self.scheduler.schedule(
                     EventPayload::new(
