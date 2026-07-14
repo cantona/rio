@@ -53,11 +53,15 @@ Close the terminal, reopen it, and your world comes back — like a browser
 restoring tabs. Every tab, the split layout with its ratios, each pane's
 working directory, the window size, even the styled scrollback text.
 
+Two levels control it. `restore` (level 1) decides *when* the session
+is saved and reloaded; `persistent` (level 2) decides *how* — dead
+scrollback or live shells.
+
 ```toml
 [session]
-# What happens at quit/launch: "never" disables sessions entirely,
-# "prompt" asks before saving and before resuming, "always" does both
-# silently. Default: "never".
+# LEVEL 1 — when. "disable" turns sessions off entirely; "prompt" asks
+# "save?" at quit and "resume?" at launch; "always" does both silently.
+# Default: "disable".
 restore = "prompt"
 # How many scrollback lines each pane saves. Default: 2000.
 max-scrollback-lines = 2000
@@ -66,8 +70,59 @@ max-scrollback-lines = 2000
 - `ctrl+shift+s` saves on demand (with a "session saved" flash)
 - Named workspaces: `rio --session work`, or the command palette's
   `Save Session As…` / `Restore Session…`
-- Restored panes are fresh shells at the saved directory with the old
-  output repainted above the prompt
+- With `persistent = false` (default), restored panes are fresh shells
+  at the saved directory with the old output repainted above the prompt
+- `"prompt"` asks at both ends and never writes without your yes;
+  `"always"` saves silently and also autosaves on tab/split changes so a
+  crash still leaves a current session
+- The launch resume prompt offers three choices: `r` resume the saved
+  session, `n` start new and discard the old one (its persistent
+  daemons are killed, not stranded), or `k` start new but keep the old
+  session in the background so a later launch can still resume it
+
+### 🧬 Persistent shells that survive rio (tmux-style)
+Turn on `persistent` and every pane runs behind a tiny standalone
+daemon (`rio-ptyd`) that owns the real PTY. Quit rio — or let it crash —
+and your shells keep running; the next launch reattaches to the live
+processes and replays their screens, alt-screen apps (vim, `top`,
+`minicom`) included. Closing a tab still kills its shell; only quitting
+detaches.
+
+```toml
+[session]
+# persistent only takes effect when restore is on (prompt/always);
+# with restore = "disable" it is ignored.
+restore = "prompt"
+# Level 2 — false (default) = v1 scrollback repaint; true = v2 live
+# rio-ptyd daemons so the shell outlives rio.
+persistent = true
+# Per-pane replay buffer, in bytes, that repaints the screen on
+# reattach. Default: 1048576 (1 MiB).
+persistent-ring-bytes = 1048576
+```
+
+`rio-ptyd` is a self-contained binary (no rio dependencies) you can
+drive by hand — `rio-ptyd list`, `attach <id>`, `kill <id>`, `gc` — so a
+session is inspectable and scriptable from any terminal. `list` shows
+each pane's session name and what it is doing — the foreground program
+when one is running (`vim`, `ssh`, …), otherwise its working directory:
+
+```
+$ rio-ptyd list
+8bd31f72…  running   pid 40231  [work]  vim
+ca203ac5…  running   pid 40988  [work]  /home/you/src
+```
+
+**Remote sessions over SSH.** Because the daemon speaks a byte protocol
+rather than passing file descriptors, a pane hosted on another machine
+attaches exactly like a local one. The command palette's
+`Attach Remote Pane…` prompts for an `user@host`, lists that host's live
+panes over `ssh … rio-ptyd list --json`, and opens the pick as a new
+tab — repaint and all. Remote tabs are saved with their host and
+reattach over SSH on the next restore. Closing a remote tab kills its
+shell like any other; what rio never does implicitly is reap a remote
+shell when you *decline* a session save or when `gc` cleans up — those
+touch local daemons only.
 
 ### ⚡ Terminal triggers
 iTerm2-style regex → action rules in a hot-reloading `triggers.toml`.
@@ -77,15 +132,18 @@ screen to a coprocess, or type text back into the terminal — plus
 `once` (one-shot) and `instant` (fire mid-line) flags:
 
 ```toml
-[[triggers.rules]]
+# In triggers.toml the rules are top-level `[[rules]]` tables — the
+# file is parsed as the triggers config directly, not nested under a
+# `[triggers]` key (that key only exists inside the main config).
+[[rules]]
 regex = "login:"
 once = true            # one-shot; re-arm with the resettriggers action
-[triggers.rules.action]
+[rules.action]
 send_text = { text = "admin\n" }
 
-[[triggers.rules]]
+[[rules]]
 regex = "error: (.*)"
-[triggers.rules.action]
+[rules.action]
 notify = { title = "Error", body = "\\1", urgency = "critical" }
 ```
 
@@ -175,15 +233,52 @@ enter bindings parse correctly in `[bindings]`.
 
 ## Build & Install
 
+This fork is not published to any package channel — build it from source.
+`dev` is the default branch and the product. MSRV is Rust 1.96.1.
+
 ```sh
 git clone https://github.com/cantona/rio.git
 cd rio
-cargo build --release -p rioterm --no-default-features --features=wayland   # or x11
-install -Dm755 target/release/rio ~/.local/bin/rio
 ```
 
-MSRV is Rust 1.96.1. For macOS/Windows builds and base-feature docs, the
-upstream documentation at [rioterm.com](https://rioterm.com) applies.
+A bare `cargo build --release` builds both binaries the fork needs — the
+`rio` terminal and the `rio-ptyd` session daemon (`[session] persistent`
+looks for it next to `rio`, then on `PATH`).
+
+**Debian / Ubuntu** — a real package (binaries + terminfo + desktop
+entry + icon), built and installed with `cargo deb`:
+
+```sh
+make install-debian-wayland   # or: make install-debian-x11
+# build the .deb without installing (lands in release/debian/):
+make release-debian-wayland
+```
+
+**Other Linux** — build, then install the binaries and the runtime
+assets by hand (this is what the .deb bundles):
+
+```sh
+make release-wayland          # or: make release-x11
+install -Dm755 target/release/rio       /usr/local/bin/rio
+install -Dm755 target/release/rio-ptyd  /usr/local/bin/rio-ptyd
+sudo tic -xe xterm-rio,rio /usr/share/terminfo misc/rio.terminfo
+install -Dm644 misc/rio.desktop /usr/share/applications/rio.desktop
+install -Dm644 misc/logo.svg    /usr/share/icons/hicolor/scalable/apps/rio.svg
+```
+
+**macOS** — build the universal `Rio.app` (locally code-signed with an
+ad-hoc identity) and move it into `/Applications`:
+
+```sh
+make install-macos
+```
+
+**Windows** — build an installer with
+[`cargo-wix`](https://github.com/volks73/cargo-wix):
+
+```sh
+make release-windows          # produces an .msi
+```
 
 ## Configuration
 
