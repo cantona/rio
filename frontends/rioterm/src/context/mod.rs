@@ -853,6 +853,27 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.contexts.is_empty()
     }
 
+    /// Whether a shell exit on `route_id` would close the whole window,
+    /// without mutating anything. Mirrors the last-context branch of
+    /// `should_close_context_manager`: the window closes only when the
+    /// route is the sole pane of the sole context. Used to decide whether
+    /// to show the save-on-exit prompt *before* the dead context is
+    /// removed, so the prompt still has a live surface to render on.
+    #[inline]
+    pub fn would_close_window(&self, route_id: usize) -> bool {
+        if self.contexts.is_empty() {
+            return true;
+        }
+        if self.current_grid().len() > 1 {
+            return false;
+        }
+        self.contexts.len() == 1
+            && self
+                .contexts
+                .iter()
+                .any(|ctx| ctx.current().route_id == route_id)
+    }
+
     #[inline]
     pub fn request_render(&mut self) {
         self.event_proxy
@@ -2059,6 +2080,31 @@ pub mod test {
         assert_eq!(context_manager.current_index, 0);
         context_manager.switch_to_next();
         assert_eq!(context_manager.current_index, 1);
+    }
+
+    #[test]
+    fn test_would_close_window() {
+        let window_id = WindowId::from(0);
+        let mut cm =
+            ContextManager::start_with_capacity(5, VoidListener {}, window_id).unwrap();
+
+        // Sole context, sole pane: its exit closes the window.
+        let only = cm.current().route_id;
+        assert!(cm.would_close_window(only));
+
+        // A second tab: neither tab's exit closes the window, and the
+        // peek must not mutate the context set (regression guard for the
+        // empty-vec panic when the shell-death close was deferred).
+        cm.add_context(false, 0);
+        assert_eq!(cm.len(), 2);
+        let first = cm.contexts[0].current().route_id;
+        let second = cm.contexts[1].current().route_id;
+        assert!(!cm.would_close_window(first));
+        assert!(!cm.would_close_window(second));
+        assert_eq!(cm.len(), 2);
+
+        // Unknown route never closes the window.
+        assert!(!cm.would_close_window(usize::MAX));
     }
 
     #[test]

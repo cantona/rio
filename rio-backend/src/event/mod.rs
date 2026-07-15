@@ -150,6 +150,11 @@ pub enum RioEvent {
     UpdateConfig,
     CreateWindow,
     CloseWindow,
+    /// Close this window after its save-on-exit prompt was answered.
+    /// The bool is the answer: `true` = save (the app does the all-windows
+    /// save before closing), `false` = discard (already handled). Never
+    /// re-runs the prompt logic, so an answer can't loop.
+    CloseWindowConfirmed(bool),
     CreateNativeTab(Option<String>),
     CreateConfigEditor,
     SelectNativeTabByIndex(usize),
@@ -360,6 +365,7 @@ impl Debug for RioEvent {
             RioEvent::CloseTerminal(route) => write!(f, "CloseTerminal {route}"),
             RioEvent::CreateWindow => write!(f, "CreateWindow"),
             RioEvent::CloseWindow => write!(f, "CloseWindow"),
+            RioEvent::CloseWindowConfirmed(_) => write!(f, "CloseWindowConfirmed"),
             RioEvent::CreateNativeTab(_) => write!(f, "CreateNativeTab"),
             RioEvent::SelectNativeTabByIndex(tab_index) => {
                 write!(f, "SelectNativeTabByIndex({tab_index})")

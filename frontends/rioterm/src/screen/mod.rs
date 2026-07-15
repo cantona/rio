@@ -120,6 +120,7 @@ impl Screen<'_> {
         event_proxy: EventProxy,
         font_library: &rio_backend::sugarloaf::font::FontLibrary,
         open_url: Option<String>,
+        session_name: Option<String>,
     ) -> Result<Screen<'screen>, Box<dyn Error>> {
         let size = window_properties.size;
         let scale = window_properties.scale;
@@ -226,7 +227,10 @@ impl Screen<'_> {
             },
             autosave: config.session.restore
                 == rio_backend::config::session::SessionRestore::Always,
-            session_name: None,
+            // Set before the initial tab's daemon spawns so it carries the
+            // session tag (`rio-ptyd list` groups by it). Patching the
+            // config after Screen::new left the first pane untagged.
+            session_name,
             #[cfg(not(target_os = "windows"))]
             use_fork: config.use_fork,
             is_native,

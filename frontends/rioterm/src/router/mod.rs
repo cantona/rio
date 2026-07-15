@@ -144,32 +144,30 @@ impl Route<'_> {
         self.request_overlay_redraw();
     }
 
+    /// Returns true if a save prompt was shown (the quit is deferred to
+    /// the overlay answer); false if the caller should proceed to exit.
     #[inline]
-    pub fn quit(&mut self) {
-        use rio_backend::config::session::SessionRestore;
-        match self.window.screen.renderer.session_restore {
-            // Ask before saving: the "save session?" overlay gates the
-            // actual save/exit (see the key handler). Declining discards
-            // the session, killing any v2 daemons.
-            SessionRestore::Prompt => {
-                self.window.screen.renderer.confirm_quit.set_active(false);
-                self.window
-                    .screen
-                    .renderer
-                    .session_prompt
-                    .set_active(Some(SessionPromptKind::SaveOnExit));
-                self.request_overlay_redraw();
-                return;
-            }
-            // Fully automatic: the all-windows save happens in the
-            // application Quit handler (this route can't reach the
-            // others). v2 daemons detach because process exit closes
-            // their sockets (EOF = detach).
-            SessionRestore::Always | SessionRestore::Never => {}
+    pub fn quit(&mut self) -> bool {
+        use crate::session::CloseDisposition;
+        // Same close-save table as every other close path. Prompt defers
+        // the exit to the SaveOnExit overlay; Save/Nothing fall through so
+        // the caller (application Quit handler) does the all-windows save
+        // and exits.
+        let disposition = crate::session::close_disposition(
+            self.session_name.is_some(),
+            self.window.screen.renderer.session_restore,
+        );
+        if disposition == CloseDisposition::Prompt {
+            self.window.screen.renderer.confirm_quit.set_active(false);
+            self.window
+                .screen
+                .renderer
+                .session_prompt
+                .set_active(Some(SessionPromptKind::SaveOnExit));
+            self.request_overlay_redraw();
+            return true;
         }
-        // process::exit runs no destructors, so Context::drop never
-        // fires here.
-        std::process::exit(0);
+        false
     }
 
     /// Target file for this window's session saves: the bound name
@@ -229,14 +227,16 @@ impl Route<'_> {
         }
     }
 
-    /// Palette "Save Session As": bind this window to `name` and save.
-    pub fn save_session_as(&mut self, name: &str) {
+    /// Palette "Save Session As": bind this window to `name`. Returns the
+    /// sanitized name so the caller (which can reach every route) does the
+    /// all-windows save; an empty name is rejected with None.
+    pub fn bind_session_name(&mut self, name: &str) -> Option<String> {
         let name = crate::session::sanitize_name(name);
         if name.is_empty() {
-            return;
+            return None;
         }
-        self.set_session_name(Some(name));
-        self.save_session();
+        self.set_session_name(Some(name.clone()));
+        Some(name)
     }
 
     /// Palette "Restore Session": append a named session's tabs to
@@ -821,26 +821,36 @@ impl Route<'_> {
                     (Key::Character(c), SessionPromptKind::SaveOnExit)
                         if c.as_str() == "y" || c.as_str() == "Y" =>
                     {
-                        // Prompt mode, explicit consent. This overlay is
-                        // per-window and can't reach the other routes, so
-                        // it saves this window only; the multi-window
-                        // writers cover `always` and the close paths.
-                        self.save_session();
-                        std::process::exit(0);
+                        // Consent given. The app-side handler does the
+                        // all-windows save (this overlay can't reach the
+                        // other routes) and closes just this window.
+                        self.window.screen.renderer.session_prompt.set_active(None);
+                        #[cfg(unix)]
+                        crate::context::set_quit_detaching();
+                        let ctx = self.window.screen.ctx();
+                        ctx.event_proxy().send_event(
+                            rio_backend::event::RioEventType::Rio(
+                                rio_backend::event::RioEvent::CloseWindowConfirmed(true),
+                            ),
+                            ctx.window_id(),
+                        );
                     }
                     (Key::Character(c), SessionPromptKind::SaveOnExit)
                         if c.as_str() == "n" || c.as_str() == "N" =>
                     {
-                        // Declining the save discards the session,
-                        // processes included — kill this window's v2
-                        // daemons synchronously (exit() runs no
-                        // destructors, so Context::drop never fires).
+                        // Declining discards this window's session and its
+                        // v2 daemons, then closes the window.
+                        self.window.screen.renderer.session_prompt.set_active(None);
                         #[cfg(unix)]
                         crate::session::kill_persistent_panes(self.window.screen.ctx());
-                        // Drop the file too: leaving it would point next
-                        // launch at the daemons we just killed.
                         crate::session::SessionState::discard(&self.session_path());
-                        std::process::exit(0);
+                        let ctx = self.window.screen.ctx();
+                        ctx.event_proxy().send_event(
+                            rio_backend::event::RioEventType::Rio(
+                                rio_backend::event::RioEvent::CloseWindowConfirmed(false),
+                            ),
+                            ctx.window_id(),
+                        );
                     }
                     // Resume: reattach the saved daemons.
                     (Key::Character(c), SessionPromptKind::ResumeOnLaunch)
@@ -1039,6 +1049,7 @@ impl Router<'_> {
             None,
             None,
             None,
+            None,
         );
         let id = window.winit_window.id();
         let route = Route::new(Assistant::new(), RoutePath::Terminal, window);
@@ -1084,6 +1095,7 @@ impl Router<'_> {
         config: &'a rio_backend::config::Config,
         open_url: Option<String>,
         app_id: Option<&str>,
+        session_name: Option<String>,
     ) {
         let tab_id = if config.navigation.is_native() {
             let id = self.current_tab_id;
@@ -1102,6 +1114,7 @@ impl Router<'_> {
             tab_id.as_deref(),
             open_url,
             app_id,
+            session_name.clone(),
         );
         let id = window.winit_window.id();
 
@@ -1110,7 +1123,7 @@ impl Router<'_> {
             path: RoutePath::Terminal,
             assistant: Assistant::new(),
             pending_session: None,
-            session_name: None,
+            session_name,
         };
 
         if let Some(err) = &self.propagated_report {
@@ -1139,6 +1152,7 @@ impl Router<'_> {
             RIO_TITLE,
             tab_id,
             open_url,
+            None,
             None,
         );
         self.routes.insert(
@@ -1258,6 +1272,7 @@ impl<'a> RouteWindow<'a> {
         tab_id: Option<&str>,
         open_url: Option<String>,
         app_id: Option<&str>,
+        session_name: Option<String>,
     ) -> RouteWindow<'a> {
         #[allow(unused_mut)]
         let mut window_builder =
@@ -1283,8 +1298,15 @@ impl<'a> RouteWindow<'a> {
             window_id: winit_window.id(),
         };
 
-        let screen = Screen::new(properties, config, event_proxy, font_library, open_url)
-            .expect("Screen not created");
+        let screen = Screen::new(
+            properties,
+            config,
+            event_proxy,
+            font_library,
+            open_url,
+            session_name,
+        )
+        .expect("Screen not created");
 
         if config.window.columns.is_some() || config.window.rows.is_some() {
             let (physical_width, physical_height) = compute_window_size_from_grid(

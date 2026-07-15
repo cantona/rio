@@ -16,7 +16,7 @@ pub struct SessionState {
     pub windows: Vec<WindowState>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct WindowState {
     pub tabs: Vec<TabState>,
     pub active_tab: usize,
@@ -28,13 +28,13 @@ pub struct WindowState {
     pub position: Option<(i32, i32)>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct TabState {
     pub layout: LayoutNode,
     pub custom_title: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub enum LayoutNode {
     Leaf(PaneState),
     /// Weight is the child's taffy `flex_grow` — proportional share of
@@ -51,7 +51,7 @@ pub enum SplitDir {
     Vertical,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct PaneState {
     pub cwd: Option<String>,
     pub title: Option<String>,
@@ -199,6 +199,156 @@ impl SessionState {
 
     pub fn discard(path: &Path) {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+/// What a window close (exit / alt+w / WM-X / quit) should do with the
+/// session, given whether the window is bound to a name and the restore
+/// mode. The single source of truth for the close-save table; every
+/// close path routes through it so they stay consistent.
+///
+/// | session | disable | prompt  | always |
+/// |---------|---------|---------|--------|
+/// | named   | Prompt  | Prompt  | Save   |
+/// | unnamed | Nothing | Prompt  | Save   |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseDisposition {
+    /// Save silently, then close.
+    Save,
+    /// Show the save prompt; the answer saves-or-discards, then closes.
+    Prompt,
+    /// Close immediately, save nothing.
+    Nothing,
+}
+
+pub fn close_disposition(
+    named: bool,
+    mode: rio_backend::config::session::SessionRestore,
+) -> CloseDisposition {
+    use rio_backend::config::session::SessionRestore;
+    match mode {
+        // Automatic: everyone saves silently.
+        SessionRestore::Always => CloseDisposition::Save,
+        // Ask: everyone is prompted.
+        SessionRestore::Prompt => CloseDisposition::Prompt,
+        // Off: a named workspace still persists (the name is intent to
+        // keep it) — asked so it isn't silently overwritten; an unnamed
+        // session is dropped.
+        SessionRestore::Never => {
+            if named {
+                CloseDisposition::Prompt
+            } else {
+                CloseDisposition::Nothing
+            }
+        }
+    }
+}
+
+/// Assemble captured windows into a session and persist it to `path`,
+/// carrying forward any still-live daemon the old file referenced but no
+/// captured window reattached (so overwriting never orphans a daemon).
+/// The session-write policy — every caller that has gathered a window
+/// list routes through here rather than re-implementing assemble +
+/// merge + write. No-op on an empty list.
+pub fn write_windows(path: &Path, windows: Vec<WindowState>) {
+    if windows.is_empty() {
+        return;
+    }
+    #[allow(unused_mut)]
+    let mut state = SessionState {
+        version: SESSION_VERSION,
+        windows,
+    };
+    #[cfg(unix)]
+    merge_kept_daemons(&mut state, path);
+    if let Err(err) = state.save(path) {
+        tracing::warn!("session save failed: {err}");
+    }
+}
+
+/// Per-run record of the windows saved to each session file, keyed by a
+/// stable, unique per-window handle `K` (the live WindowId). A
+/// multi-window session is often persisted across several saves — one
+/// window closes, then another — and each save only sees the windows
+/// still open. Keying accumulated windows by `K` keeps the earlier-closed
+/// ones so the file is never shrunk to the still-open subset, and
+/// re-saving a window replaces its entry rather than appending a second
+/// copy (the bug a pane-set-identity merge had: a window whose tab set
+/// changed between two saves looked like a different window and was
+/// duplicated). Empty at process start, so a previous run's file never
+/// leaks stale windows into this one.
+#[derive(Default)]
+pub struct SavedWindows<K: Eq + std::hash::Hash> {
+    per_file: std::collections::HashMap<
+        std::path::PathBuf,
+        std::collections::HashMap<K, WindowState>,
+    >,
+}
+
+impl<K: Eq + std::hash::Hash + Copy> SavedWindows<K> {
+    pub fn new() -> Self {
+        SavedWindows {
+            per_file: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Record `captured` (key, window) pairs for `path`, replacing any
+    /// prior entry for the same key. Then write the union of everything
+    /// recorded for `path` this run, ordering `preferred` first so restore
+    /// lands it in the launch route.
+    pub fn accumulate_and_write<I>(
+        &mut self,
+        path: &Path,
+        captured: I,
+        preferred: Option<K>,
+    ) where
+        I: IntoIterator<Item = (K, WindowState)>,
+    {
+        let windows = self.accumulate(path, captured, preferred);
+        write_windows(path, windows);
+    }
+
+    /// Record `captured` for `path` (replacing same-key entries) and
+    /// return the union recorded so far, `preferred` first. The pure part
+    /// of `accumulate_and_write`, split out so the ordering/dedup is
+    /// testable without touching the filesystem.
+    fn accumulate<I>(
+        &mut self,
+        path: &Path,
+        captured: I,
+        preferred: Option<K>,
+    ) -> Vec<WindowState>
+    where
+        I: IntoIterator<Item = (K, WindowState)>,
+    {
+        let acc = self.per_file.entry(path.to_path_buf()).or_default();
+        for (key, window) in captured {
+            acc.insert(key, window);
+        }
+        let mut windows: Vec<WindowState> = Vec::with_capacity(acc.len());
+        if let Some(pref) = preferred {
+            if let Some(w) = acc.get(&pref) {
+                windows.push(w.clone());
+            }
+        }
+        for (key, w) in acc.iter() {
+            if Some(*key) != preferred {
+                windows.push(w.clone());
+            }
+        }
+        windows
+    }
+
+    /// Replace the recorded set for `path` with exactly `captured` and
+    /// write it. Used by explicit "save now" actions (Ctrl+Shift+S,
+    /// Save As), where the saved file should mirror the windows currently
+    /// open, not resurrect ones closed earlier this run.
+    pub fn replace_and_write<I>(&mut self, path: &Path, captured: I, preferred: Option<K>)
+    where
+        I: IntoIterator<Item = (K, WindowState)>,
+    {
+        self.per_file.remove(path);
+        self.accumulate_and_write(path, captured, preferred);
     }
 }
 
@@ -656,5 +806,113 @@ fn restore_active_pane<T: EventListener + Clone + Send + 'static>(
     let mut counter = 0;
     if let Some(idx) = find_active_index(layout, &mut counter) {
         ctx_manager.select_pane_by_order(idx);
+    }
+}
+
+#[cfg(test)]
+mod saved_windows_tests {
+    use super::{LayoutNode, PaneState, SavedWindows, TabState, WindowState};
+    use std::path::Path;
+
+    fn window(pane_ids: &[&str]) -> WindowState {
+        let tabs = pane_ids
+            .iter()
+            .map(|id| TabState {
+                custom_title: None,
+                layout: LayoutNode::Leaf(PaneState {
+                    cwd: None,
+                    title: None,
+                    is_active: true,
+                    scrollback: String::new(),
+                    pane_id: Some((*id).to_string()),
+                    socket: None,
+                    host: None,
+                }),
+            })
+            .collect();
+        WindowState {
+            tabs,
+            active_tab: 0,
+            size: (0, 0),
+            position: None,
+        }
+    }
+
+    fn pane_ids(w: &WindowState) -> Vec<String> {
+        w.tabs
+            .iter()
+            .filter_map(|t| match &t.layout {
+                LayoutNode::Leaf(p) => p.pane_id.clone(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // Two windows closed one at a time restore as two, not more: the
+    // regression where re-saving a window whose tab set had changed
+    // between saves left duplicate windows in the file (a 1-tab snapshot
+    // AND a 2-tab snapshot of the same window). Keying by WindowId, the
+    // second save of window 1 replaces the first instead of appending.
+    #[test]
+    fn per_window_close_does_not_duplicate() {
+        let mut sw: SavedWindows<u32> = SavedWindows::new();
+        let path = Path::new("unused-in-accumulate");
+
+        // Close window 1 while both are open: window 1 has one tab so far,
+        // window 2 has two.
+        let first = sw.accumulate(
+            path,
+            vec![(1u32, window(&["a"])), (2u32, window(&["b", "c"]))],
+            Some(1),
+        );
+        assert_eq!(first.len(), 2);
+
+        // Close window 2; window 1 meanwhile grew a second tab. Only
+        // window 2 is captured now, but the accumulator still holds
+        // window 1 — and the fresh capture of window 1 (if any) must
+        // replace, never duplicate.
+        let second = sw.accumulate(
+            path,
+            vec![(1u32, window(&["a", "d"])), (2u32, window(&["b", "c"]))],
+            Some(2),
+        );
+        assert_eq!(second.len(), 2, "same two windows, no duplicates");
+
+        // Window 2 is preferred (first), window 1 carries its latest tabs.
+        assert_eq!(pane_ids(&second[0]), vec!["b", "c"]);
+        let w1 = second.iter().find(|w| pane_ids(w) == vec!["a", "d"]);
+        assert!(w1.is_some(), "window 1 present with its grown tab set");
+    }
+
+    #[test]
+    fn replace_drops_earlier_closed_windows() {
+        let mut sw: SavedWindows<u32> = SavedWindows::new();
+        let path = Path::new("unused");
+        sw.accumulate(path, vec![(1u32, window(&["a"]))], Some(1));
+        // Explicit snapshot with only window 2 open forgets window 1.
+        sw.per_file.remove(path);
+        let out = sw.accumulate(path, vec![(2u32, window(&["b"]))], Some(2));
+        assert_eq!(out.len(), 1);
+        assert_eq!(pane_ids(&out[0]), vec!["b"]);
+    }
+}
+
+#[cfg(test)]
+mod close_disposition_tests {
+    use super::{close_disposition, CloseDisposition};
+    use rio_backend::config::session::SessionRestore;
+
+    #[test]
+    fn table() {
+        // (named, mode) -> disposition. Locks the confirmed close-save
+        // table: named always persists (prompt in disable/prompt, silent
+        // in always); unnamed follows the mode (nothing/prompt/silent).
+        let d = close_disposition;
+        assert_eq!(d(true, SessionRestore::Never), CloseDisposition::Prompt);
+        assert_eq!(d(true, SessionRestore::Prompt), CloseDisposition::Prompt);
+        assert_eq!(d(true, SessionRestore::Always), CloseDisposition::Save);
+        assert_eq!(d(false, SessionRestore::Never), CloseDisposition::Nothing);
+        assert_eq!(d(false, SessionRestore::Prompt), CloseDisposition::Prompt);
+        assert_eq!(d(false, SessionRestore::Always), CloseDisposition::Save);
     }
 }
