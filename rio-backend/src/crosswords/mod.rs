@@ -2433,6 +2433,14 @@ impl<U: EventListener> Handler for Crosswords<U> {
             prefix, index
         );
 
+        // Replayed OSC 10/11/12 color queries must not be answered: the
+        // reply would be written into the live shell and echo as literal
+        // text at the prompt (`10;rgb:.../...`). Gate on the same flag
+        // reply() uses for other query responses during ring replay.
+        if self.suppress_replies {
+            return;
+        }
+
         let terminator = terminator.to_owned();
         self.event_proxy.send_event(
             RioEvent::ColorRequest(
