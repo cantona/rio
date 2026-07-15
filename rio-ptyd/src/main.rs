@@ -194,53 +194,7 @@ fn run(args: Vec<String>) -> i32 {
                     return 1;
                 }
             };
-            // Prefer the protocol (lets the daemon clean up and exit).
-            let sock = sockdir::socket_path(&base, id);
-            let killed = std::os::unix::net::UnixStream::connect(&sock)
-                .and_then(|mut s| {
-                    use std::io::Read;
-                    rio_ptyd::protocol::write_frame(
-                        &mut s,
-                        rio_ptyd::protocol::FrameType::ClientHello,
-                        &rio_ptyd::protocol::encode_client_hello(),
-                    )?;
-                    rio_ptyd::protocol::write_frame(
-                        &mut s,
-                        rio_ptyd::protocol::FrameType::Kill,
-                        &[],
-                    )?;
-                    // A daemon that actually processed the Kill exits and
-                    // closes the socket. Read until EOF so we don't treat
-                    // a write into a doomed connection as success and skip
-                    // the fallback; drain to a small scratch buffer.
-                    let mut scratch = [0u8; 256];
-                    loop {
-                        match s.read(&mut scratch) {
-                            Ok(0) => break,
-                            Ok(_) => {}
-                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    Ok(())
-                })
-                .is_ok();
-            if !killed {
-                if let Ok(meta) = sockdir::read_meta(&base, id) {
-                    // The pids in stale metadata may have been recycled
-                    // by unrelated same-uid processes; only signal one
-                    // that still matches the daemon we recorded.
-                    unsafe {
-                        if sockdir::pid_matches_start(meta.shell_pid, meta.created_at) {
-                            libc::kill(meta.shell_pid, libc::SIGHUP);
-                        }
-                        if sockdir::pid_matches_start(meta.daemon_pid, meta.created_at) {
-                            libc::kill(meta.daemon_pid, libc::SIGTERM);
-                        }
-                    }
-                }
-                sockdir::remove_pane_files(&base, id);
-            }
+            kill_pane(&base, id);
             0
         }
         "gc" => {
@@ -258,9 +212,12 @@ fn run(args: Vec<String>) -> i32 {
                 let old_enough = now.saturating_sub(m.created_at) > 60;
                 let sock = sockdir::socket_path(&base, &m.pane_id);
                 let unreachable = std::os::unix::net::UnixStream::connect(&sock).is_err();
+
+                // Case 1: the daemon process itself is gone, leaving only
+                // stale socket/meta files. Unlink them.
                 if daemon_dead && unreachable && old_enough {
                     if dry {
-                        println!("would remove {}", m.pane_id);
+                        println!("would remove {} (dead daemon)", m.pane_id);
                     } else if std::os::unix::net::UnixStream::connect(&sock).is_err() {
                         // Re-check liveness right before unlinking: on
                         // pane-id reuse a fresh daemon may have bound this
@@ -268,10 +225,82 @@ fn run(args: Vec<String>) -> i32 {
                         // files would orphan a healthy pane.
                         sockdir::remove_pane_files(&base, &m.pane_id);
                     }
+                    continue;
+                }
+
+                // Case 2: the shell exited but the daemon is still alive,
+                // lingering with its ring for a reattach that may never
+                // come. Reap it so it does not leak a process + PTY
+                // indefinitely. Only when reachable (so we can ask it to
+                // exit cleanly) and old enough to not race a just-exited
+                // pane the user is about to reattach.
+                if m.exited_status.is_some() && !unreachable && old_enough {
+                    if dry {
+                        println!("would reap {} (exited, lingering)", m.pane_id);
+                    } else {
+                        kill_pane(&base, &m.pane_id);
+                    }
                 }
             }
             0
         }
         _ => usage(),
+    }
+}
+
+/// Terminate one pane's daemon and remove its files. Prefers the
+/// protocol (ClientHello + Kill), which lets the daemon flush its client
+/// and exit cleanly; falls back to signalling the recorded pids (only
+/// when they still match the daemon we started, so a recycled pid is not
+/// hit) and unlinking the socket/meta. Shared by the `kill` command and
+/// `gc`'s reaping of lingering exited daemons.
+#[cfg(unix)]
+fn kill_pane(base: &std::path::Path, id: &str) {
+    use rio_ptyd::sockdir;
+    let sock = sockdir::socket_path(base, id);
+    let killed = std::os::unix::net::UnixStream::connect(&sock)
+        .and_then(|mut s| {
+            use std::io::Read;
+            rio_ptyd::protocol::write_frame(
+                &mut s,
+                rio_ptyd::protocol::FrameType::ClientHello,
+                &rio_ptyd::protocol::encode_client_hello(),
+            )?;
+            rio_ptyd::protocol::write_frame(
+                &mut s,
+                rio_ptyd::protocol::FrameType::Kill,
+                &[],
+            )?;
+            // A daemon that actually processed the Kill exits and closes
+            // the socket. Read until EOF so we don't treat a write into a
+            // doomed connection as success and skip the fallback; drain to
+            // a small scratch buffer.
+            let mut scratch = [0u8; 256];
+            loop {
+                match s.read(&mut scratch) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        })
+        .is_ok();
+    if !killed {
+        if let Ok(meta) = sockdir::read_meta(base, id) {
+            // The pids in stale metadata may have been recycled by
+            // unrelated same-uid processes; only signal one that still
+            // matches the daemon we recorded.
+            unsafe {
+                if sockdir::pid_matches_start(meta.shell_pid, meta.created_at) {
+                    libc::kill(meta.shell_pid, libc::SIGHUP);
+                }
+                if sockdir::pid_matches_start(meta.daemon_pid, meta.created_at) {
+                    libc::kill(meta.daemon_pid, libc::SIGTERM);
+                }
+            }
+        }
+        sockdir::remove_pane_files(base, id);
     }
 }
