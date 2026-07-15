@@ -18,7 +18,7 @@ fn run(args: Vec<String>) -> i32 {
 
     let usage = || {
         eprintln!(
-            "usage:\n  rio-ptyd spawn [--pane-id HEX32] [--cwd DIR] [--session NAME] [--ring-size BYTES] [--env K=V]... -- PROGRAM [ARGS...]\n  rio-ptyd attach [--stdio] [--no-replay] <pane-id | socket.sock>\n  rio-ptyd list [--json]\n  rio-ptyd kill <pane-id>\n  rio-ptyd gc [--dry-run]"
+            "usage:\n  rio-ptyd spawn [--pane-id HEX32] [--cwd DIR] [--session NAME] [--ring-size BYTES] [--env K=V]... -- PROGRAM [ARGS...]\n  rio-ptyd attach [--stdio] [--no-replay] <pane-id | socket.sock>\n  rio-ptyd list [--json] [--full] [--sort session|created|id|pid]\n  rio-ptyd kill <pane-id>\n  rio-ptyd kill-session [--dry-run] <name | --unnamed>\n  rio-ptyd gc [--dry-run]"
         );
         2
     };
@@ -102,7 +102,26 @@ fn run(args: Vec<String>) -> i32 {
             }
         }
         "list" => {
-            let json = args.get(1).map(|a| a == "--json").unwrap_or(false);
+            let mut json = false;
+            let mut full_id = false;
+            let mut sort_key = "session"; // session | created | id | pid
+            let mut it = args[1..].iter().peekable();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--json" => json = true,
+                    "--full" => full_id = true,
+                    "--sort" => match it.next().map(|s| s.as_str()) {
+                        Some(k @ ("session" | "created" | "id" | "pid")) => sort_key = k,
+                        _ => {
+                            eprintln!(
+                                "rio-ptyd list: --sort expects session|created|id|pid"
+                            );
+                            return 2;
+                        }
+                    },
+                    _ => return usage(),
+                }
+            }
             let base = match sockdir::base_dir() {
                 Ok(b) => b,
                 Err(e) => {
@@ -147,7 +166,54 @@ fn run(args: Vec<String>) -> i32 {
                         .map(|c| if c.is_control() { '?' } else { c })
                         .collect()
                 };
-                for m in &panes {
+                // Show the full 32-hex id when asked (--full) or when two
+                // panes share the short prefix (a collision would make the
+                // short form ambiguous for kill/attach), so the displayed
+                // id is always safe to act on. Otherwise show the short
+                // prefix.
+                let short_collision = {
+                    let mut seen = std::collections::HashSet::new();
+                    let n = sockdir::SHORT_PANE_ID_LEN;
+                    panes
+                        .iter()
+                        .any(|m| !seen.insert(&m.pane_id[..n.min(m.pane_id.len())]))
+                };
+                let id_w = if full_id || short_collision { 32 } else { 8 };
+
+                if !panes.is_empty() {
+                    // Header and rows share these column widths so they
+                    // line up: pane id (id_w), state (12), pid (right 8),
+                    // session (14, the bracketed tag), activity (40), then
+                    // created (ISO "YYYY-MM-DD HH:MM") last.
+                    println!(
+                        "{:<id_w$}  {:<12}  {:>8}  {:<14}  {:<40}  CREATED",
+                        "PANE ID", "STATE", "PID", "SESSION", "ACTIVITY"
+                    );
+                }
+                // JSON output stays in creation order for stable machine
+                // consumption; the table honors --sort (default: session,
+                // grouping tagged sessions first and unnamed last).
+                let mut ordered = panes.clone();
+                ordered.sort_by(|a, b| {
+                    use std::cmp::Ordering;
+                    let by_created = a.created_at.cmp(&b.created_at);
+                    match sort_key {
+                        "created" => by_created,
+                        "id" => a.pane_id.cmp(&b.pane_id),
+                        "pid" => a.shell_pid.cmp(&b.shell_pid).then(by_created),
+                        _ => {
+                            let ka = a.session.as_deref().filter(|s| !s.is_empty());
+                            let kb = b.session.as_deref().filter(|s| !s.is_empty());
+                            match (ka, kb) {
+                                (Some(x), Some(y)) => x.cmp(y).then(by_created),
+                                (Some(_), None) => Ordering::Less,
+                                (None, Some(_)) => Ordering::Greater,
+                                (None, None) => by_created,
+                            }
+                        }
+                    }
+                });
+                for m in &ordered {
                     let alive = sockdir::pid_alive(m.daemon_pid);
                     let state = if let Some(code) = m.exited_status {
                         format!("exited({code})")
@@ -167,13 +233,13 @@ fn run(args: Vec<String>) -> i32 {
                         .or_else(|| m.cwd.clone())
                         .map(|s| sanitize(&s))
                         .unwrap_or_else(|| "-".into());
+                    let created = sockdir::format_epoch_local(m.created_at);
+                    let id = &m.pane_id[..id_w.min(m.pane_id.len())];
+                    let session =
+                        format!("[{}]", sanitize(m.session.as_deref().unwrap_or("-")));
                     println!(
-                        "{}  {:8}  pid {:>7}  [{}]  {}",
-                        m.pane_id,
-                        state,
+                        "{id:<id_w$}  {state:<12}  {:>8}  {session:<14}  {activity:<40}  {created}",
                         m.shell_pid,
-                        sanitize(m.session.as_deref().unwrap_or("-")),
-                        activity,
                     );
                 }
             }
@@ -183,10 +249,6 @@ fn run(args: Vec<String>) -> i32 {
             let Some(id) = args.get(1) else {
                 return usage();
             };
-            if !sockdir::is_valid_pane_id(id) {
-                eprintln!("rio-ptyd kill: invalid pane id");
-                return 2;
-            }
             let base = match sockdir::base_dir() {
                 Ok(b) => b,
                 Err(e) => {
@@ -194,7 +256,58 @@ fn run(args: Vec<String>) -> i32 {
                     return 1;
                 }
             };
-            kill_pane(&base, id);
+            // Accept the full id or the short prefix `list` shows.
+            let Some(full) = sockdir::resolve_pane_id(&base, id) else {
+                eprintln!("rio-ptyd kill: no unique pane matches '{id}'");
+                return 2;
+            };
+            kill_pane(&base, &full);
+            0
+        }
+        "kill-session" => {
+            // rio-ptyd kill-session [--dry-run] <name | --unnamed>
+            let mut dry = false;
+            let mut unnamed = false;
+            let mut name: Option<String> = None;
+            for a in &args[1..] {
+                match a.as_str() {
+                    "--dry-run" => dry = true,
+                    "--unnamed" => unnamed = true,
+                    other => name = Some(other.to_string()),
+                }
+            }
+            if unnamed == name.is_some() {
+                // Neither, or both, a name and --unnamed were given.
+                eprintln!(
+                    "rio-ptyd kill-session: give exactly one of <name> or --unnamed"
+                );
+                return 2;
+            }
+            let base = match sockdir::base_dir() {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("rio-ptyd kill-session: {e}");
+                    return 1;
+                }
+            };
+            // An empty or absent session tag counts as unnamed.
+            let want = |m: &sockdir::PaneMeta| -> bool {
+                let tag = m.session.as_deref().filter(|s| !s.is_empty());
+                match &name {
+                    Some(n) => tag == Some(n.as_str()),
+                    None => tag.is_none(),
+                }
+            };
+            for m in sockdir::list_panes(&base).unwrap_or_default() {
+                if !want(&m) {
+                    continue;
+                }
+                if dry {
+                    println!("would kill {}", m.pane_id);
+                } else {
+                    kill_pane(&base, &m.pane_id);
+                }
+            }
             0
         }
         "gc" => {
@@ -261,6 +374,14 @@ fn kill_pane(base: &std::path::Path, id: &str) {
     let killed = std::os::unix::net::UnixStream::connect(&sock)
         .and_then(|mut s| {
             use std::io::Read;
+            use std::time::Duration;
+            // Bound every socket op: a wedged or protocol-incompatible
+            // daemon must never hang the caller. Without this, killing a
+            // whole session (many panes in sequence) froze forever on the
+            // first daemon that accepted the connection but never closed
+            // it. On timeout we fall through to the signal+unlink path.
+            s.set_read_timeout(Some(Duration::from_secs(2)))?;
+            s.set_write_timeout(Some(Duration::from_secs(2)))?;
             rio_ptyd::protocol::write_frame(
                 &mut s,
                 rio_ptyd::protocol::FrameType::ClientHello,
@@ -274,7 +395,8 @@ fn kill_pane(base: &std::path::Path, id: &str) {
             // A daemon that actually processed the Kill exits and closes
             // the socket. Read until EOF so we don't treat a write into a
             // doomed connection as success and skip the fallback; drain to
-            // a small scratch buffer.
+            // a small scratch buffer. A read timeout surfaces as an error
+            // (WouldBlock/TimedOut) and drops us into the fallback.
             let mut scratch = [0u8; 256];
             loop {
                 match s.read(&mut scratch) {

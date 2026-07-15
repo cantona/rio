@@ -10,15 +10,17 @@ use crate::protocol::{self, Decoder, FrameType};
 use crate::sockdir;
 
 pub fn resolve_socket(target: &str) -> io::Result<PathBuf> {
-    if sockdir::is_valid_pane_id(target) {
-        Ok(sockdir::socket_path(&sockdir::base_dir()?, target))
-    } else if target.ends_with(".sock") && Path::new(target).exists() {
-        Ok(PathBuf::from(target))
-    } else {
-        Err(io::Error::other(
-            "expected a 32-hex pane id or an existing .sock path",
-        ))
+    if target.ends_with(".sock") && Path::new(target).exists() {
+        return Ok(PathBuf::from(target));
     }
+    // A full 32-hex id or the short prefix `list` shows.
+    let base = sockdir::base_dir()?;
+    if let Some(full) = sockdir::resolve_pane_id(&base, target) {
+        return Ok(sockdir::socket_path(&base, &full));
+    }
+    Err(io::Error::other(
+        "expected a pane id (or unique prefix) or an existing .sock path",
+    ))
 }
 
 /// `attach --stdio`: splice bytes between our stdin/stdout and the

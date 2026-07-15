@@ -88,6 +88,41 @@ pub fn is_valid_pane_id(id: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
+/// A shorter hex prefix that `list` shows and that resolve_pane_id
+/// expands. 8 hex = 32 bits, unique in practice for a per-user set of
+/// daemons.
+pub const SHORT_PANE_ID_LEN: usize = 8;
+
+fn is_hex_prefix(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 32
+        && s.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// Expand a full pane id or a unique hex prefix to the full pane id.
+/// A full 32-hex id resolves to itself without touching disk. A shorter
+/// prefix must match exactly one existing pane, else it is rejected
+/// (None): ambiguous prefixes and typos never act on the wrong daemon.
+pub fn resolve_pane_id(base: &Path, id_or_prefix: &str) -> Option<String> {
+    if is_valid_pane_id(id_or_prefix) {
+        return Some(id_or_prefix.to_string());
+    }
+    if !is_hex_prefix(id_or_prefix) {
+        return None;
+    }
+    let mut hit = None;
+    for m in list_panes(base).ok()? {
+        if m.pane_id.starts_with(id_or_prefix) {
+            if hit.is_some() {
+                return None; // ambiguous
+            }
+            hit = Some(m.pane_id);
+        }
+    }
+    hit
+}
+
 pub fn new_pane_id() -> io::Result<String> {
     let mut bytes = [0u8; 16];
     fs::File::open("/dev/urandom")
@@ -232,6 +267,29 @@ pub fn now_epoch() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Format a unix epoch as local ISO 8601 "YYYY-MM-DD HH:MM" for the list
+/// display: unambiguous across regions and text-sortable. Uses libc
+/// localtime_r/strftime to avoid a time-formatting dependency (the crate
+/// keeps to libc + serde). Empty string on failure.
+pub fn format_epoch_local(epoch: u64) -> String {
+    unsafe {
+        let t = epoch as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return String::new();
+        }
+        let mut buf = [0u8; 32];
+        let fmt = c"%Y-%m-%d %H:%M";
+        let n = libc::strftime(
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            fmt.as_ptr(),
+            &tm,
+        );
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    }
 }
 
 #[cfg(test)]
