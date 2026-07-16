@@ -60,6 +60,17 @@ impl Application<'_> {
         if let Some(error) = config_error {
             router.propagate_error_to_next_route(error.into());
         }
+        // A broken triggers.toml must be as visible as a broken
+        // config.toml; a config error and a triggers error can't both
+        // be pending here (a failed config load never loads triggers).
+        if let Some(message) = &config.triggers_load_error {
+            router.propagate_error_to_next_route(rio_backend::error::RioError {
+                report: rio_backend::error::RioErrorType::InvalidTriggersFormat(
+                    message.clone(),
+                ),
+                level: rio_backend::error::RioErrorLevel::Warning,
+            });
+        }
 
         let proxy = event_loop.create_proxy();
         let event_proxy = EventProxy::new(proxy.clone());
@@ -721,10 +732,24 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 }
             }
             RioEventType::Rio(RioEvent::UpdateConfig) => {
-                let (config, config_error) = match rio_backend::config::Config::try_load()
-                {
-                    Ok(config) => (config, None),
-                    Err(error) => (rio_backend::config::Config::default(), Some(error)),
+                // A config.toml typo mid-edit must not reset the live
+                // config (fonts, colors, binds, session) to defaults:
+                // keep running on the current one, surface the error,
+                // and pick up the next save. Same rule as triggers.toml
+                // below. Startup is different — there is nothing live to
+                // keep, so main's load still falls back to defaults.
+                let config = match rio_backend::config::Config::try_load() {
+                    Ok(config) => config,
+                    Err(error) => {
+                        tracing::warn!(
+                            "config.toml failed to parse; keeping the previous config"
+                        );
+                        for (_id, route) in self.router.routes.iter_mut() {
+                            route.report_error(&error.to_owned().into());
+                            route.request_redraw();
+                        }
+                        return;
+                    }
                 };
 
                 let has_font_updates = self.config.fonts != config.fonts;
@@ -742,8 +767,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 // A triggers.toml typo mid-edit must not silently wipe the
                 // live rules (and their highlights): the failed load left
                 // the fresh config's triggers empty, so keep the running
-                // ones until the file parses again.
-                let previous_triggers = if config.triggers_load_failed {
+                // ones until the file parses again, and surface the parse
+                // error the same way a config.toml one is surfaced.
+                let previous_triggers = if config.triggers_load_error.is_some() {
                     Some(std::mem::take(&mut self.config.triggers))
                 } else {
                     None
@@ -789,13 +815,28 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     );
                     route.window.configure_window(&self.config);
 
-                    if let Some(error) = &config_error {
-                        route.report_error(&error.to_owned().into());
-                    } else {
-                        route.clear_errors();
-                    }
+                    // The reload parsed: drop any error screen left from a
+                    // previously broken save.
+                    route.clear_errors();
 
                     route.request_redraw();
+                }
+
+                // After clear_errors and the renderer rebuilds above, or
+                // the overlay would be wiped by the very reload that
+                // should show it: a triggers.toml typo must be as visible
+                // as a config.toml one.
+                if let Some(message) = &self.config.triggers_load_error {
+                    let error = rio_backend::error::RioError {
+                        report: rio_backend::error::RioErrorType::InvalidTriggersFormat(
+                            message.clone(),
+                        ),
+                        level: rio_backend::error::RioErrorLevel::Warning,
+                    };
+                    for (_id, route) in self.router.routes.iter_mut() {
+                        route.report_error(&error);
+                        route.request_redraw();
+                    }
                 }
             }
             RioEventType::Rio(RioEvent::SaveSession) => {
