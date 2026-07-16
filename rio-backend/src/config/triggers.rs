@@ -3,6 +3,17 @@ use serde::{Deserialize, Serialize};
 
 /// Triggers configuration, loaded from a dedicated `triggers.toml` so the
 /// file's top level is the rule list (`[[rules]]`).
+///
+/// Scanning scope: rules run against the FOCUSED pane's output as it
+/// renders. A pane in a background tab is not scanned until it is
+/// focused again, so a notify rule fires when you switch to that tab,
+/// not at the moment the text appeared.
+///
+/// Substituted captures (`\1`...) in `run`/`coprocess` args come from
+/// untrusted terminal output; no shell is involved and words are never
+/// re-split, but a capture can begin with `-`. Put `--` before capture
+/// arguments when the program supports it, e.g.
+/// `run = { program = "notify-send", args = ["--", "\1"] }`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Triggers {
     #[serde(default)]

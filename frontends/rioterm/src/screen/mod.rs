@@ -3881,9 +3881,13 @@ impl Screen<'_> {
         let route_id = self.context_manager.current().route_id;
 
         let (actions, highlights) = {
-            let terminal = self.context_manager.current().terminal.lock();
+            let ctx = self.context_manager.current();
+            // Previous highlights let a Partial frame rescan only damaged
+            // rows and carry the rest over.
+            let prev = ctx.renderable_content.trigger_highlights.as_deref();
+            let terminal = ctx.terminal.lock();
             let actions = self.triggers.scan(route_id, &terminal);
-            let highlights = self.triggers.highlights(&terminal);
+            let highlights = self.triggers.highlights(&terminal, prev);
             (actions, highlights)
         };
 

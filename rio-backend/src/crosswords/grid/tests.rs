@@ -16,6 +16,29 @@ impl GridSquare for usize {
     }
 }
 
+// The scroll epoch keeps advancing after the history limit saturates
+// (history_size stops, the epoch must not — per-line dedup identity
+// depends on it), and a full-width scroll_down walks it back.
+#[test]
+fn scroll_epoch_survives_history_saturation() {
+    let mut grid = Grid::<usize>::new(4, 1, 2);
+    assert_eq!(grid.scroll_epoch(), 0);
+    for _ in 0..5 {
+        grid.scroll_up(&(Line(0)..Line(4)), 1);
+    }
+    // History clamped at its limit, epoch not.
+    assert_eq!(grid.history_size(), 2);
+    assert_eq!(grid.scroll_epoch(), 5);
+    // Alt-style grid (no history at all) still advances the epoch.
+    let mut alt = Grid::<usize>::new(4, 1, 0);
+    alt.scroll_up(&(Line(0)..Line(4)), 3);
+    assert_eq!(alt.history_size(), 0);
+    assert_eq!(alt.scroll_epoch(), 3);
+    // A top-anchored scroll_down shifts rows the other way.
+    grid.scroll_down(&(Line(0)..Line(4)), 1);
+    assert_eq!(grid.scroll_epoch(), 4);
+}
+
 // Scroll up moves lines upward.
 #[test]
 fn scroll_up() {

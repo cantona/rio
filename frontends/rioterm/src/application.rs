@@ -739,7 +739,22 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     None
                 };
 
+                // A triggers.toml typo mid-edit must not silently wipe the
+                // live rules (and their highlights): the failed load left
+                // the fresh config's triggers empty, so keep the running
+                // ones until the file parses again.
+                let previous_triggers = if config.triggers_load_failed {
+                    Some(std::mem::take(&mut self.config.triggers))
+                } else {
+                    None
+                };
                 self.config = config;
+                if let Some(triggers) = previous_triggers {
+                    tracing::warn!(
+                        "triggers.toml failed to parse; keeping the previous rules"
+                    );
+                    self.config.triggers = triggers;
+                }
 
                 let mut has_checked_adaptive_colors = false;
                 for (_id, route) in self.router.routes.iter_mut() {
@@ -1122,10 +1137,16 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         // Capture stdout off-thread so a slow command never
                         // blocks the UI, then write it into the PTY. When
                         // `stdin` is set, the visible screen is piped to the
-                        // command (small payload, no deadlock risk).
+                        // command (small payload, no deadlock risk). The
+                        // child is bounded by a deadline: a hung coprocess
+                        // would otherwise leak this thread + pipes forever,
+                        // and its eventual stdout would be typed into
+                        // whatever runs in the pane much later.
+                        const COPROCESS_DEADLINE: std::time::Duration =
+                            std::time::Duration::from_secs(10);
                         let proxy = self.event_proxy.clone();
                         std::thread::spawn(move || {
-                            use std::io::Write;
+                            use std::io::{Read, Write};
                             use std::process::Stdio;
                             let mut command = std::process::Command::new(&program);
                             command
@@ -1156,20 +1177,54 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                                     });
                                 }
                             }
-                            match child.wait_with_output() {
-                                Ok(output) if !output.stdout.is_empty() => {
-                                    let text = String::from_utf8_lossy(&output.stdout)
-                                        .into_owned();
-                                    proxy.send_event(
-                                        RioEvent::PtyWrite(route_id, text).into(),
-                                        window_id,
-                                    );
+                            // Drain stdout on its own thread too, so the
+                            // deadline loop below never blocks on a pipe;
+                            // the reader finishes when the pipe closes
+                            // (child exit or kill).
+                            let stdout_rx = child.stdout.take().map(|mut pipe| {
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                std::thread::spawn(move || {
+                                    let mut buf = Vec::new();
+                                    let _ = pipe.read_to_end(&mut buf);
+                                    let _ = tx.send(buf);
+                                });
+                                rx
+                            });
+                            let deadline = std::time::Instant::now() + COPROCESS_DEADLINE;
+                            let timed_out = loop {
+                                match child.try_wait() {
+                                    Ok(Some(_)) => break false,
+                                    Ok(None) => {}
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            "trigger coprocess {program:?} failed: {err}"
+                                        );
+                                        break true;
+                                    }
                                 }
-                                Ok(_) => {}
-                                Err(err) => {
+                                if std::time::Instant::now() >= deadline {
                                     tracing::warn!(
-                                        "trigger coprocess {program:?} failed: {err}"
+                                        "trigger coprocess {program:?} exceeded {COPROCESS_DEADLINE:?}; killing"
                                     );
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                    break true;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            };
+                            if timed_out {
+                                return;
+                            }
+                            if let Some(rx) = stdout_rx {
+                                if let Ok(buf) = rx.recv() {
+                                    if !buf.is_empty() {
+                                        let text =
+                                            String::from_utf8_lossy(&buf).into_owned();
+                                        proxy.send_event(
+                                            RioEvent::PtyWrite(route_id, text).into(),
+                                            window_id,
+                                        );
+                                    }
                                 }
                             }
                         });

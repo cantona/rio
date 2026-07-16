@@ -59,6 +59,14 @@ pub struct Grid<T> {
     /// Maximum number of lines in history.
     max_scroll_limit: usize,
 
+    /// Net lines the whole screen has scrolled over the grid's lifetime
+    /// (up minus down), NEVER clamped — unlike `history_size`, which stops
+    /// growing at `max_scroll_limit` (and is always 0 for the alt grid).
+    /// `scroll_epoch + screen_row` therefore stays a stable identity for a
+    /// physical line across scrolling even after the scrollback saturates,
+    /// which per-line dedup (terminal triggers) relies on.
+    scroll_epoch: i64,
+
     /// Per-grid intern table for cell styles. Cells store only a `StyleId`;
     /// the actual fg/bg/underline_color/sgr-flags live here and are looked up
     /// at render/SGR-mutation time. The renderer snapshots a clone under the
@@ -161,6 +169,7 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
         Grid {
             raw: Storage::with_capacity(lines, columns),
             max_scroll_limit,
+            scroll_epoch: 0,
             display_offset: 0,
             saved_cursor: Cursor::default(),
             cursor: Cursor::default(),
@@ -169,6 +178,13 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
             style_set: crate::crosswords::style::StyleSet::new(),
             extras_table: ExtrasTable::new(),
         }
+    }
+
+    /// Net lines the screen has scrolled (up minus down), never clamped by
+    /// the history limit. See the field doc.
+    #[inline]
+    pub fn scroll_epoch(&self) -> i64 {
+        self.scroll_epoch
     }
 
     /// Update the size of the scrollback history.
@@ -218,6 +234,13 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
             }
 
             return;
+        }
+
+        // Screen rows shift down when the region starts at the top: move
+        // the epoch back so `scroll_epoch + row` still names the same
+        // physical line (mirror of the scroll_up advance).
+        if region.start == 0 {
+            self.scroll_epoch -= positions as i64;
         }
 
         // Which implementation we can use depends on the existence of a scrollback history.
@@ -303,6 +326,11 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
 
         // Only rotate the entire history if the active region starts at the top.
         if region.start == 0 {
+            // Every screen row's content moves up: advance the epoch so
+            // `scroll_epoch + row` keeps identifying the same physical
+            // line even when the history below is already saturated.
+            self.scroll_epoch += positions as i64;
+
             // Create scrollback for the new lines.
             self.increase_scroll_limit(positions);
 

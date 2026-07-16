@@ -1,15 +1,27 @@
-use crate::hints::extract_line_text;
 use rio_backend::config::triggers::{TriggerAction, Triggers as TriggersConfig};
 use rio_backend::crosswords::grid::Dimensions;
 use rio_backend::crosswords::pos::{Column, Line, Pos};
 use rio_backend::crosswords::search::Match;
-use rio_backend::crosswords::Crosswords;
+use rio_backend::crosswords::square::Wide;
+use rio_backend::crosswords::{Crosswords, Mode};
 use rio_backend::event::{EventListener, TerminalDamage};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::hash::{Hash, Hasher};
+use std::time::{Duration, Instant};
 
 /// Longest line (chars) matched against trigger regexes.
 const LINE_SCAN_CAP: usize = 4096;
+
+/// Feedback-loop breaker for actions that write back into the pty
+/// (send_text / coprocess): the SAME rule may fire at most
+/// `WRITE_BURST_MAX` times within `WRITE_BURST_WINDOW`. A legitimate
+/// flow (login automation, a burst of [y/n] answers) stays far below the
+/// budget and pays zero latency; output produced by the action
+/// re-matching its own rule fires at render rate and hits the cap, so a
+/// loop is cut off instead of storming the pty. Read-only actions
+/// (notify/tab_color/run) are not budgeted.
+const WRITE_BURST_WINDOW: Duration = Duration::from_secs(1);
+const WRITE_BURST_MAX: u32 = 8;
 
 /// Scrollback lines (above the visible bottom) included when a feed_screen
 /// coprocess captures the screen, so a multi-line block that scrolled partly
@@ -56,11 +68,14 @@ pub struct Triggers {
     has_highlight: bool,
     /// Any rule pipes the screen to a coprocess; gate the screen capture.
     has_feed_screen: bool,
-    /// Per route, the set of (absolute line, content hash, finalized) we've
-    /// already evaluated, so a given line+content fires once. Keyed on
-    /// content rather than a cursor counter so prompt redraws and TUIs
-    /// (which don't scroll) still register new output.
-    seen: FxHashMap<usize, FxHashSet<(i64, u64, bool)>>,
+    /// Per route, the set of (alt screen, absolute line, content hash,
+    /// finalized) we've already evaluated, so a given line+content fires
+    /// once. The absolute line is `scroll_epoch + row` (a never-clamped
+    /// physical-line identity; `history_size` stops at the scrollback
+    /// limit and is always 0 in the alt screen). The alt flag keeps the
+    /// two screens' keys apart so retention/purge on one never wipes the
+    /// other's, and swapping back doesn't mass re-fire.
+    seen: FxHashMap<usize, FxHashSet<(bool, i64, u64, bool)>>,
     /// (route, stable rule id) of `once` rules that have already fired.
     /// Retained across rebuild (config reload) — a stable id keeps the match
     /// correct even when the rule list changes.
@@ -75,6 +90,9 @@ pub struct Triggers {
     /// wrapping, which invalidates `seen`'s (abs_line, content) keys; the next
     /// scan then re-seeds `seen` without firing so reflow doesn't mass re-fire.
     dims: FxHashMap<usize, (usize, usize)>,
+    /// Per (route, rule id): (window start, fires in window) for the
+    /// pty-writing burst budget. See WRITE_BURST_WINDOW's doc.
+    write_bursts: FxHashMap<(usize, u64), (Instant, u32)>,
 }
 
 /// A one-shot trigger action with captures already substituted.
@@ -140,15 +158,26 @@ fn match_hash(text: &str, caps: &onig::Captures) -> u64 {
 impl Triggers {
     pub fn new(config: &TriggersConfig) -> Self {
         let mut rules = Vec::with_capacity(config.rules.len());
+        // Byte-identical duplicate rules would share an id (second `once`
+        // copy never fires, second instant copy swallowed by the shared
+        // cursor-line key); salt each repeat with its occurrence index —
+        // stable across reloads since file order is preserved.
+        let mut dups: FxHashMap<u64, u64> = FxHashMap::default();
         for rule in &config.rules {
             match onig::Regex::new(&rule.regex) {
-                Ok(regex) => rules.push(CompiledTrigger {
-                    regex,
-                    instant: rule.instant,
-                    once: rule.once,
-                    id: rule_id(&rule.regex, &rule.action),
-                    action: rule.action.clone(),
-                }),
+                Ok(regex) => {
+                    let base = rule_id(&rule.regex, &rule.action);
+                    let salt = dups.entry(base).or_insert(0);
+                    let id = base ^ salt.rotate_left(32).wrapping_add(*salt);
+                    *salt += 1;
+                    rules.push(CompiledTrigger {
+                        regex,
+                        instant: rule.instant,
+                        once: rule.once,
+                        id,
+                        action: rule.action.clone(),
+                    })
+                }
                 Err(err) => {
                     tracing::warn!("invalid trigger regex {:?}: {}", rule.regex, err);
                 }
@@ -174,6 +203,7 @@ impl Triggers {
             fired_once: FxHashSet::default(),
             cursor_fired: FxHashMap::default(),
             dims: FxHashMap::default(),
+            write_bursts: FxHashMap::default(),
         }
     }
 
@@ -201,6 +231,7 @@ impl Triggers {
         self.cursor_fired.remove(&route_id);
         self.dims.remove(&route_id);
         self.fired_once.retain(|(r, _)| *r != route_id);
+        self.write_bursts.retain(|(r, _), _| *r != route_id);
     }
 
     /// Re-arm `once` rules so the automation can run again. Bound to
@@ -212,9 +243,10 @@ impl Triggers {
     pub fn reset(&mut self) {
         self.fired_once.clear();
         for seen in self.seen.values_mut() {
-            seen.retain(|(_, _, finalized)| *finalized);
+            seen.retain(|(_, _, _, finalized)| *finalized);
         }
         self.cursor_fired.clear();
+        self.write_bursts.clear();
     }
 
     #[inline]
@@ -236,10 +268,17 @@ impl Triggers {
         }
 
         let grid = &term.grid;
-        let history = grid.history_size() as i64;
+        // Never-clamped physical-line identity base. `history_size` stops
+        // at the scrollback limit (and is 0 in the alt screen), which made
+        // `history + row` collapse once saturated: every scroll step gave
+        // each visible line a fresh key (mass re-fire) and pinned the
+        // cursor's key (prompts suppressed again). The epoch always
+        // advances with the rows.
+        let epoch = grid.scroll_epoch();
         let cursor_row = grid.cursor.pos.row.0 as i64;
         let screen_lines = grid.screen_lines();
         let columns = term.columns();
+        let is_alt = term.mode().contains(Mode::ALT_SCREEN);
 
         // A resize / font-zoom reflows the grid: absolute line numbers and
         // wrapping are rewritten, so `seen`'s (abs_line, content) keys no
@@ -254,12 +293,13 @@ impl Triggers {
         // scan() runs at the top of every render() — cursor blink, mouse hover
         // and other UI-only repaints included — but only Full/Partial damage
         // means cells actually changed. Noop/CursorOnly frames do no scan work
-        // (this walks and hashes every visible line under the terminal lock).
+        // (this walks and hashes visible lines under the terminal lock).
         // A reflow always reports Full damage, so the re-seed above is reached.
-        match term.peek_damage_event() {
-            Some(TerminalDamage::Full) | Some(TerminalDamage::Partial) => {}
+        let full_damage = match term.peek_damage_event() {
+            Some(TerminalDamage::Full) => true,
+            Some(TerminalDamage::Partial) => false,
             _ => return Vec::new(),
-        }
+        };
 
         // Captured lazily on the first feed_screen match (see below) so the
         // common path — and every non-matching frame — pays nothing.
@@ -269,30 +309,32 @@ impl Triggers {
         if reflowed {
             seen.clear();
         }
-        // Drop lines that have scrolled out of the live view.
-        seen.retain(|(abs, _, _)| *abs >= history);
-        // In the alternate screen history never advances, so the retain
-        // above frees nothing and a redrawing TUI (htop/watch) grows the
-        // set without bound. Cap it: clearing costs at most a re-fire of
-        // whatever is currently on screen, which the per-line dedup then
-        // re-suppresses immediately.
+        // Drop this screen's lines that scrolled out of the live view. The
+        // other screen's keys are kept for the swap back (leaving the alt
+        // screen must not make every restored primary line look new).
+        seen.retain(|(alt, abs, _, _)| *alt != is_alt || *abs >= epoch);
+        // A redrawing TUI (htop/watch) keeps producing new content hashes
+        // on the same rows, growing the set without bound. Cap it — but
+        // purge only this screen's keys, and re-seed silently below (like
+        // reflow) instead of letting the purge re-fire everything visible.
+        let mut purged = false;
         if seen.len() > 8192 {
-            seen.clear();
+            seen.retain(|(alt, _, _, _)| *alt != is_alt);
+            purged = true;
         }
+        // Re-seed pass: record keys, fire nothing.
+        let reseed = reflowed || purged;
 
         // Reset the cursor line's fire set when the cursor moved to a new
-        // ABSOLUTE line, so a fresh prompt fires while an echo/growth on the
-        // same line cannot. Keying on the screen row broke a scrolling
-        // console (minicom on serial): the cursor sits on the bottom row
-        // forever, so every re-drawn `login:` prompt reused the same
-        // (row, match) key and was suppressed as an echo. The absolute line
-        // (history + cursor_row) advances as the buffer scrolls, so a new
-        // prompt scrolled to the same bottom row still gets a new key. A
-        // scrolled-back view (offset != 0) is not the live prompt, so leave
-        // the fire set untouched.
+        // absolute line, so a fresh prompt fires while an echo/growth on
+        // the same line cannot (a scrolling console keeps the cursor on
+        // the bottom SCREEN row forever, so the epoch-based line is the
+        // only identity that both advances with new prompts and stays put
+        // for an echo). A scrolled-back view (offset != 0) is not the live
+        // prompt, so leave the fire set untouched.
         let live = grid.display_offset() == 0;
         if live {
-            let cursor_abs = history + cursor_row;
+            let cursor_abs = epoch + cursor_row;
             let cf = self.cursor_fired.entry(route_id).or_default();
             if cf.row != cursor_abs {
                 cf.row = cursor_abs;
@@ -301,15 +343,30 @@ impl Triggers {
         }
 
         let mut actions = Vec::new();
+        let mut text = String::new();
+        let mut cells: Vec<(u16, u16)> = Vec::new();
         for i in 0..screen_lines {
-            let abs = history + i as i64;
+            // While scrolled back, the cursor row is still being written:
+            // matching it now would fire non-instant rules on a half-drawn
+            // line (truncated captures) and again once it finalizes. Skip
+            // it; it is evaluated when the view returns to the bottom.
+            if !live && (i as i64) == cursor_row {
+                continue;
+            }
+            // On a Partial frame only damaged rows can have changed; the
+            // rest keep both their content and their (epoch-based) keys.
+            // Re-seed passes must walk everything to rebuild the keys.
+            if !full_damage && !reseed && !term.peek_line_damaged(i) {
+                continue;
+            }
+            let abs = epoch + i as i64;
             let is_cursor = live && (i as i64) == cursor_row;
             let finalized = (i as i64) < cursor_row;
-            let text = extract_line_text(term, Line(i as i32));
+            extract_match_line(term, Line(i as i32), &mut text, &mut cells);
             if text.is_empty() {
                 continue;
             }
-            let text: &str = if text.len() > LINE_SCAN_CAP {
+            let text: &str = if cells.len() > LINE_SCAN_CAP {
                 match text.char_indices().nth(LINE_SCAN_CAP) {
                     Some((byte, _)) => &text[..byte],
                     None => &text,
@@ -322,10 +379,10 @@ impl Triggers {
             // echo of an action's own output doesn't re-fire it (findings on
             // send_text/coprocess feedback and growing instant matches). Other
             // lines fire once each, keyed on (line, content, phase). When
-            // re-seeding after a reflow, record the key but don't fire.
+            // re-seeding (reflow / cap purge), record the key but don't fire.
             if !is_cursor {
-                let fresh = seen.insert((abs, hash_text(text), finalized));
-                if !fresh || reflowed {
+                let fresh = seen.insert((is_alt, abs, hash_text(text), finalized));
+                if !fresh || reseed {
                     continue;
                 }
             }
@@ -347,7 +404,9 @@ impl Triggers {
                     // On the cursor line, dedup by the matched substring so an
                     // action's echo (or the line growing by a chunk) that
                     // reproduces an already-fired match is suppressed, while a
-                    // new match on the same row still fires.
+                    // new match on the same row still fires. On a re-seed
+                    // (reflow / purge) record the key silently — a resize
+                    // must not re-fire the still-visible prompt.
                     if is_cursor {
                         let key = (rule.id, match_hash(text, &caps));
                         if !self
@@ -357,6 +416,32 @@ impl Triggers {
                             .fired
                             .insert(key)
                         {
+                            continue;
+                        }
+                        if reseed {
+                            continue;
+                        }
+                    }
+                    // Bound write-back feedback loops (see the const doc):
+                    // a fire inside the budget pays nothing; only a loop
+                    // exhausts it.
+                    if matches!(
+                        rule.action,
+                        TriggerAction::SendText { .. } | TriggerAction::Coprocess { .. }
+                    ) {
+                        let now = Instant::now();
+                        let burst = self
+                            .write_bursts
+                            .entry((route_id, rule.id))
+                            .or_insert((now, 0));
+                        if now - burst.0 > WRITE_BURST_WINDOW {
+                            *burst = (now, 0);
+                        }
+                        burst.1 += 1;
+                        if burst.1 > WRITE_BURST_MAX {
+                            tracing::warn!(
+                                "trigger write action exceeded {WRITE_BURST_MAX} fires/s; suppressing (feedback loop?)"
+                            );
                             continue;
                         }
                     }
@@ -392,33 +477,58 @@ impl Triggers {
 
     /// Recompute highlight ranges over the visible region, or `None` when the
     /// terminal content did not change since the last render so the caller
-    /// should keep the highlights it already has. Highlights are a visual
-    /// state, but re-running onig over every visible line each frame — under
-    /// the terminal lock, on cursor-blink and hover repaints too — is wasted
-    /// work when no cell changed. Content change (Full/Partial damage) forces
-    /// a recompute; an empty `Vec` still means "clear", e.g. when the last
-    /// matching text scrolled off or the highlight rules were removed.
+    /// should keep the highlights it already has (passed as `prev`).
+    /// Highlights are a visual state, but re-running onig over every visible
+    /// line each frame — under the terminal lock, on cursor-blink and hover
+    /// repaints too — is wasted work when no cell changed. On a Partial frame
+    /// of the live view only damaged rows are rescanned; `prev`'s matches on
+    /// untouched rows are carried over. An empty `Vec` still means "clear",
+    /// e.g. when the last matching text scrolled off or the rules changed.
     pub fn highlights<T: EventListener>(
         &self,
         term: &Crosswords<T>,
+        prev: Option<&[(Match, [u8; 4])]>,
     ) -> Option<Vec<(Match, [u8; 4])>> {
         if !self.has_highlight {
             return Some(Vec::new());
         }
-        match term.peek_damage_event() {
-            Some(TerminalDamage::Full) | Some(TerminalDamage::Partial) => {}
+        let full_damage = match term.peek_damage_event() {
+            Some(TerminalDamage::Full) => true,
+            Some(TerminalDamage::Partial) => false,
             _ => return None,
-        }
+        };
         let grid = &term.grid;
         let display_offset = grid.display_offset() as i32;
         let topmost = grid.topmost_line().0;
+        let screen_lines = grid.screen_lines();
+        // Rescan damaged rows only when the view is live (line coords then
+        // equal screen rows, so prev's untouched entries stay valid); any
+        // scrolled view recomputes fully.
+        let incremental = !full_damage && display_offset == 0;
         let mut out = Vec::new();
-        for i in 0..grid.screen_lines() {
+        if incremental {
+            if let Some(prev) = prev {
+                out.extend(
+                    prev.iter()
+                        .filter(|(m, _)| {
+                            let row = m.start().row.0;
+                            row >= 0 && !term.peek_line_damaged(row as usize)
+                        })
+                        .cloned(),
+                );
+            }
+        }
+        let mut text = String::new();
+        let mut cells: Vec<(u16, u16)> = Vec::new();
+        for i in 0..screen_lines {
+            if incremental && !term.peek_line_damaged(i) {
+                continue;
+            }
             let line = Line(i as i32 - display_offset);
             if line.0 < topmost {
                 continue;
             }
-            let text = extract_line_text(term, line);
+            extract_match_line(term, line, &mut text, &mut cells);
             if text.is_empty() {
                 continue;
             }
@@ -432,7 +542,7 @@ impl Triggers {
                 // number of ranges every frame (this runs under the
                 // terminal lock, on the render path).
                 for caps in rule.regex.captures_iter(&text).take(256) {
-                    if let Some((start, end)) = span(&text, &caps) {
+                    if let Some((start, end)) = span(&text, &cells, &caps) {
                         out.push((Pos::new(line, start)..=Pos::new(line, end), rgba));
                     }
                 }
@@ -442,6 +552,47 @@ impl Triggers {
     }
 }
 
+/// Fill `text` with one grid line's characters and `cells` with each
+/// character's (first, last) cell column. Wide-char spacer cells are
+/// skipped — with the padding spaces they'd otherwise inject, adjacent
+/// wide characters (CJK, emoji) could never match a regex — which is why
+/// the byte-offset -> column mapping needs the explicit `cells` table.
+/// Trailing NUL/whitespace is trimmed. Buffers are caller-owned so a
+/// screen walk reuses one allocation instead of two per line.
+fn extract_match_line<T: EventListener>(
+    term: &Crosswords<T>,
+    line: Line,
+    text: &mut String,
+    cells: &mut Vec<(u16, u16)>,
+) {
+    text.clear();
+    cells.clear();
+    let grid = &term.grid;
+    let mut keep_chars = 0;
+    let mut keep_bytes = 0;
+    for col in 0..grid.columns() {
+        let sq = &grid[line][Column(col)];
+        let wide = sq.wide();
+        if matches!(wide, Wide::Spacer | Wide::LeadingSpacer) {
+            continue;
+        }
+        let c = sq.c();
+        let end = if matches!(wide, Wide::Wide) {
+            col + 1
+        } else {
+            col
+        };
+        text.push(c);
+        cells.push((col as u16, end as u16));
+        if c != '\0' && !c.is_whitespace() {
+            keep_chars = cells.len();
+            keep_bytes = text.len();
+        }
+    }
+    cells.truncate(keep_chars);
+    text.truncate(keep_bytes);
+}
+
 /// Visible screen plus recent scrollback as one newline-joined string, for a
 /// feed_screen coprocess. Recent history is included so a multi-line block
 /// that has scrolled partly above the visible area is still captured whole.
@@ -449,10 +600,16 @@ fn capture_screen<T: EventListener>(term: &Crosswords<T>) -> String {
     let grid = &term.grid;
     let screen_lines = grid.screen_lines() as i32;
     let start = grid.topmost_line().0.max(-FEED_HISTORY_LINES);
-    let text = (start..screen_lines)
-        .map(|i| extract_line_text(term, Line(i)))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut line = String::new();
+    let mut cells = Vec::new();
+    let mut text = String::new();
+    for i in start..screen_lines {
+        extract_match_line(term, Line(i), &mut line, &mut cells);
+        if i > start {
+            text.push('\n');
+        }
+        text.push_str(&line);
+    }
     if text.len() <= FEED_PAYLOAD_CAP {
         return text;
     }
@@ -464,12 +621,19 @@ fn capture_screen<T: EventListener>(term: &Crosswords<T>) -> String {
     }
 }
 
-/// Match span as cell columns (onig reports byte offsets; columns are
-/// per-cell, one char each).
-fn span(text: &str, caps: &onig::Captures) -> Option<(Column, Column)> {
+/// Match span as cell columns. onig reports byte offsets; `cells` maps
+/// each char index to its (first, last) cell column — wide characters
+/// cover two cells, so the mapping isn't 1:1.
+fn span(
+    text: &str,
+    cells: &[(u16, u16)],
+    caps: &onig::Captures,
+) -> Option<(Column, Column)> {
     let (start_b, end_b) = caps.pos(0)?;
-    let start = text[..start_b].chars().count();
-    let end = text[..end_b].chars().count().saturating_sub(1);
+    let start_char = text[..start_b].chars().count();
+    let end_char = text[..end_b].chars().count().saturating_sub(1);
+    let start = cells.get(start_char)?.0 as usize;
+    let end = cells.get(end_char.max(start_char))?.1 as usize;
     Some((Column(start), Column(end.max(start))))
 }
 

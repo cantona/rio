@@ -167,6 +167,11 @@ pub struct Config {
     /// Loaded from the dedicated `triggers.toml`, never from `config.toml`.
     #[serde(skip)]
     pub triggers: Triggers,
+    /// True when triggers.toml exists but failed to parse in this load, so
+    /// a hot-reload can keep the previously-live rules instead of silently
+    /// replacing them with this (empty) default.
+    #[serde(skip)]
+    pub triggers_load_failed: bool,
     #[serde(default = "Bell::default")]
     pub bell: Bell,
     #[serde(default = "default_bool_true", rename = "enable-scroll-bar")]
@@ -519,10 +524,12 @@ impl Config {
         }
     }
 
-    /// Load `triggers.toml` into `config`, if present. A parse error keeps the
-    /// config's existing (default) triggers and is only logged: a triggers
-    /// typo must not discard the rest of a live config (fonts, colors, binds)
-    /// by turning into a whole-config load failure.
+    /// Load `triggers.toml` into `config`, if present. A parse error only
+    /// sets `triggers_load_failed` and is logged: a triggers typo must not
+    /// discard the rest of a live config (fonts, colors, binds) by turning
+    /// into a whole-config load failure, and on a hot-reload the flag lets
+    /// the application keep the previously-live rules rather than silently
+    /// wiping them with this config's empty default.
     fn apply_triggers(config: &mut Config) {
         let triggers_path = triggers_file_path();
         if !triggers_path.exists() {
@@ -531,7 +538,8 @@ impl Config {
         match Config::load_triggers(&triggers_path) {
             Ok(loaded) => config.triggers = loaded,
             Err(err_message) => {
-                warn!("failed to load triggers, keeping previous config: {err_message}");
+                config.triggers_load_failed = true;
+                warn!("failed to load triggers.toml: {err_message}");
             }
         }
     }
@@ -728,6 +736,7 @@ impl Default for Config {
             draw_bold_text_with_light_colors: false,
             hints: Hints::default(),
             triggers: Triggers::default(),
+            triggers_load_failed: false,
             bell: Bell::default(),
             enable_scroll_bar: true,
             scrollback_history_limit: default_scrollback_history_limit(),

@@ -180,6 +180,11 @@ notify = { title = "Error", body = "\\1", urgency = "critical" }
   matched line, so the command can see multi-line context.
 - **Type text back into the pty** — auto-answer a prompt.
 
+Rules scan the focused pane as it renders; a background tab's output is
+picked up when you switch to it. When a capture feeds a command's
+arguments, put `--` before it so hostile output can't smuggle an option
+(`args = ["--", "\1"]`).
+
 Two flags refine when a rule fires: `once` (fire a single time, until the
 config reloads — good for a one-shot login probe) and `instant` (fire
 mid-line, on every output batch, instead of waiting for the line to be
