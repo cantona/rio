@@ -2117,6 +2117,10 @@ impl<U: EventListener> Crosswords<U> {
             return;
         };
 
+        // Match every cell before mutating anything: clearing the first
+        // cell frees the row's shared slot, after which the remaining
+        // sibling cells would no longer resolve to the target id mid-scan.
+        let mut matched: Vec<Column> = Vec::new();
         for col_idx in 0..self.grid.columns() {
             let pos = Column(col_idx);
             let same = self
@@ -2124,9 +2128,12 @@ impl<U: EventListener> Crosswords<U> {
                 .map(|gc| gc.texture.id == target_id)
                 .unwrap_or(false);
             if same {
-                let cell = &mut self.grid.raw[row][pos];
-                Self::clear_cell_graphic(&mut self.grid.extras_table, cell);
+                matched.push(pos);
             }
+        }
+        for pos in matched {
+            let cell = &mut self.grid.raw[row][pos];
+            Self::clear_cell_graphic(&mut self.grid.extras_table, cell);
         }
         self.mark_line_damaged(row);
     }
@@ -4012,31 +4019,32 @@ impl<U: EventListener> Handler for Crosswords<U> {
                     cell_ref.clear();
                 }
 
-                // A cell that already has an extras slot needs a PRIVATE
-                // slot for the graphic. The existing slot may be shared —
-                // a previous image's per-row slot, or a multi-cell
-                // hyperlink span — and mutating it in place would corrupt
-                // every sibling cell that reads it. Allocate a fresh slot
-                // carrying this cell's own zerowidth/hyperlink plus the
-                // graphic, and repoint only this cell (the old slot, if
-                // private, is reclaimed by gc_extras; if shared, its
-                // siblings keep it untouched). Bare cells share the single
-                // per-row slot as before.
-                if let Some(old_eid) = cell_ref.extras_id() {
-                    let (zerowidth, hyperlink) = self
-                        .grid
+                // A covered cell whose old slot carries zerowidth or
+                // hyperlink data keeps it in a PRIVATE slot merged with
+                // the graphic: the old slot may be shared (a multi-cell
+                // hyperlink span) and mutating it in place would corrupt
+                // its sibling cells, while repointing at the row slot
+                // would drop the data. Every other cell — bare, or
+                // holding a graphic-only slot from a previous image's
+                // row — is repointed at this image's single per-row
+                // slot, so redrawing a full-screen image costs one slot
+                // per row instead of one per cell. Old slots left
+                // unreferenced are reclaimed by gc_extras.
+                let carried = cell_ref.extras_id().and_then(|old_eid| {
+                    self.grid
                         .extras_table
                         .get(old_eid)
+                        .filter(|e| !e.zerowidth.is_empty() || e.hyperlink.is_some())
                         .map(|e| (e.zerowidth.clone(), e.hyperlink.clone()))
-                        .unwrap_or_default();
-                    let eid = self.grid.extras_table.alloc(square::Extras {
+                });
+                let eid = if let Some((zerowidth, hyperlink)) = carried {
+                    self.grid.extras_table.alloc(square::Extras {
                         zerowidth,
                         hyperlink,
                         graphic: Some(smallvec::smallvec![graphic_cell.clone()]),
-                    });
-                    cell_ref.set_extras_id(Some(eid));
+                    })
                 } else {
-                    let eid = match shared_eid {
+                    match shared_eid {
                         Some(eid) => eid,
                         None => {
                             let eid = self.grid.extras_table.alloc(square::Extras {
@@ -4046,9 +4054,9 @@ impl<U: EventListener> Handler for Crosswords<U> {
                             shared_eid = Some(eid);
                             eid
                         }
-                    };
-                    cell_ref.set_extras_id(Some(eid));
-                }
+                    }
+                };
+                cell_ref.set_extras_id(Some(eid));
                 cell_ref.insert_cell_flag(CellFlags::GRAPHICS);
                 self.grid.raw[line].has_extras = true;
             }
@@ -6594,6 +6602,78 @@ mod tests {
 
         // The accessor should also return None.
         assert!(cw.cell_graphic(Line(0), Column(0)).is_none());
+    }
+
+    /// `delete_graphic_at_position` must clear every cell of the target
+    /// image, even though they share one extras slot per row, while
+    /// leaving another image on the same row intact.
+    #[test]
+    fn delete_graphic_at_position_clears_all_sibling_cells() {
+        let size = CrosswordsSize::new(20, 10);
+        let window_id = crate::event::WindowId::from(0);
+        let mut cw = Crosswords::new(
+            size,
+            CursorShape::Block,
+            VoidListener {},
+            window_id,
+            0,
+            10_000,
+        );
+        cw.graphics.cell_width = 10.0;
+        cw.graphics.cell_height = 10.0;
+
+        let make_graphic = |width: usize, height: usize| GraphicData {
+            id: sugarloaf::GraphicId::new(0),
+            width,
+            height,
+            pixels: vec![0u8; width * height * 4],
+            color_type: sugarloaf::ColorType::Rgba,
+            is_opaque: true,
+            display_width: None,
+            display_height: None,
+            resize: None,
+            transmit_time: std::time::Instant::now(),
+        };
+
+        // First image: cols 0..4 of row 0. Second image: cols 6..8.
+        cw.insert_graphic(make_graphic(40, 10), None, None);
+        cw.grid.cursor.pos.row = Line(0);
+        cw.grid.cursor.pos.col = Column(6);
+        cw.insert_graphic(make_graphic(20, 10), None, None);
+
+        let first_id = cw
+            .cell_graphic(Line(0), Column(0))
+            .expect("first image should be readable")
+            .texture
+            .id;
+        let second_id = cw
+            .cell_graphic(Line(0), Column(6))
+            .expect("second image should be readable")
+            .texture
+            .id;
+        assert_ne!(first_id, second_id);
+
+        // Delete via a middle cell so both slot-owner orders are covered.
+        cw.delete_graphic_at_position(Column(1), Line(0));
+
+        for col in 0..4 {
+            let cell = &cw.grid[Line(0)][Column(col)];
+            assert!(
+                !cell.has_graphics(),
+                "cell (0,{col}) should no longer have GRAPHICS"
+            );
+            assert!(
+                cell.extras_id().is_none(),
+                "cell (0,{col}) should not keep a stale extras id"
+            );
+        }
+
+        for col in 6..8 {
+            let gc = cw
+                .cell_graphic(Line(0), Column(col))
+                .expect("second image should survive the delete");
+            assert_eq!(gc.texture.id, second_id);
+        }
     }
 
     // ------------------------------------------------------------------

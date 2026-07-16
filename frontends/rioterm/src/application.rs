@@ -659,6 +659,23 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     // Process graphics directly in sugarloaf
                     let sugarloaf = &mut route.window.screen.sugarloaf;
 
+                    // Removals before inserts: an evict-then-retransmit of
+                    // the same kitty id lands in one batch, and the fresh
+                    // pixels must survive the eviction of the old ones.
+                    for removal in queues.remove_queue {
+                        // Atlas and kitty graphics live under different
+                        // `image_data` keys; the tag picks the right one so
+                        // a kitty removal doesn't delete an atlas entry (and
+                        // leak the kitty texture).
+                        let key = match removal {
+                            rio_backend::ansi::graphics::GraphicRemoval::Atlas(id) => {
+                                crate::renderer::atlas_image_key(id.get())
+                            }
+                            rio_backend::ansi::graphics::GraphicRemoval::Kitty(id) => id,
+                        };
+                        sugarloaf.image_data.remove(&key);
+                    }
+
                     // Atlas graphics (sixel/iTerm2) → the same per-image
                     // texture store the overlay pipeline draws from, under
                     // a namespaced key.
@@ -680,20 +697,6 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                                 graphic_data,
                             ),
                         );
-                    }
-
-                    for removal in queues.remove_queue {
-                        // Atlas and kitty graphics live under different
-                        // `image_data` keys; the tag picks the right one so
-                        // a kitty removal doesn't delete an atlas entry (and
-                        // leak the kitty texture).
-                        let key = match removal {
-                            rio_backend::ansi::graphics::GraphicRemoval::Atlas(id) => {
-                                crate::renderer::atlas_image_key(id.get())
-                            }
-                            rio_backend::ansi::graphics::GraphicRemoval::Kitty(id) => id,
-                        };
-                        sugarloaf.image_data.remove(&key);
                     }
 
                     // Mark the panel dirty — the renderer skips non-dirty

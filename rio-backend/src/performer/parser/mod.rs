@@ -42,6 +42,12 @@ const OSC_FIXED_LEN: usize = 2048;
 /// oversized payload.
 const OSC_MAX_LEN: usize = 384 * 1024 * 1024;
 
+/// Largest `OscBuffer::overflow` capacity retained across `clear`. Anything
+/// bigger is released: one never-terminating OSC can grow the buffer to
+/// `OSC_MAX_LEN`, and keeping that capacity would pin hundreds of MB per
+/// terminal for the tab's lifetime.
+const OSC_RETAINED_CAPACITY: usize = 1024 * 1024;
+
 /// Parser for raw _VTE_ protocol which delegates actions to a [`Perform`].
 #[derive(Default)]
 pub(crate) struct Parser {
@@ -130,8 +136,13 @@ impl OscBuffer {
     fn clear(&mut self) {
         self.fixed_len = 0;
         // Keep `overflow`'s capacity so a session that hits one large paste
-        // doesn't re-allocate on the next one.
-        self.overflow.clear();
+        // doesn't re-allocate on the next one — up to a ceiling, so an
+        // oversized OSC doesn't pin its buffer until the tab closes.
+        if self.overflow.capacity() > OSC_RETAINED_CAPACITY {
+            self.overflow = Vec::new();
+        } else {
+            self.overflow.clear();
+        }
     }
 }
 

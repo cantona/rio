@@ -472,22 +472,40 @@ impl Renderer {
                         if image_bottom_row <= 0 || screen_row >= screen_lines {
                             continue;
                         }
+                        let full_height = p.pixel_height as f32;
+                        if full_height <= 0.0 {
+                            continue;
+                        }
                         let mut y = origin_y
                             + screen_row as f32 * cell_height
                             + p.cell_y_offset as f32;
-                        let mut height = p.pixel_height as f32;
+                        let mut height = full_height;
                         let mut src_top = 0.0;
-                        // Clip the top against the grid origin: a placement
-                        // whose first rows scrolled above the viewport must
-                        // not draw up into the tab bar. Crop the hidden band
-                        // out of the source rect and pin y to origin_y.
+                        let mut src_bottom = 1.0;
+                        // Clip against the grid band: the scissor covers the
+                        // whole surface, so a placement whose first rows
+                        // scrolled above the viewport would draw up into the
+                        // tab bar, and one extending past the last line would
+                        // draw over the padding or the split below. Crop the
+                        // hidden bands out of the source rect, clamp the dest
+                        // quad, and skip when nothing remains visible.
                         if y < origin_y {
                             let hidden = origin_y - y;
-                            if height > 0.0 {
-                                src_top = (hidden / height).min(1.0);
+                            if hidden >= height {
+                                continue;
                             }
+                            src_top = hidden / full_height;
                             height -= hidden;
                             y = origin_y;
+                        }
+                        let grid_bottom = origin_y + screen_lines as f32 * cell_height;
+                        let overhang = (y + height) - grid_bottom;
+                        if overhang > 0.0 {
+                            if overhang >= height {
+                                continue;
+                            }
+                            src_bottom = 1.0 - overhang / full_height;
+                            height -= overhang;
                         }
                         overlays.push(rio_backend::sugarloaf::GraphicOverlay {
                             image_id: p.image_id,
@@ -499,9 +517,9 @@ impl Renderer {
                             width: p.pixel_width as f32,
                             height,
                             z_index: p.z_index,
-                            // source_rect is [u0, v0, u1, v1]; crop the
-                            // hidden top band by raising v0.
-                            source_rect: [0.0, src_top, 1.0, 1.0],
+                            // source_rect is [u0, v0, u1, v1]; the clipped
+                            // bands raise v0 / lower v1.
+                            source_rect: [0.0, src_top, 1.0, src_bottom],
                         });
                     }
                 }
