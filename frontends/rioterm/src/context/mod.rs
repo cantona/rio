@@ -119,7 +119,16 @@ pub fn clear_quit_detaching() {
 #[cfg(unix)]
 pub(crate) fn kill_local_daemon(socket: &std::path::Path) {
     use rio_ptyd::protocol as p;
+    use std::time::Duration;
+    // Runs on the UI thread inside Context::drop while a window closes.
+    // A shell `exit` makes the daemon self-clean and drop its socket at
+    // the same moment; connecting or writing to a peer that is tearing
+    // down can otherwise block that thread and freeze the close. Bound
+    // both the connect and the writes so a racing/dead daemon can never
+    // hang the UI — if the daemon is already gone the shell is dead
+    // anyway, which is the outcome we wanted.
     if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) {
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
         let _ = p::write_frame(
             &mut stream,
             p::FrameType::ClientHello,
