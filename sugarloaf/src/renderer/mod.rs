@@ -787,7 +787,7 @@ const IMAGE_BG_LIMIT: i32 = i32::MIN / 2;
 
 /// A single image draw command for the image pipeline.
 struct ImageDraw {
-    image_id: u32,
+    image_id: crate::sugarloaf::graphics::ImageKey,
     instance: ImageInstance,
     layer: ImageLayer,
 }
@@ -807,7 +807,7 @@ pub struct Renderer {
     draw_cmds: Vec<batch::DrawCmd>,
     images: ImageCache,
     /// Per-image GPU textures (one map, any backend).
-    image_textures: FxHashMap<u32, ImageTextureEntry>,
+    image_textures: FxHashMap<crate::sugarloaf::graphics::ImageKey, ImageTextureEntry>,
     /// Image draw commands for the current frame.
     image_draws: Vec<ImageDraw>,
     /// Pending background image upload (consumed by `prepare`).
@@ -1024,7 +1024,7 @@ impl Renderer {
         _state: &crate::sugarloaf::state::SugarState,
         _graphics: &mut Graphics,
         image_data: &mut rustc_hash::FxHashMap<
-            u32,
+            crate::sugarloaf::graphics::ImageKey,
             crate::sugarloaf::graphics::GraphicDataEntry,
         >,
         image_overlays: &rustc_hash::FxHashMap<
@@ -1162,7 +1162,7 @@ impl Renderer {
         &mut self,
         context: &mut crate::context::Context,
         image_data: &mut rustc_hash::FxHashMap<
-            u32,
+            crate::sugarloaf::graphics::ImageKey,
             crate::sugarloaf::graphics::GraphicDataEntry,
         >,
         overlays: &[&crate::sugarloaf::graphics::GraphicOverlay],
@@ -1368,7 +1368,10 @@ impl Renderer {
     #[allow(clippy::too_many_arguments)]
     fn draw_images_metal(
         image_draws: &[ImageDraw],
-        image_textures: &FxHashMap<u32, ImageTextureEntry>,
+        image_textures: &FxHashMap<
+            crate::sugarloaf::graphics::ImageKey,
+            ImageTextureEntry,
+        >,
         brush: &MetalRenderer,
         render_encoder: &metal::RenderCommandEncoderRef,
         layer: ImageLayer,

@@ -15,18 +15,17 @@ use tracing::debug;
 
 /// A graphic scheduled for removal, tagged with the id space it lives in.
 ///
-/// Atlas graphics (sixel/iTerm2) and kitty images share neither their id
-/// space nor their `image_data` key: atlas graphics are stored under
-/// `atlas_image_key(GraphicId)` (high bit set) while kitty images use the
-/// protocol `image_id: u32` directly. A bare id can't tell the removal
-/// handler which map/key to target — mapping a kitty id through the atlas
-/// key deletes the wrong entry and leaks the real one. The tag keeps the
-/// two disjoint.
+/// Atlas graphics (sixel/iTerm2) and kitty images don't share an id
+/// space: both allocate per terminal and can collide numerically. The
+/// window-level store is keyed by `sugarloaf::ImageKey` (route, source,
+/// id), and the frontend needs this tag to build the source part — a
+/// bare id can't tell the removal handler which entry to target, so a
+/// kitty removal could delete an atlas entry and leak the real one.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum GraphicRemoval {
-    /// Sixel/iTerm2 atlas graphic (keyed by `atlas_image_key`).
+    /// Sixel/iTerm2 atlas graphic (`GraphicId` space).
     Atlas(GraphicId),
-    /// Kitty image (keyed by the raw protocol `image_id`).
+    /// Kitty image (raw protocol `image_id` space).
     Kitty(u32),
 }
 

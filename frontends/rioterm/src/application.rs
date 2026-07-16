@@ -662,25 +662,34 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     // Removals before inserts: an evict-then-retransmit of
                     // the same kitty id lands in one batch, and the fresh
                     // pixels must survive the eviction of the old ones.
+                    // The store is shared by every terminal in the window
+                    // while both protocols allocate ids per terminal, so
+                    // every key is scoped to the originating route and its
+                    // id space — a kitty removal must not delete an atlas
+                    // entry (or another tab's image) and leak the texture
+                    // the cells still reference.
                     for removal in queues.remove_queue {
-                        // Atlas and kitty graphics live under different
-                        // `image_data` keys; the tag picks the right one so
-                        // a kitty removal doesn't delete an atlas entry (and
-                        // leak the kitty texture).
                         let key = match removal {
                             rio_backend::ansi::graphics::GraphicRemoval::Atlas(id) => {
-                                crate::renderer::atlas_image_key(id.get())
+                                rio_backend::sugarloaf::ImageKey::atlas(
+                                    route_id,
+                                    id.get(),
+                                )
                             }
-                            rio_backend::ansi::graphics::GraphicRemoval::Kitty(id) => id,
+                            rio_backend::ansi::graphics::GraphicRemoval::Kitty(id) => {
+                                rio_backend::sugarloaf::ImageKey::kitty(route_id, id)
+                            }
                         };
                         sugarloaf.image_data.remove(&key);
                     }
 
                     // Atlas graphics (sixel/iTerm2) → the same per-image
-                    // texture store the overlay pipeline draws from, under
-                    // a namespaced key.
+                    // texture store the overlay pipeline draws from.
                     for graphic_data in queues.pending {
-                        let key = crate::renderer::atlas_image_key(graphic_data.id.get());
+                        let key = rio_backend::sugarloaf::ImageKey::atlas(
+                            route_id,
+                            graphic_data.id.get(),
+                        );
                         sugarloaf.image_data.insert(
                             key,
                             rio_backend::sugarloaf::GraphicDataEntry::from_graphic_data(
@@ -689,10 +698,10 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         );
                     }
 
-                    // Image textures (kitty) → separate store, no clone
+                    // Image textures (kitty) → same store, no clone
                     for (image_id, graphic_data) in queues.pending_images {
                         sugarloaf.image_data.insert(
-                            image_id,
+                            rio_backend::sugarloaf::ImageKey::kitty(route_id, image_id),
                             rio_backend::sugarloaf::GraphicDataEntry::from_graphic_data(
                                 graphic_data,
                             ),

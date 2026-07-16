@@ -929,8 +929,13 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     #[inline]
-    pub fn close_unfocused_tabs(&mut self) {
+    pub fn close_unfocused_tabs(&mut self, sugarloaf: &mut Sugarloaf) {
         let current_route_id = self.current().route_id;
+        for grid in &self.contexts {
+            if grid.current().route_id != current_route_id {
+                grid.remove_all_rich_text(sugarloaf);
+            }
+        }
         self.contexts
             .retain(|ctx| ctx.current().route_id == current_route_id);
         self.current_route = self.contexts[0].current().route_id;

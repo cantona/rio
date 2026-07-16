@@ -85,12 +85,58 @@ pub struct Graphic {
     pub offset_y: u16,
 }
 
+/// Which protocol id space an `ImageKey`'s id lives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ImageSource {
+    /// Sixel/iTerm2 atlas graphic (`GraphicId` space, u64).
+    Atlas,
+    /// Kitty graphics image (protocol `image_id` space, u32).
+    Kitty,
+}
+
+/// Key for the window-level image stores (`Sugarloaf::image_data` and the
+/// renderer's per-image GPU texture map). One window hosts many terminals
+/// (tabs/splits), and both protocol id spaces restart per terminal, so a
+/// bare numeric id cannot address the shared store: one terminal's image
+/// would clobber another's, and a kitty id could land on a sixel's entry.
+/// The key carries all three coordinates so live images never collide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ImageKey {
+    /// Opaque per-terminal namespace supplied by the frontend (rioterm
+    /// passes the route id).
+    pub owner: usize,
+    pub source: ImageSource,
+    /// Protocol-level id, widened to u64: kitty ids may use the full
+    /// u32 range and `GraphicId` is u64 — neither can be shrunk.
+    pub id: u64,
+}
+
+impl ImageKey {
+    #[inline]
+    pub const fn atlas(owner: usize, id: u64) -> Self {
+        Self {
+            owner,
+            source: ImageSource::Atlas,
+            id,
+        }
+    }
+
+    #[inline]
+    pub const fn kitty(owner: usize, id: u32) -> Self {
+        Self {
+            owner,
+            source: ImageSource::Kitty,
+            id: id as u64,
+        }
+    }
+}
+
 /// An overlay image placement.
 /// Used by the renderer to draw images on top of (or behind) terminal content.
 #[derive(Debug, Clone)]
 pub struct GraphicOverlay {
-    /// Image identifier (kitty protocol image_id).
-    pub image_id: u32,
+    /// Key of the image in the window-level image store.
+    pub image_id: ImageKey,
     /// Screen position (physical pixels).
     pub x: f32,
     pub y: f32,
@@ -443,6 +489,28 @@ pub struct ResizeCommand {
     pub height: ResizeParameter,
 
     pub preserve_aspect_ratio: bool,
+}
+
+#[test]
+fn image_keys_discriminate_source_and_owner() {
+    // Implicit kitty ids allocate from 0x80000000 while the first sixel's
+    // GraphicId is 1 — under the old flag-packed u32 key both mapped to
+    // 0x80000001 and the kitty transmit clobbered the sixel's entry.
+    assert_ne!(ImageKey::kitty(7, 0x8000_0001), ImageKey::atlas(7, 1));
+    // A client-supplied kitty i= may occupy any u32 value, including ones
+    // numerically equal to an atlas GraphicId.
+    assert_ne!(ImageKey::kitty(7, 1), ImageKey::atlas(7, 1));
+    // Per-terminal id counters restart at 1 (atlas) / 0x80000000 (kitty),
+    // so the same protocol id from two tabs sharing a window must map to
+    // distinct entries.
+    assert_ne!(ImageKey::atlas(1, 1), ImageKey::atlas(2, 1));
+    assert_ne!(
+        ImageKey::kitty(1, 0x8000_0000),
+        ImageKey::kitty(2, 0x8000_0000)
+    );
+    // Identity still holds within one terminal + source.
+    assert_eq!(ImageKey::kitty(3, 42), ImageKey::kitty(3, 42));
+    assert_eq!(ImageKey::atlas(3, 42), ImageKey::atlas(3, 42));
 }
 
 #[test]

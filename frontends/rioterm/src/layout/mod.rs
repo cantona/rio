@@ -1489,8 +1489,11 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             return;
         }
 
-        // Get rich text ID before removing
-        let rich_text_id = self.inner.get(&to_remove).map(|item| item.val.rich_text_id);
+        // Capture ids before removing — needed for sugarloaf cleanup below
+        let removed_ids = self
+            .inner
+            .get(&to_remove)
+            .map(|item| (item.val.rich_text_id, item.val.route_id));
 
         // Select next panel before removing (use visual ordering)
         let ordered_keys = self.get_ordered_keys();
@@ -1523,10 +1526,14 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         // Remove from inner map
         self.inner.remove(&to_remove);
 
-        // Drop image overlays for the removed panel — sugarloaf has
-        // no other panel state to clean up post-Content removal.
-        if let Some(id) = rich_text_id {
-            sugarloaf.clear_image_overlays_for(id);
+        // Drop the removed panel's sugarloaf state: its overlays, and
+        // its entries in the window-level image store — nothing else
+        // ever removes a closed pane's kitty images (atlas graphics at
+        // least queue removals when their cells drop), so without this
+        // the pixels outlive the terminal for the life of the window.
+        if let Some((rich_text_id, route_id)) = removed_ids {
+            sugarloaf.clear_image_overlays_for(rich_text_id);
+            sugarloaf.remove_images_for(route_id);
         }
 
         // Update root if necessary
@@ -1594,14 +1601,15 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         }
     }
 
-    /// Drop image overlays for every panel in the grid. Used on tab
-    /// teardown — the panels themselves go away with the
-    /// `ContextManager`; only the kitty graphics state needs an
-    /// explicit cleanup signal.
+    /// Drop image overlays and stored images for every panel in the
+    /// grid. Used on tab teardown — the panels themselves go away with
+    /// the `ContextManager`; only the graphics state living on
+    /// sugarloaf needs an explicit cleanup signal.
     #[inline]
     pub fn remove_all_rich_text(&self, sugarloaf: &mut Sugarloaf) {
         for item in self.inner.values() {
             sugarloaf.clear_image_overlays_for(item.val.rich_text_id);
+            sugarloaf.remove_images_for(item.val.route_id);
         }
     }
 }

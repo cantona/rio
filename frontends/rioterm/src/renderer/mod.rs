@@ -25,7 +25,7 @@ use rio_backend::config::colors::{
 use rio_backend::config::navigation::Navigation;
 use rio_backend::config::Config;
 use rio_backend::event::EventProxy;
-use rio_backend::sugarloaf::Sugarloaf;
+use rio_backend::sugarloaf::{ImageKey, Sugarloaf};
 
 /// The window-bg clear alpha that flows into sugarloaf's
 /// `set_background_color`. Stored on the renderer and re-applied on
@@ -43,17 +43,6 @@ fn window_bg_alpha(config: &Config) -> f32 {
     } else {
         config.window.opacity.clamp(0.0, 1.0)
     }
-}
-
-/// `image_data` (u32) key for an atlas graphic (sixel/iTerm2).
-/// `GraphicId`s are small sequential u64s; the high bit keeps them out
-/// of the kitty protocol id space (see the `KittyPlacement` doc comment
-/// in rio-backend), so both kinds share the per-image texture store.
-pub const ATLAS_IMAGE_ID_FLAG: u32 = 0x8000_0000;
-
-#[inline]
-pub fn atlas_image_key(id: u64) -> u32 {
-    ATLAS_IMAGE_ID_FLAG | (id as u32 & 0x7FFF_FFFF)
 }
 
 pub struct Renderer {
@@ -508,7 +497,7 @@ impl Renderer {
                             height -= overhang;
                         }
                         overlays.push(rio_backend::sugarloaf::GraphicOverlay {
-                            image_id: p.image_id,
+                            image_id: ImageKey::kitty(context.route_id, p.image_id),
                             // kitty X=/Y= offset, supports sub-cell positioning
                             x: origin_x
                                 + p.dest_col as f32 * cell_width
@@ -528,6 +517,7 @@ impl Renderer {
                     Self::push_virtual_placeholder_overlays(
                         overlays,
                         rc,
+                        context.route_id,
                         origin_x,
                         origin_y,
                         cell_width,
@@ -539,6 +529,7 @@ impl Renderer {
                     Self::push_atlas_graphic_overlays(
                         overlays,
                         rc,
+                        context.route_id,
                         origin_x,
                         origin_y,
                         cell_width,
@@ -811,6 +802,7 @@ impl Renderer {
     fn push_virtual_placeholder_overlays(
         overlays: &mut Vec<rio_backend::sugarloaf::GraphicOverlay>,
         rc: &RenderableContent,
+        route_id: usize,
         origin_x: f32,
         origin_y: f32,
         cell_width: f32,
@@ -844,6 +836,7 @@ impl Renderer {
                         flush_run(
                             overlays,
                             rc,
+                            route_id,
                             p.complete(),
                             line_idx,
                             start_col,
@@ -879,6 +872,7 @@ impl Renderer {
                             flush_run(
                                 overlays,
                                 rc,
+                                route_id,
                                 p.complete(),
                                 line_idx,
                                 start_col,
@@ -908,6 +902,7 @@ impl Renderer {
                 flush_run(
                     overlays,
                     rc,
+                    route_id,
                     p.complete(),
                     line_idx,
                     start_col,
@@ -930,6 +925,7 @@ impl Renderer {
         fn flush_run(
             overlays: &mut Vec<rio_backend::sugarloaf::GraphicOverlay>,
             rc: &RenderableContent,
+            route_id: usize,
             run: PlaceholderRun,
             screen_line: usize,
             start_screen_col: usize,
@@ -970,7 +966,7 @@ impl Renderer {
             };
 
             overlays.push(rio_backend::sugarloaf::GraphicOverlay {
-                image_id: run.image_id,
+                image_id: ImageKey::kitty(route_id, run.image_id),
                 x: geom.x,
                 y: geom.y,
                 width: geom.width,
@@ -990,6 +986,7 @@ impl Renderer {
     fn push_atlas_graphic_overlays(
         overlays: &mut Vec<rio_backend::sugarloaf::GraphicOverlay>,
         rc: &RenderableContent,
+        route_id: usize,
         origin_x: f32,
         origin_y: f32,
         cell_width: f32,
@@ -1017,9 +1014,11 @@ impl Renderer {
         /// texture (normalized, resolution-independent) covering the
         /// run's cells. Edge cells draw only the pixels the image
         /// actually has.
+        #[allow(clippy::too_many_arguments)]
         fn flush(
             overlays: &mut Vec<rio_backend::sugarloaf::GraphicOverlay>,
             r: Run,
+            route_id: usize,
             line: usize,
             origin_x: f32,
             origin_y: f32,
@@ -1032,7 +1031,7 @@ impl Renderer {
                 return;
             }
             overlays.push(rio_backend::sugarloaf::GraphicOverlay {
-                image_id: atlas_image_key(r.id),
+                image_id: ImageKey::atlas(route_id, r.id),
                 x: origin_x + r.start_col as f32 * cell_width,
                 y: origin_y + line as f32 * cell_height,
                 width: src_w * (cell_width / r.insert_cw),
@@ -1074,6 +1073,7 @@ impl Renderer {
                         flush(
                             overlays,
                             r,
+                            route_id,
                             line_idx,
                             origin_x,
                             origin_y,
@@ -1100,6 +1100,7 @@ impl Renderer {
                             flush(
                                 overlays,
                                 r,
+                                route_id,
                                 line_idx,
                                 origin_x,
                                 origin_y,
@@ -1134,6 +1135,7 @@ impl Renderer {
                 flush(
                     overlays,
                     r,
+                    route_id,
                     line_idx,
                     origin_x,
                     origin_y,

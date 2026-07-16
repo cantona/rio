@@ -38,7 +38,8 @@ pub use crate::font_cache::ResolvedGlyph;
 pub use crate::sugarloaf::{
     graphics::{
         ColorType, Graphic, GraphicData, GraphicDataEntry, GraphicId, GraphicOverlay,
-        Graphics, ResizeCommand, ResizeParameter, MAX_GRAPHIC_DIMENSIONS,
+        Graphics, ImageKey, ImageSource, ResizeCommand, ResizeParameter,
+        MAX_GRAPHIC_DIMENSIONS,
     },
     primitives::{
         is_private_user_area, Corners, CursorKind, ImageProperties, Quad, Rect,

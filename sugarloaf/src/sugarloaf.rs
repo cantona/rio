@@ -9,7 +9,7 @@ use crate::font::{fonts::SugarloafFont, FontLibrary};
 use crate::font_cache::{compute_advance, resolve_with, FontCache, ResolvedGlyph};
 use crate::layout::RootStyle;
 use crate::renderer::Renderer;
-use crate::sugarloaf::graphics::{GraphicDataEntry, Graphics};
+use crate::sugarloaf::graphics::{GraphicDataEntry, Graphics, ImageKey};
 use swash::Attributes;
 
 use crate::context::Context;
@@ -38,8 +38,11 @@ pub struct Sugarloaf<'a> {
     pub graphics: Graphics,
     #[cfg(feature = "wgpu")]
     filters_brush: Option<FiltersBrush>,
-    /// Pixel data for standalone image textures, keyed by ImageId.
-    pub image_data: rustc_hash::FxHashMap<u32, GraphicDataEntry>,
+    /// Pixel data for standalone image textures. Keyed by the composite
+    /// `ImageKey` — this store is window-level while protocol ids are
+    /// per-terminal, so the key must carry the owning terminal and the
+    /// source id space alongside the id.
+    pub image_data: rustc_hash::FxHashMap<ImageKey, GraphicDataEntry>,
     /// Persistent state for the CPU rasterizer (glyph cache + frame hash).
     /// Unused on GPU backends.
     cpu_cache: crate::renderer::cpu::CpuCache,
@@ -860,6 +863,16 @@ impl Sugarloaf<'_> {
         if let Some(v) = self.image_overlays.get_mut(&panel_id) {
             v.clear();
         }
+    }
+
+    /// Drop every standalone image owned by `owner` (a closing
+    /// terminal's namespace). Without this a closed tab/split leaves
+    /// its pixel entries in the window-level store for the life of the
+    /// window. The GPU textures follow on the next `prepare`, which
+    /// evicts any texture whose `image_data` entry is gone.
+    #[inline]
+    pub fn remove_images_for(&mut self, owner: usize) {
+        self.image_data.retain(|key, _| key.owner != owner);
     }
 
     #[inline]
