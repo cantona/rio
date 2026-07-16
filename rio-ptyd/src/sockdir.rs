@@ -27,8 +27,8 @@ pub struct PaneMeta {
 }
 
 /// `$XDG_RUNTIME_DIR/rio-ptyd`, else `${TMPDIR:-/tmp}/rio-ptyd-<uid>`.
-/// Created 0700; validated tmux-style on every use (must be a dir we
-/// own with no group/world permissions).
+/// Created 0700; validated on every use (must be a dir we own with no
+/// group/world permissions).
 pub fn base_dir() -> io::Result<PathBuf> {
     let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(run) if !run.is_empty() => PathBuf::from(run).join("rio-ptyd"),
@@ -37,7 +37,10 @@ pub fn base_dir() -> io::Result<PathBuf> {
                 .filter(|t| !t.is_empty())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/tmp"));
+            #[cfg(unix)]
             let uid = unsafe { libc::getuid() };
+            #[cfg(not(unix))]
+            let uid = 0;
             tmp.join(format!("rio-ptyd-{uid}"))
         }
     };
@@ -173,95 +176,53 @@ pub fn list_panes(base: &Path) -> io::Result<Vec<PaneMeta>> {
     Ok(out)
 }
 
+#[cfg(unix)]
 pub fn pid_alive(pid: i32) -> bool {
     pid > 0 && unsafe { libc::kill(pid, 0) } == 0
+}
+
+#[cfg(not(unix))]
+pub fn pid_alive(_pid: i32) -> bool {
+    false
 }
 
 /// True when `pid` still looks like the process the pane recorded, so a
 /// blind signal can't hit an unrelated same-uid process that recycled
 /// the pid. A recycled pid started long after the pane's `created_at`;
-/// the pane's own daemon/shell started at or before it. Linux reads the
-/// process start-time from `/proc`; other platforms only check liveness.
+/// the pane's own daemon/shell started at or before it. Every supported
+/// OS backend reads the start-time; one that can't (or another unix with
+/// only the fallback) returns None and we accept liveness alone.
+#[cfg(unix)]
 pub fn pid_matches_start(pid: i32, created_at: u64) -> bool {
     if !pid_alive(pid) {
         return false;
     }
-    #[cfg(target_os = "linux")]
-    {
-        match proc_start_epoch(pid) {
-            // A generous slack absorbs clock skew and the gap between
-            // fork and the meta write; a recycled pid is off by far more.
-            Some(start) => start <= created_at.saturating_add(5),
-            // Can't read start-time: fall back to liveness alone.
-            None => true,
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = created_at;
-        true
+    match crate::osproc::start_epoch(pid) {
+        // A generous slack absorbs clock skew and the gap between fork
+        // and the meta write; a recycled pid is off by far more.
+        Some(start) => start <= created_at.saturating_add(5),
+        // Can't read start-time: fall back to liveness alone.
+        None => true,
     }
 }
 
-/// Wall-clock epoch (seconds) at which `pid` started, from
-/// `/proc/<pid>/stat` field 22 (starttime, in clock ticks since boot)
-/// plus the system boot time from `/proc/stat` `btime`.
-#[cfg(target_os = "linux")]
-fn proc_start_epoch(pid: i32) -> Option<u64> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // comm (field 2) is parenthesized and may hold spaces/parens; split
-    // on the last ')' to reach the space-delimited tail. After it the
-    // fields are state(3)..starttime(22), so starttime is token index 19.
-    let tail = &stat[stat.rfind(')')? + 1..];
-    let starttime_ticks: u64 = tail.split_whitespace().nth(19)?.parse().ok()?;
-    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if hz <= 0 {
-        return None;
-    }
-    let btime = fs::read_to_string("/proc/stat").ok().and_then(|s| {
-        s.lines()
-            .find_map(|l| l.strip_prefix("btime "))
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    })?;
-    Some(btime + starttime_ticks / hz as u64)
+#[cfg(not(unix))]
+pub fn pid_matches_start(_pid: i32, _created_at: u64) -> bool {
+    false
 }
 
-/// Name of the program currently in the foreground of `shell_pid`'s
-/// controlling terminal, or None when the shell itself is foreground
-/// (idle prompt) or nothing can be read. Lets `list` show "vim"/"ssh"
-/// instead of the login shell when a pane is busy. Linux-only
-/// (`/proc`); other platforms fall back to the cwd at the call site.
+/// Name of the program in the foreground of `shell_pid`'s tty, or None
+/// (idle prompt / not readable). Delegates to the per-OS backend; on
+/// platforms without one `list` falls back to the cwd at the call site.
+#[cfg(unix)]
 pub fn foreground_activity(shell_pid: i32) -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        // stat field 8 (1-indexed) is tpgid: the foreground process
-        // group of the process's controlling terminal. comm (field 2)
-        // is parenthesized and may contain spaces/parens, so split on
-        // the LAST ')' to reach the space-delimited tail; after it the
-        // fields are state(3) ppid(4) pgrp(5) session(6) tty_nr(7)
-        // tpgid(8), so tpgid is the 6th token (index 5).
-        let stat = fs::read_to_string(format!("/proc/{shell_pid}/stat")).ok()?;
-        let tail = &stat[stat.rfind(')')? + 1..];
-        let tpgid: i32 = tail.split_whitespace().nth(5)?.parse().ok()?;
-        if tpgid <= 0 || tpgid == shell_pid {
-            return None;
-        }
-        // The foreground pgid equals its leader's pid; read that
-        // leader's comm. If it is the shell itself, treat as idle.
-        let leader = fs::read_to_string(format!("/proc/{tpgid}/comm")).ok()?;
-        let leader = leader.trim();
-        if leader.is_empty() {
-            return None;
-        }
-        Some(leader.to_string())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = shell_pid;
-        None
-    }
+    crate::osproc::foreground(shell_pid)
 }
 
+#[cfg(not(unix))]
+pub fn foreground_activity(_shell_pid: i32) -> Option<String> {
+    None
+}
 pub fn now_epoch() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -272,7 +233,9 @@ pub fn now_epoch() -> u64 {
 /// Format a unix epoch as local ISO 8601 "YYYY-MM-DD HH:MM" for the list
 /// display: unambiguous across regions and text-sortable. Uses libc
 /// localtime_r/strftime to avoid a time-formatting dependency (the crate
-/// keeps to libc + serde). Empty string on failure.
+/// keeps to libc + serde). Empty string on failure or on non-unix (the
+/// list command is unix-only anyway).
+#[cfg(unix)]
 pub fn format_epoch_local(epoch: u64) -> String {
     unsafe {
         let t = epoch as libc::time_t;
@@ -290,6 +253,11 @@ pub fn format_epoch_local(epoch: u64) -> String {
         );
         String::from_utf8_lossy(&buf[..n]).into_owned()
     }
+}
+
+#[cfg(not(unix))]
+pub fn format_epoch_local(_epoch: u64) -> String {
+    String::new()
 }
 
 #[cfg(test)]

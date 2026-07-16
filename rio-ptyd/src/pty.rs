@@ -80,7 +80,8 @@ pub fn spawn_shell(spec: &SpawnSpec) -> io::Result<PtyChild> {
             })
             .collect::<io::Result<_>>()?;
 
-        // Block signals across the fork (tmux discipline).
+        // Block signals across the fork so the child starts with a clean,
+        // predictable signal state before it resets dispositions.
         let mut all: libc::sigset_t = std::mem::zeroed();
         let mut old: libc::sigset_t = std::mem::zeroed();
         libc::sigfillset(&mut all);

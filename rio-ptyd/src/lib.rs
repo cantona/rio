@@ -21,4 +21,6 @@ pub mod attach_cli;
 #[cfg(unix)]
 pub mod daemon;
 #[cfg(unix)]
+pub mod osproc;
+#[cfg(unix)]
 pub mod pty;

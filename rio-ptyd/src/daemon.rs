@@ -638,7 +638,8 @@ impl Daemon {
         // Prefer the shell's LIVE cwd (/proc/<pid>/cwd) over the
         // spawn-time cwd — the client caches it so a later fresh-spawn
         // fallback (dead daemon) lands in the right directory.
-        let live_cwd = live_cwd(self.meta.shell_pid).or_else(|| self.meta.cwd.clone());
+        let live_cwd =
+            crate::osproc::cwd(self.meta.shell_pid).or_else(|| self.meta.cwd.clone());
         let meta_json = serde_json::json!({
             "pane_id": self.pane_id,
             "program": self.meta.program,
@@ -951,12 +952,6 @@ fn pollfd(fd: RawFd, events: libc::c_short) -> libc::pollfd {
 
 fn revents(fds: &[libc::pollfd], idx: usize) -> libc::c_short {
     fds.get(idx).map(|p| p.revents).unwrap_or(0)
-}
-
-fn live_cwd(pid: i32) -> Option<String> {
-    std::fs::read_link(format!("/proc/{pid}/cwd"))
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned())
 }
 
 fn decode_wait_status(status: libc::c_int) -> i32 {
