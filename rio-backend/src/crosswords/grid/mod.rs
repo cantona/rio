@@ -85,7 +85,18 @@ pub struct Grid<T> {
 pub struct ExtrasTable {
     slots: Vec<Option<crate::crosswords::square::Extras>>,
     free: Vec<u16>,
+
+    /// Live-slot count that triggers the next `Grid::gc_extras` sweep.
+    /// Doubles after every sweep that stays populated, so a grid full of
+    /// genuinely live extras isn't re-swept on each image insert.
+    gc_watermark: usize,
 }
+
+/// Sweep floor: well below the u16 id ceiling so orphaned graphic slots
+/// (each pinning a row of pixels via its `TextureRef`) are reclaimed
+/// long before they can pin gigabytes, yet high enough that ordinary
+/// zerowidth/hyperlink churn never triggers a sweep.
+pub const EXTRAS_GC_WATERMARK: usize = 4096;
 
 impl ExtrasTable {
     pub fn new() -> Self {
@@ -94,6 +105,7 @@ impl ExtrasTable {
         Self {
             slots: vec![None],
             free: Vec::new(),
+            gc_watermark: EXTRAS_GC_WATERMARK,
         }
     }
 
@@ -129,9 +141,18 @@ impl ExtrasTable {
         id
     }
 
-    /// Nearly out of slot ids — time for `Grid::gc_extras`.
+    /// Allocated slots currently holding extras (sentinel excluded).
+    pub fn live_slots(&self) -> usize {
+        self.slots.len().saturating_sub(self.free.len() + 1)
+    }
+
+    /// Time for `Grid::gc_extras`: either the u16 id space is nearly
+    /// exhausted, or live slots crossed the doubling watermark — meaning
+    /// orphaned slots (cells overwritten by text, rows dropped off the
+    /// scrollback ring) may be pinning dead pixel data via `TextureRef`.
     pub fn under_pressure(&self) -> bool {
-        self.slots.len() >= u16::MAX as usize && self.free.len() < 256
+        (self.slots.len() >= u16::MAX as usize && self.free.len() < 256)
+            || self.live_slots() >= self.gc_watermark
     }
 
     /// Free every allocated slot whose bit is not set in `live`.
@@ -143,6 +164,9 @@ impl ExtrasTable {
                 self.free.push(id as u16);
             }
         }
+        // Re-arm at double the surviving population: sweeps stay
+        // amortized O(1) per allocation even when everything is live.
+        self.gc_watermark = (self.live_slots() * 2).max(EXTRAS_GC_WATERMARK);
     }
 
     /// Free a previously-allocated slot. No-op if `id == 0`.
@@ -161,6 +185,7 @@ impl ExtrasTable {
         self.slots.clear();
         self.slots.push(None);
         self.free.clear();
+        self.gc_watermark = EXTRAS_GC_WATERMARK;
     }
 }
 
@@ -409,6 +434,12 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
         for line in range.map(Line::from) {
             self.raw[line].reset(&self.cursor.template);
         }
+
+        // Every row and both cursor templates are back to defaults, so no
+        // extras id is referenced anymore. Drop the slots outright —
+        // graphic slots release their `TextureRef`, queueing the GPU-side
+        // removal, instead of lingering until a gc sweep.
+        self.extras_table.clear();
     }
 }
 

@@ -2757,6 +2757,11 @@ impl<U: EventListener> Handler for Crosswords<U> {
         // screen waiting to come back).
         self.graphics.clear_all_kitty_state();
 
+        // Grid resets dropped every extras slot and the kitty clear
+        // queued its image removals; flush them so the renderer frees
+        // the GPU textures now instead of at the next graphics event.
+        self.send_graphics_updates();
+
         // Preserve vi mode across resets.
         self.mode &= Mode::VI;
         self.mode.insert(Mode::default());
@@ -3902,20 +3907,36 @@ impl<U: EventListener> Handler for Crosswords<U> {
             graphic_bytes, self.graphics.total_bytes, self.graphics.total_limit
         );
 
-        // Only scan the grid for used IDs when eviction is actually needed
-        if self.graphics.total_bytes + graphic_bytes > self.graphics.total_limit {
-            let used_ids = self.collect_used_graphic_ids();
-            debug!(
-                "insert_graphic: {} images currently in use in grid, need eviction",
-                used_ids.len()
-            );
+        // Only scan the grid for used IDs when eviction is actually
+        // needed, and not while the warn latch is set — everything left
+        // was live last time, so repeating the sweep and scan for every
+        // insert would burn CPU for the same answer. The latch releases
+        // as soon as accounting drops back under the budget.
+        if self.graphics.total_bytes + graphic_bytes > self.graphics.total_limit
+            && !self.graphics.over_budget_warned
+        {
+            // Orphaned extras slots (image cells overwritten by text,
+            // rows scrolled off the ring) are usually what holds the
+            // budget hostage; sweep them and fold the freed bytes back
+            // into the accounting before evicting live images.
+            self.grid.gc_extras();
+            self.graphics.untrack_queued_removals();
 
-            if !self.graphics.evict_images(graphic_bytes, &used_ids) {
-                warn!(
-                    "Failed to evict enough images for {} bytes, image may not display",
-                    graphic_bytes
+            if self.graphics.total_bytes + graphic_bytes > self.graphics.total_limit {
+                let used_ids = self.collect_used_graphic_ids();
+                debug!(
+                    "insert_graphic: {} images currently in use in grid, need eviction",
+                    used_ids.len()
                 );
-                // Continue anyway - let it fail gracefully rather than silently dropping
+
+                if !self.graphics.evict_images(graphic_bytes, &used_ids) {
+                    warn!(
+                        "Failed to evict enough images for {} bytes, image may not display",
+                        graphic_bytes
+                    );
+                    // Continue anyway - let it fail gracefully rather than silently dropping
+                    self.graphics.over_budget_warned = true;
+                }
             }
         }
 
@@ -3975,8 +3996,9 @@ impl<U: EventListener> Handler for Crosswords<U> {
         self.graphics
             .register_placed_texture(graphic_id, Arc::downgrade(&texture));
 
-        // Reclaim slots dropped off the scrollback ring before allocating
-        // this image's rows against a nearly-full table.
+        // Reclaim orphaned slots before allocating this image's rows.
+        // The table's doubling watermark keeps the sweep amortized, so a
+        // busy image workload isn't swept on every insert.
         if self.grid.extras_table.under_pressure() {
             self.grid.gc_extras();
         }
@@ -4225,8 +4247,10 @@ impl<U: EventListener> Handler for Crosswords<U> {
                 overlay_changed = true;
 
                 if delete.delete_data {
-                    self.graphics.kitty_images.clear();
-                    self.graphics.kitty_image_numbers.clear();
+                    // Route through delete_kitty_images so the byte
+                    // accounting deflates and the window-level textures
+                    // are queued for removal.
+                    self.graphics.delete_kitty_images(|_, _| true);
                 }
             }
             b'i' | b'I' => {
@@ -6511,6 +6535,48 @@ mod tests {
 
         // Cell outside the image should NOT have graphics.
         assert!(!cw.grid[Line(0)][Column(2)].has_graphics());
+    }
+
+    /// RIS drops graphics extras outright: the grid content is gone, so
+    /// the pixel data (CPU copy, GPU texture, byte accounting) must go
+    /// with it instead of lingering until a gc sweep.
+    #[test]
+    fn reset_state_reclaims_graphic_extras() {
+        let size = CrosswordsSize::new(20, 10);
+        let window_id = crate::event::WindowId::from(0);
+        let mut cw = Crosswords::new(
+            size,
+            CursorShape::Block,
+            VoidListener {},
+            window_id,
+            0,
+            10_000,
+        );
+        cw.graphics.cell_width = 10.0;
+        cw.graphics.cell_height = 10.0;
+
+        let graphic = GraphicData {
+            id: sugarloaf::GraphicId::new(0),
+            width: 20,
+            height: 20,
+            pixels: vec![0u8; 20 * 20 * 4],
+            color_type: sugarloaf::ColorType::Rgba,
+            is_opaque: true,
+            display_width: None,
+            display_height: None,
+            resize: None,
+            transmit_time: std::time::Instant::now(),
+        };
+        cw.insert_graphic(graphic, None, None);
+        assert!(cw.grid.extras_table.live_slots() > 0);
+        assert!(cw.graphics.total_bytes > 0);
+
+        cw.reset_state();
+
+        assert_eq!(cw.grid.extras_table.live_slots(), 0);
+        // Dropping the extras queued the atlas removal and the reset's
+        // own update flush folded it back into the byte accounting.
+        assert_eq!(cw.graphics.total_bytes, 0);
     }
 
     /// Verify that `cell_graphic()` reads the first GraphicCell back.

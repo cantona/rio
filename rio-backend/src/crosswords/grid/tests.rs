@@ -16,6 +16,40 @@ impl GridSquare for usize {
     }
 }
 
+// Orphaned extras slots must trip the gc trigger long before the u16 id
+// ceiling, and a sweep re-arms the watermark so a table full of live
+// slots isn't swept again on every allocation.
+#[test]
+fn extras_watermark_triggers_and_rearms() {
+    use crate::crosswords::square::Extras;
+
+    let mut table = ExtrasTable::new();
+    for _ in 0..EXTRAS_GC_WATERMARK {
+        assert_ne!(table.alloc(Extras::default()), 0);
+    }
+    assert_eq!(table.live_slots(), EXTRAS_GC_WATERMARK);
+    assert!(table.under_pressure());
+
+    // All slots dead: the sweep frees them and pressure is gone.
+    let none_live = vec![0u64; (u16::MAX as usize).div_ceil(64)];
+    table.sweep_unmarked(&none_live);
+    assert_eq!(table.live_slots(), 0);
+    assert!(!table.under_pressure());
+
+    // All slots live: the sweep frees nothing but doubles the watermark,
+    // so the next allocation doesn't re-trigger a futile sweep.
+    for _ in 0..EXTRAS_GC_WATERMARK {
+        table.alloc(Extras::default());
+    }
+    let mut all_live = vec![0u64; (u16::MAX as usize).div_ceil(64)];
+    for id in 1..=EXTRAS_GC_WATERMARK {
+        all_live[id / 64] |= 1 << (id % 64);
+    }
+    table.sweep_unmarked(&all_live);
+    assert_eq!(table.live_slots(), EXTRAS_GC_WATERMARK);
+    assert!(!table.under_pressure());
+}
+
 // The scroll epoch keeps advancing after the history limit saturates
 // (history_size stops, the epoch must not — per-line dedup identity
 // depends on it), and a full-width scroll_down walks it back.
