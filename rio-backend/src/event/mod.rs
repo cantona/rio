@@ -246,6 +246,10 @@ pub enum RioEvent {
     /// Quit request.
     Quit,
 
+    /// Quit confirmed by the "want to quit?" prompt. Runs the save + exit
+    /// path directly, bypassing the confirm check that Quit re-triggers.
+    QuitConfirmed,
+
     /// Save the current session to disk (tabs/splits/CWDs/scrollback).
     SaveSession,
 
@@ -355,6 +359,7 @@ impl Debug for RioEvent {
             }
             RioEvent::Exit => write!(f, "Exit"),
             RioEvent::Quit => write!(f, "Quit"),
+            RioEvent::QuitConfirmed => write!(f, "QuitConfirmed"),
             RioEvent::SaveSession => write!(f, "SaveSession"),
             RioEvent::ClearSessionNotice => write!(f, "ClearSessionNotice"),
             RioEvent::CloseButtonArmed => write!(f, "CloseButtonArmed"),

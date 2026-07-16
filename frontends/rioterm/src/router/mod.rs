@@ -767,8 +767,20 @@ impl Route<'_> {
                         self.request_overlay_redraw();
                     }
                     Key::Character(c) if c.as_str() == "y" || c.as_str() == "Y" => {
+                        // Answer accepted: dismiss the overlay and run the
+                        // real quit via QuitConfirmed. Calling self.quit()
+                        // here dropped its return value, so in always/disable
+                        // mode (where quit() returns "not deferred, caller
+                        // must save+exit") nothing exited and the window
+                        // froze. QuitConfirmed reaches quit_now() app-side.
                         self.window.screen.renderer.confirm_quit.set_active(false);
-                        self.quit();
+                        let ctx = self.window.screen.ctx();
+                        ctx.event_proxy().send_event(
+                            rio_backend::event::RioEventType::Rio(
+                                rio_backend::event::RioEvent::QuitConfirmed,
+                            ),
+                            ctx.window_id(),
+                        );
                         return true;
                     }
                     _ => {}

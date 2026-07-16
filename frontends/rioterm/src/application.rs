@@ -245,6 +245,32 @@ impl Application<'_> {
         }
     }
 
+    /// Finish a quit: `route.quit()` shows the save prompt and returns true
+    /// when the close-save table says Prompt (that overlay's answer then
+    /// exits). Otherwise it returns false and we do the silent all-windows
+    /// save (named workspaces + the implicit slot when `always`) and exit
+    /// now. Shared by the no-confirm Quit path and the QuitConfirmed answer
+    /// to "want to quit?".
+    fn quit_now(&mut self, window_id: WindowId) {
+        let deferred = self
+            .router
+            .routes
+            .get_mut(&window_id)
+            .map(|route| route.quit())
+            .unwrap_or(false);
+        if !deferred {
+            #[cfg(unix)]
+            crate::context::set_quit_detaching();
+            self.save_named_sessions();
+            if self.config.session.restore
+                == rio_backend::config::session::SessionRestore::Always
+            {
+                self.save_last_session(Some(window_id));
+            }
+            std::process::exit(0);
+        }
+    }
+
     /// A window's last tab closed (WM-close or shell `exit`). Persist per
     /// the restore mode. Returns true when a save PROMPT was shown, so
     /// the caller must NOT close the window yet — the prompt's answer
@@ -880,33 +906,19 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             }
             RioEventType::Rio(RioEvent::Exit | RioEvent::Quit) => {
                 if self.config.confirm_before_quit {
+                    // Show "want to quit?"; the y answer fires QuitConfirmed
+                    // which runs quit_now(). Without that, answering y in
+                    // any non-prompt mode (always/disable) just dismissed
+                    // the overlay and nothing exited — the window froze.
                     if let Some(route) = self.router.routes.get_mut(&window_id) {
                         route.confirm_quit();
                     }
                 } else {
-                    // route.quit() shows the save prompt and returns true
-                    // when the close-save table says Prompt (the overlay
-                    // answer then exits). Otherwise it returns false and we
-                    // do the silent all-windows save (named workspaces +
-                    // the implicit slot when `always`) and exit now.
-                    let deferred = self
-                        .router
-                        .routes
-                        .get_mut(&window_id)
-                        .map(|route| route.quit())
-                        .unwrap_or(false);
-                    if !deferred {
-                        #[cfg(unix)]
-                        crate::context::set_quit_detaching();
-                        self.save_named_sessions();
-                        if self.config.session.restore
-                            == rio_backend::config::session::SessionRestore::Always
-                        {
-                            self.save_last_session(Some(window_id));
-                        }
-                        std::process::exit(0);
-                    }
+                    self.quit_now(window_id);
                 }
+            }
+            RioEventType::Rio(RioEvent::QuitConfirmed) => {
+                self.quit_now(window_id);
             }
             RioEventType::Rio(RioEvent::GlyphProtocolInstalled {
                 route_id,
