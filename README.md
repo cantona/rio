@@ -71,8 +71,9 @@ working directory, the window size, even the styled scrollback text.
 ```toml
 [session]
 # "disable" (default) turns sessions off entirely.
-# "prompt" asks "save?" at quit and "resume?" at launch.
-# "always" does both silently, and also autosaves on tab/split changes.
+# "prompt" asks first — "save?" when a window closes or rio quits,
+#   "resume?" at launch — and a yes does exactly what "always" would.
+# "always" does it all silently, and autosaves on tab/split changes.
 restore = "prompt"
 # How many scrollback lines each pane saves. Default: 2000.
 max-scrollback-lines = 2000
@@ -109,8 +110,23 @@ With `persistent = true`, every pane runs behind a standalone daemon,
 rio — or let it crash — and the shells keep running. Relaunch, and rio
 reattaches to the live processes and replays their screens: `vim`, `top`,
 your build, your `ssh` session, all still there, still running, exactly
-where you left them. Closing a tab still kills its shell; only quitting rio
-(cleanly or not) detaches instead of killing.
+where you left them.
+
+And closing is just as deliberate as resuming. Rio reads each close for
+what it means and cleans up — or preserves — accordingly:
+
+| How you close a window | Your session | Your shells |
+|---|---|---|
+| `exit`, or close the last tab while idle | tidied out of the session | ended — nothing lingers behind |
+| close the last tab mid-work (an editor, a build, an ssh session) | kept | keep running — the next launch reattaches with the program still going |
+| the window's ✕ button | kept | keep running, reattach on relaunch |
+| quit rio — or crash | saved as-is | all keep running, reattach on relaunch |
+
+(Closing an individual tab or split *inside* a window always ends just
+that shell — deliberate is deliberate.) Fat-finger `alt+w` on a window
+running a build and nothing is lost; close an idle one and nothing is
+leaked — `rio-ptyd list` stays exactly as long as your real workload. In `prompt` mode rio asks before acting and your
+answer does precisely the above; in `always` mode it simply happens.
 
 This is the pitch in one line: **no tmux, no prefix keys, native GPU
 rendering, and the session actually survives.**
@@ -185,6 +201,12 @@ picked up when you switch to it. When a capture feeds a command's
 arguments, put `--` before it so hostile output can't smuggle an option
 (`args = ["--", "\1"]`).
 
+A typo never costs you a working terminal. Break `config.toml` mid-edit
+and rio keeps running on the live config instead of resetting to
+defaults; break `triggers.toml` and the running rules stay live. Both
+surface the parse error as an in-terminal overlay — fix the file, save,
+and the overlay clears itself.
+
 Two flags refine when a rule fires: `once` (fire a single time, until the
 config reloads — good for a one-shot login probe) and `instant` (fire
 mid-line, on every output batch, instead of waiting for the line to be
@@ -207,6 +229,14 @@ this fork puts its attention:
   bleeding up into the tab bar.
 - **Overlapping and side-by-side images don't corrupt each other**, and
   deleting one leaves its neighbor intact.
+- **Images survive a window resize in one piece.** Rows that anchor a
+  picture never rewrap — no torn bands, no ghost copies — and a shrink
+  only hides pixels: drag the window narrower and back, and the whole
+  picture is still there.
+- **The prompt lands below the picture, every time.** Sixel streams that
+  end with a graphics-new-line — the way `chafa` and `img2sixel` finish —
+  leave the cursor under the image, so the second render is as clean as
+  the first.
 
 These are the kind of rough edges that surface only when you lean on the
 feature daily — found in use, fixed quickly, kept fixed.
@@ -305,7 +335,7 @@ first-class requirement, not an afterthought:
 None of this is a pile of hacks bolted onto a demo. It's built to run
 unattended, for days, against output you don't fully control.
 
-### 🔧 Quality-of-life fixes upstream lacks
+### 🔧 Quality-of-life fixes
 
 - Key bindings and `window.decorations` hot-reload on config save — no
   restart needed.
