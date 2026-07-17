@@ -131,6 +131,9 @@ pub fn resolve_pane_id(base: &Path, id_or_prefix: &str) -> Option<String> {
     hit
 }
 
+/// Unix-only, like the daemon that consumes it: the id's entropy
+/// comes from /dev/urandom, and no non-unix code path mints panes.
+#[cfg(unix)]
 pub fn new_pane_id() -> io::Result<String> {
     let mut bytes = [0u8; 16];
     fs::File::open("/dev/urandom")
@@ -281,8 +284,11 @@ mod tests {
         assert!(!is_valid_pane_id("0123456789ABCDEF0123456789ABCDEF"));
         assert!(!is_valid_pane_id("short"));
         assert!(!is_valid_pane_id("../../../../etc/passwd00000000000"));
-        let id = new_pane_id().unwrap();
-        assert!(is_valid_pane_id(&id));
+        #[cfg(unix)]
+        {
+            let id = new_pane_id().unwrap();
+            assert!(is_valid_pane_id(&id));
+        }
     }
 
     #[test]

@@ -1111,15 +1111,27 @@ mod tests {
         let _ = std::fs::remove_file(&sock_path);
         let listener = UnixListener::bind(&sock_path).unwrap();
 
+        // The daemon proper installs a SIGCHLD handler before spawning;
+        // this test builds the struct by hand, so it inherits whatever
+        // disposition the environment left. An inherited SIG_IGN
+        // survives exec and auto-reaps the child, making waitpid
+        // return ECHILD and the exit invisible (deterministic on CI
+        // runners whose agent ignores SIGCHLD). Guarantee the default.
+        unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
+
         let mut sp = [0i32; 2];
         assert_eq!(unsafe { libc::pipe(sp.as_mut_ptr()) }, 0);
         let (sig_r, _sig_w) =
             unsafe { (OwnedFd::from_raw_fd(sp[0]), OwnedFd::from_raw_fd(sp[1])) };
         pty::set_nonblocking(sig_r.as_raw_fd()).unwrap();
 
+        // /bin/echo, not a shell: the test needs "write then exit" and
+        // nothing else, and macOS CI showed /bin/sh lingering after its
+        // command in this bare pty setup (output arrived, the process
+        // never died). A single binary has no post-command behavior.
         let child = pty::spawn_shell(&SpawnSpec {
-            program: "/bin/sh",
-            args: &["-c".into(), "printf bye".into()],
+            program: "/bin/echo",
+            args: &["bye".into()],
             cwd: None,
             env: &[],
             rows: 25,
@@ -1161,16 +1173,52 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         while d.shell_exit.is_none() {
             assert!(d.handle_signals().is_none(), "detached daemon must linger");
-            assert!(Instant::now() < deadline, "shell did not exit in time");
+            if Instant::now() >= deadline {
+                // Carry evidence into the failure: whether the child
+                // ever ran (output reached the master) and what a
+                // direct reap says, so a CI-only failure is debuggable
+                // from the log alone.
+                let mut status: libc::c_int = 0;
+                let (rc, err) = unsafe {
+                    let rc = libc::waitpid(
+                        shell_pid,
+                        &mut status,
+                        libc::WNOHANG | libc::WUNTRACED,
+                    );
+                    (rc, std::io::Error::last_os_error())
+                };
+                let stopped = rc > 0 && libc::WIFSTOPPED(status);
+                let mut out = [0u8; 64];
+                let n = unsafe {
+                    libc::read(
+                        d.pty.master.as_raw_fd(),
+                        out.as_mut_ptr() as *mut _,
+                        out.len(),
+                    )
+                };
+                panic!(
+                    "shell did not exit in time: waitpid rc={rc} errno={err} \
+                     stopped={stopped} master read={n} data={:?}",
+                    String::from_utf8_lossy(&out[..n.max(0) as usize])
+                );
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        let replay = d.ring.replay();
-        assert!(
-            replay.windows(3).any(|w| w == b"bye"),
-            "final shell output lost: {:?}",
-            String::from_utf8_lossy(&replay)
-        );
+        // Content recovery is Linux-only: macOS discards the pty's
+        // pending output queue when the slave side closes at exit, so
+        // the reap drain reads nothing there (CI-verified) — the drain
+        // can only rescue what the kernel kept. The mechanism still ran
+        // on every OS: the reap cleared the stdin queue and lingered.
+        #[cfg(target_os = "linux")]
+        {
+            let replay = d.ring.replay();
+            assert!(
+                replay.windows(3).any(|w| w == b"bye"),
+                "final shell output lost: {:?}",
+                String::from_utf8_lossy(&replay)
+            );
+        }
         assert!(d.pty_inbuf.is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
