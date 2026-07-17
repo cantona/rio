@@ -6692,6 +6692,159 @@ mod tests {
         );
     }
 
+    /// Column reflow must not wrap image rows: every covered cell of
+    /// one image row shares an extras slot, so wrapping paints the same
+    /// band twice at the wrong place (and pushes earlier bands into
+    /// history). Image rows are clipped to the new width instead.
+    #[test]
+    fn graphic_rows_are_clipped_not_reflowed() {
+        let size = CrosswordsSize::new(20, 10);
+        let window_id = crate::event::WindowId::from(0);
+        let mut cw = Crosswords::new(
+            size,
+            CursorShape::Block,
+            VoidListener {},
+            window_id,
+            0,
+            10_000,
+        );
+        cw.graphics.cell_width = 10.0;
+        cw.graphics.cell_height = 10.0;
+
+        let graphic = GraphicData {
+            id: sugarloaf::GraphicId::new(0),
+            width: 200,
+            height: 40,
+            pixels: vec![0u8; 200 * 40 * 4],
+            color_type: sugarloaf::ColorType::Rgba,
+            is_opaque: true,
+            display_width: None,
+            display_height: None,
+            resize: None,
+            transmit_time: std::time::Instant::now(),
+        };
+        cw.insert_graphic(graphic, None, None);
+
+        let band = |cw: &Crosswords<VoidListener>, row: i32, col: usize| {
+            let cell = &cw.grid[Line(row)][Column(col)];
+            if !cell.has_graphics() || cell.is_bg_only() {
+                return None;
+            }
+            cell.extras_id()
+                .and_then(|eid| cw.grid.extras_table.get(eid))
+                .and_then(|e| e.graphic.as_ref())
+                .and_then(|g| g.first())
+                .map(|g| g.offset_y)
+        };
+
+        // Shrink 20 -> 15 columns: bands stay in place, clipped.
+        let mut s = CrosswordsSize::new(15, 10);
+        s.width = 150;
+        s.height = 100;
+        s.square_width = 10;
+        s.square_height = 10;
+        cw.resize(s);
+        for row in 0..4 {
+            assert_eq!(band(&cw, row, 0), Some((row as usize * 10) as u16));
+            assert_eq!(band(&cw, row, 14), Some((row as usize * 10) as u16));
+        }
+        assert_eq!(band(&cw, 4, 0), None, "no duplicated band below");
+
+        // Grow back 15 -> 20: the clipped columns are re-covered from
+        // the shared slot (the texture kept the pixels), restoring the
+        // full picture instead of leaving it cropped.
+        let mut s = CrosswordsSize::new(20, 10);
+        s.width = 200;
+        s.height = 100;
+        s.square_width = 10;
+        s.square_height = 10;
+        cw.resize(s);
+        for row in 0..4 {
+            assert_eq!(band(&cw, row, 0), Some((row as usize * 10) as u16));
+            assert_eq!(
+                band(&cw, row, 19),
+                Some((row as usize * 10) as u16),
+                "clipped cells recover on grow"
+            );
+        }
+        // Growing past the image never over-covers.
+        let mut s = CrosswordsSize::new(30, 10);
+        s.width = 300;
+        s.height = 100;
+        s.square_width = 10;
+        s.square_height = 10;
+        cw.resize(s);
+        for row in 0..4 {
+            assert_eq!(band(&cw, row, 19), Some((row as usize * 10) as u16));
+            assert_eq!(band(&cw, row, 20), None, "no cells beyond the image");
+        }
+    }
+
+    /// Wrapped text reflowing toward an image row must not be prepended
+    /// into it (that would shift the image off its anchor column); the
+    /// leftover cells get their own line above the image instead.
+    #[test]
+    fn text_reflow_spills_above_graphic_row() {
+        let size = CrosswordsSize::new(20, 10);
+        let window_id = crate::event::WindowId::from(0);
+        let mut cw = Crosswords::new(
+            size,
+            CursorShape::Block,
+            VoidListener {},
+            window_id,
+            0,
+            10_000,
+        );
+        cw.graphics.cell_width = 10.0;
+        cw.graphics.cell_height = 10.0;
+        let mut processor = crate::performer::handler::Processor::default();
+
+        // 25 chars: row 0 full (wrapline set), row 1 holds 5.
+        processor.advance(&mut cw, "a".repeat(25).as_bytes());
+        // Image over row 1: 20x10 px = 2 cols x 1 row at the cursor col,
+        // moved to col 0 first.
+        processor.advance(&mut cw, b"\r");
+        let graphic = GraphicData {
+            id: sugarloaf::GraphicId::new(0),
+            width: 20,
+            height: 10,
+            pixels: vec![0u8; 20 * 10 * 4],
+            color_type: sugarloaf::ColorType::Rgba,
+            is_opaque: true,
+            display_width: None,
+            display_height: None,
+            resize: None,
+            transmit_time: std::time::Instant::now(),
+        };
+        cw.insert_graphic(graphic, None, None);
+        assert!(cw.grid[Line(1)][Column(0)].has_graphics());
+
+        // Shrink: row 0's wrapped tail must NOT prepend into the image
+        // row — it spills onto its own line, and the image keeps its
+        // anchor column.
+        let mut s = CrosswordsSize::new(15, 10);
+        s.width = 150;
+        s.height = 100;
+        s.square_width = 10;
+        s.square_height = 10;
+        cw.resize(s);
+
+        let image_row = (0..10)
+            .find(|r| cw.grid[Line(*r)][Column(0)].has_graphics())
+            .expect("image row survives the resize");
+        assert!(
+            cw.grid[Line(image_row)][Column(1)].has_graphics(),
+            "image intact at its anchor"
+        );
+        assert!(
+            image_row >= 1,
+            "spilled text sits above the image, not inside it"
+        );
+        let spill_row = image_row - 1;
+        assert_eq!(cw.grid[Line(spill_row)][Column(0)].c(), 'a');
+        assert!(!cw.grid[Line(spill_row)][Column(0)].has_graphics());
+    }
+
     /// A sixel stream ending in a Graphics New Line (`-` before ST, the
     /// way chafa and img2sixel terminate) leaves the text cursor on the
     /// row below the image, so a shell prompt printed right after the

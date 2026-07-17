@@ -9,7 +9,70 @@ use crate::crosswords::Row;
 use std::cmp::{max, min, Ordering};
 use std::mem;
 
+/// True when the row anchors an inline image (sixel/iTerm2). Such rows
+/// must not reflow on a column change: every covered cell of one image
+/// row shares a single extras slot whose x offsets derive from the
+/// anchor column, so wrapping the cells onto another row paints the
+/// same band twice at the wrong position. The row is clipped to the
+/// new width instead, like a non-reflowing terminal.
+fn row_has_graphics(row: &Row<Square>) -> bool {
+    if !row.has_extras {
+        return false;
+    }
+    (0..row.len()).any(|i| {
+        let cell = &row[Column(i)];
+        cell.has_graphics() && !cell.is_bg_only()
+    })
+}
+
 impl Grid<Square> {
+    /// Re-cover an image row's freshly grown columns. A column shrink
+    /// clips an image row's covered cells, but the pixels live in the
+    /// texture and every covered cell of one image row shares a single
+    /// extras slot — so the clipped cells are fully reconstructible
+    /// from the slot's anchor and texture width. Growing back restores
+    /// the picture instead of leaving it cropped.
+    fn recover_graphic_cells(&mut self, row: &mut Row<Square>, from: usize, to: usize) {
+        use crate::crosswords::square::CellFlags;
+        if !row.has_extras || from == 0 {
+            return;
+        }
+        let mut spans: Vec<(crate::crosswords::square::ExtrasId, usize)> = Vec::new();
+        for i in 0..from {
+            let cell = &row[Column(i)];
+            if !cell.has_graphics() || cell.is_bg_only() {
+                continue;
+            }
+            let Some(eid) = cell.extras_id() else {
+                continue;
+            };
+            if spans.iter().any(|(e, _)| *e == eid) {
+                continue;
+            }
+            let Some(g) = self
+                .extras_table
+                .get(eid)
+                .and_then(|e| e.graphic.as_ref())
+                .and_then(|g| g.first())
+            else {
+                continue;
+            };
+            let cell_w = g.texture.cell_width.max(1);
+            let span_end =
+                g.anchor_col as usize + (g.texture.width as usize).div_ceil(cell_w);
+            if span_end > from {
+                spans.push((eid, span_end));
+            }
+        }
+        for (eid, span_end) in spans {
+            for col in from..to.min(span_end) {
+                let cell = &mut row[Column(col)];
+                cell.set_extras_id(Some(eid));
+                cell.insert_cell_flag(CellFlags::GRAPHICS);
+            }
+        }
+    }
+
     /// Resize the grid's width and/or height.
     pub fn resize(&mut self, reflow: bool, lines: usize, columns: usize) {
         // Use empty template cell for resetting cells due to resize.
@@ -109,9 +172,16 @@ impl Grid<Square> {
         let mut rows = self.raw.take_all();
 
         for (i, mut row) in rows.drain(..).enumerate().rev() {
-            // Check if reflowing should be performed.
+            // Check if reflowing should be performed. An image row is a
+            // barrier: cells are neither pulled from it nor into it.
             let last_row = match reversed.last_mut() {
-                Some(last_row) if should_reflow(last_row) => last_row,
+                Some(last_row)
+                    if should_reflow(last_row)
+                        && !row_has_graphics(&row)
+                        && !row_has_graphics(last_row) =>
+                {
+                    last_row
+                }
                 _ => {
                     reversed.push(row);
                     continue;
@@ -220,7 +290,9 @@ impl Grid<Square> {
         let mut new_raw = Vec::with_capacity(reversed.len());
         for mut row in reversed.drain(..).rev() {
             if row.len() < columns {
+                let covered = row.len();
                 row.grow(columns);
+                self.recover_graphic_cells(&mut row, covered, columns);
             }
             new_raw.push(row);
         }
@@ -248,14 +320,40 @@ impl Grid<Square> {
         for (i, mut row) in rows.drain(..).enumerate().rev() {
             // Append lines left over from the previous row.
             if let Some(buffered) = buffered.take() {
-                // Add a column for every cell added before the cursor, if it goes beyond the new
-                // width it is then later reflown.
-                let cursor_buffer_line = self.lines - self.cursor.pos.row.0 as usize - 1;
-                if i == cursor_buffer_line {
-                    self.cursor.pos.col += buffered.len();
-                }
+                if row_has_graphics(&row) {
+                    // Wrapped text must not flow into an image row —
+                    // prepending would shift the image cells off their
+                    // anchor column. Give the leftover cells their own
+                    // line above instead.
+                    let occ = buffered.len();
+                    let mut spill = Row::from_vec(buffered, occ);
+                    if spill.len() < columns {
+                        spill.grow(columns);
+                    }
+                    new_raw.push(spill);
+                    if i < self.display_offset {
+                        self.display_offset += 1;
+                    }
+                } else {
+                    // Add a column for every cell added before the cursor, if it goes beyond the new
+                    // width it is then later reflown.
+                    let cursor_buffer_line =
+                        self.lines - self.cursor.pos.row.0 as usize - 1;
+                    if i == cursor_buffer_line {
+                        self.cursor.pos.col += buffered.len();
+                    }
 
-                row.append_front(buffered);
+                    row.append_front(buffered);
+                }
+            }
+
+            // An image row never reflows: clip it to the new width and
+            // keep it whole. The clipped cells' extras slots are
+            // reclaimed by the next gc_extras sweep.
+            if row_has_graphics(&row) {
+                let _ = row.shrink(columns);
+                new_raw.push(row);
+                continue;
             }
 
             loop {
