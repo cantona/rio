@@ -647,3 +647,83 @@ fn test_split_inside_resized_panel_preserves_proportions() {
         "Bottom (bottom half) should be ~400px tall, got {bottom_h}"
     );
 }
+
+/// Nested-split capture ordering: pane A, split right (A|C), focus A,
+/// split down (A over B), focus B. Depth-first the saved leaves are
+/// [A, B, C] while the visual (y, x) order is [A, C, B] — an ordinal
+/// carried from one order into the other lands on the wrong pane,
+/// which is why session restore reselects the active leaf by its live
+/// node id rather than by index.
+#[test]
+fn nested_split_active_pane_capture() {
+    use crate::context::{create_mock_context, ContextDimension};
+    use crate::session::{LayoutNode, PaneState};
+    use rio_backend::event::VoidListener;
+    use rio_window::window::WindowId;
+
+    let dims = TextDimensions {
+        scale: 1.,
+        width: 18.,
+        height: 9.,
+    };
+    let make_ctx = |id: usize| {
+        let dim = ContextDimension::build(
+            1200.0,
+            800.0,
+            dims,
+            cell_for(dims),
+            1.0,
+            14.0,
+            Margin::default(),
+        );
+        create_mock_context(VoidListener {}, WindowId::from(0), id, dim)
+    };
+
+    let mut grid = ContextGrid::new(
+        make_ctx(0),
+        Margin::default(),
+        [0.0; 4],
+        [0.0; 4],
+        rio_backend::config::layout::Panel::default(),
+    );
+    let a = grid.current;
+    let c = grid.try_split_right().unwrap();
+    grid.inner.insert(c, ContextGridItem::new(make_ctx(1)));
+    grid.current = a;
+    let b = grid.try_split_down().unwrap();
+    grid.inner.insert(b, ContextGridItem::new(make_ctx(2)));
+    grid.current = b;
+    grid.calculate_positions();
+
+    let layout = grid.to_layout_node(&mut |_, is_active| PaneState {
+        cwd: None,
+        title: None,
+        is_active,
+        scrollback: String::new(),
+        pane_id: None,
+        socket: None,
+        host: None,
+    });
+
+    fn active_dfs_index(node: &LayoutNode, next: &mut usize) -> Option<usize> {
+        match node {
+            LayoutNode::Leaf(p) => {
+                let idx = *next;
+                *next += 1;
+                p.is_active.then_some(idx)
+            }
+            LayoutNode::Split { children, .. } => children
+                .iter()
+                .find_map(|(_, child)| active_dfs_index(child, next)),
+        }
+    }
+    let mut counter = 0;
+    let idx = active_dfs_index(&layout, &mut counter).expect("one leaf is active");
+    assert_eq!(idx, 1, "the focused pane is the second leaf depth-first");
+
+    // The same ordinal in visual order is a different pane: selecting
+    // by index would focus C, not the saved-active B.
+    let visual = grid.get_ordered_keys();
+    assert_eq!(visual[idx], c);
+    assert_ne!(visual[idx], b);
+}

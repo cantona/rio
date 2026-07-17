@@ -1260,12 +1260,14 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         &self.contexts
     }
 
-    /// Select the current grid's pane by visual order index. Used by
-    /// session restore to reselect the saved active pane.
-    pub fn select_pane_by_order(&mut self, index: usize) {
+    /// Select a pane of the current grid by its live node id. Used by
+    /// session restore to reselect the saved active pane; selecting by
+    /// identity instead of ordinal keeps it correct for nested splits,
+    /// where visual (y, x) order and the saved tree's depth-first
+    /// order disagree.
+    pub fn select_pane_node(&mut self, node: taffy::NodeId) {
         let grid = &mut self.contexts[self.current_index];
-        if let Some(&node) = grid.get_ordered_keys().get(index) {
-            grid.set_current(node);
+        if grid.set_current(node) {
             self.current_route = grid.current().route_id;
         }
     }

@@ -98,13 +98,19 @@ impl PaneState {
 
 impl LayoutNode {
     /// True when the tree is structurally usable: every `Split` has at
-    /// least one child. A hand-edited / corrupt file with an empty
-    /// `Split` would otherwise panic in `first_leaf`'s `children[0]`.
+    /// least one child, and every child weight is finite and positive.
+    /// A hand-edited / corrupt file with an empty `Split` would
+    /// otherwise panic in `first_leaf`'s `children[0]`, and a NaN /
+    /// infinite / non-positive weight flows straight into taffy
+    /// `flex_grow`, degenerating the pane rects.
     fn well_formed(&self) -> bool {
         match self {
             LayoutNode::Leaf(_) => true,
             LayoutNode::Split { children, .. } => {
-                !children.is_empty() && children.iter().all(|(_, c)| c.well_formed())
+                !children.is_empty()
+                    && children
+                        .iter()
+                        .all(|(w, c)| w.is_finite() && *w > 0.0 && c.well_formed())
             }
         }
     }
@@ -137,6 +143,11 @@ impl SessionState {
     /// Per-pane scrollback is truncated to this many bytes on load so a
     /// tampered file can't replay an unbounded stream into a terminal.
     const MAX_PANE_SCROLLBACK_BYTES: usize = 8 * 1024 * 1024;
+    /// Every leaf spawns a shell (or daemon attach) on restore; a
+    /// tampered file with thousands of leaves would fork-bomb an
+    /// `always` launch. Far above any real window, so exceeding it
+    /// means the file is not worth restoring at all.
+    const MAX_WINDOW_PANES: usize = 256;
 
     pub fn load(path: &Path) -> Option<SessionState> {
         // Bound the read before allocating: an oversized file is
@@ -150,8 +161,9 @@ impl SessionState {
         if state.version != SESSION_VERSION || state.windows.is_empty() {
             return None;
         }
-        // Reject a structurally-broken tree (an empty Split) rather
-        // than panic later in first_leaf on a corrupt/hostile file.
+        // Reject a structurally-broken tree (an empty Split, a
+        // non-finite or non-positive weight) rather than panic later in
+        // first_leaf or hand taffy degenerate ratios.
         let all_ok = state
             .windows
             .iter()
@@ -159,6 +171,14 @@ impl SessionState {
             .all(|t| t.layout.well_formed());
         if !all_ok {
             tracing::warn!("session: discarding file with a malformed layout tree");
+            return None;
+        }
+        let flood = state.windows.iter().any(|w| {
+            w.tabs.iter().map(|t| t.layout.leaf_count()).sum::<usize>()
+                > Self::MAX_WINDOW_PANES
+        });
+        if flood {
+            tracing::warn!("session: discarding file with too many panes per window");
             return None;
         }
         // Cap per-pane scrollback so a tampered file can't replay an
@@ -192,9 +212,23 @@ impl SessionState {
         }
     }
 
+    /// Write via a sibling temp file renamed over the target: the
+    /// rename is atomic on one filesystem, so a crash mid-write or a
+    /// concurrent instance never leaves a truncated file — which
+    /// `load` would reject, losing the whole session and with it the
+    /// only handle on its detached daemons. Concurrent writers still
+    /// race whole files (last one wins), but each lands intact. The
+    /// pid suffix keeps two instances off the same temp path.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let bytes = serde_json::to_vec(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, bytes)
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(format!(".tmp.{}", std::process::id()));
+        let tmp = std::path::PathBuf::from(tmp);
+        std::fs::write(&tmp, bytes)
+            .and_then(|()| std::fs::rename(&tmp, path))
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            })
     }
 
     pub fn discard(path: &Path) {
@@ -261,13 +295,27 @@ pub fn write_on_quit(
     }
 }
 
+/// How a save's carry-forward merge verifies candidate daemons.
+/// Probing costs one blocking socket connect per not-reattached pane
+/// on the UI thread; autosave fires on every tab/split change, so it
+/// assumes instead. A stale carry is self-healing: the next probed
+/// save (close/quit/explicit) drops it, and restoring a dead daemon
+/// falls back to a fresh spawn with the saved scrollback.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DaemonCheck {
+    /// Connect to each candidate's socket; carry only the live ones.
+    Probe,
+    /// Carry every candidate; used by autosave.
+    AssumeAlive,
+}
+
 /// Assemble captured windows into a session and persist it to `path`,
 /// carrying forward any still-live daemon the old file referenced but no
 /// captured window reattached (so overwriting never orphans a daemon).
 /// The session-write policy — every caller that has gathered a window
 /// list routes through here rather than re-implementing assemble +
 /// merge + write. No-op on an empty list.
-pub fn write_windows(path: &Path, windows: Vec<WindowState>) {
+pub fn write_windows(path: &Path, windows: Vec<WindowState>, check: DaemonCheck) {
     if windows.is_empty() {
         return;
     }
@@ -277,7 +325,9 @@ pub fn write_windows(path: &Path, windows: Vec<WindowState>) {
         windows,
     };
     #[cfg(unix)]
-    merge_kept_daemons(&mut state, path);
+    merge_kept_daemons(&mut state, path, check);
+    #[cfg(not(unix))]
+    let _ = check;
     if let Err(err) = state.save(path) {
         tracing::warn!("session save failed: {err}");
     }
@@ -318,11 +368,12 @@ impl<K: Eq + std::hash::Hash + Copy> SavedWindows<K> {
         path: &Path,
         captured: I,
         preferred: Option<K>,
+        check: DaemonCheck,
     ) where
         I: IntoIterator<Item = (K, WindowState)>,
     {
         let windows = self.accumulate(path, captured, preferred);
-        write_windows(path, windows);
+        write_windows(path, windows, check);
     }
 
     /// Record `captured` for `path` (replacing same-key entries) and
@@ -365,7 +416,9 @@ impl<K: Eq + std::hash::Hash + Copy> SavedWindows<K> {
         I: IntoIterator<Item = (K, WindowState)>,
     {
         let windows = self.replace(path, captured, preferred);
-        write_windows(path, windows);
+        // Explicit snapshots are rare user actions; always probe so
+        // the written file never carries a dead daemon.
+        write_windows(path, windows, DaemonCheck::Probe);
     }
 
     /// Drop everything recorded for `path` this run. Used when the
@@ -562,13 +615,20 @@ fn pane_ids(state: &SessionState) -> std::collections::HashSet<String> {
 }
 
 /// True when a single leaf still points at a live local daemon this
-/// session did not reattach.
+/// session did not reattach; `AssumeAlive` trusts every candidate
+/// instead of probing its socket.
 #[cfg(unix)]
-fn leaf_alive(p: &PaneState, already: &std::collections::HashSet<String>) -> bool {
+fn leaf_alive(
+    p: &PaneState,
+    already: &std::collections::HashSet<String>,
+    check: DaemonCheck,
+) -> bool {
     let (Some(id), Some(sock)) = (&p.pane_id, &p.socket) else {
         return false;
     };
-    p.host.is_none() && !already.contains(id) && daemon_alive(sock)
+    p.host.is_none()
+        && !already.contains(id)
+        && (check == DaemonCheck::AssumeAlive || daemon_alive(sock))
 }
 
 /// True when an entire tab is worth carrying forward: every leaf points
@@ -582,12 +642,15 @@ fn leaf_alive(p: &PaneState, already: &std::collections::HashSet<String>) -> boo
 fn tab_is_fully_live(
     node: &LayoutNode,
     already: &std::collections::HashSet<String>,
+    check: DaemonCheck,
 ) -> bool {
     match node {
-        LayoutNode::Leaf(p) => leaf_alive(p, already),
+        LayoutNode::Leaf(p) => leaf_alive(p, already, check),
         LayoutNode::Split { children, .. } => {
             !children.is_empty()
-                && children.iter().all(|(_, c)| tab_is_fully_live(c, already))
+                && children
+                    .iter()
+                    .all(|(_, c)| tab_is_fully_live(c, already, check))
         }
     }
 }
@@ -600,17 +663,18 @@ fn tab_is_fully_live(
 fn collect_live_leaves<'a>(
     node: &'a LayoutNode,
     already: &std::collections::HashSet<String>,
+    check: DaemonCheck,
     out: &mut Vec<&'a PaneState>,
 ) {
     match node {
         LayoutNode::Leaf(p) => {
-            if leaf_alive(p, already) {
+            if leaf_alive(p, already, check) {
                 out.push(p);
             }
         }
         LayoutNode::Split { children, .. } => {
             for (_, c) in children {
-                collect_live_leaves(c, already, out);
+                collect_live_leaves(c, already, check, out);
             }
         }
     }
@@ -630,7 +694,11 @@ fn collect_live_leaves<'a>(
 /// surviving leaves is carried as its own single-pane tab — dropping
 /// them would strand their live daemons. Dead daemons are dropped.
 #[cfg(unix)]
-pub fn merge_kept_daemons(new_state: &mut SessionState, old_path: &Path) {
+pub fn merge_kept_daemons(
+    new_state: &mut SessionState,
+    old_path: &Path,
+    check: DaemonCheck,
+) {
     let Some(old) = SessionState::load(old_path) else {
         return;
     };
@@ -638,13 +706,13 @@ pub fn merge_kept_daemons(new_state: &mut SessionState, old_path: &Path) {
     let mut kept: Vec<TabState> = Vec::new();
     for w in old.windows {
         for tab in w.tabs {
-            if tab_is_fully_live(&tab.layout, &already) {
+            if tab_is_fully_live(&tab.layout, &already, check) {
                 kept.push(tab);
             } else {
                 // Rescue the still-live leaves of a partially-dead
                 // split as standalone single-pane tabs.
                 let mut live = Vec::new();
-                collect_live_leaves(&tab.layout, &already, &mut live);
+                collect_live_leaves(&tab.layout, &already, check, &mut live);
                 for pane in live {
                     kept.push(TabState {
                         custom_title: None,
@@ -791,24 +859,33 @@ pub fn restore_tab_layout<T: EventListener + Clone + Send + 'static>(
     layout: &LayoutNode,
     sugarloaf: &mut rio_backend::sugarloaf::Sugarloaf,
 ) {
-    build_node(ctx_manager, layout, sugarloaf);
+    let active = build_node(ctx_manager, layout, sugarloaf);
     ctx_manager.current_grid_mut().apply_layout_weights(layout);
-    // A skipped (failed) split leaf shifts every later leaf's ordinal,
-    // so the saved active index would land on the wrong pane. Only
-    // reselect when the live tree matches the saved one; weights above
-    // carry their own equivalent guard.
-    if ctx_manager.current_grid().len() == layout.leaf_count() {
-        restore_active_pane(ctx_manager, layout);
+    // The saved active leaf is reselected by the live node id captured
+    // while it was built, never by ordinal: the saved tree counts
+    // leaves depth-first while pane navigation orders them visually
+    // (y, then x), and the two disagree for nested splits. When the
+    // active leaf's split failed there is nothing to select and the
+    // build's last pane stays current.
+    if let Some(node) = active {
+        ctx_manager.select_pane_node(node);
     }
 }
 
+/// Returns the live node of the leaf flagged `is_active`, when its
+/// pane was built.
 fn build_node<T: EventListener + Clone + Send + 'static>(
     ctx_manager: &mut ContextManager<T>,
     layout: &LayoutNode,
     sugarloaf: &mut rio_backend::sugarloaf::Sugarloaf,
-) {
+) -> Option<taffy::NodeId> {
     match layout {
-        LayoutNode::Leaf(pane) => inject_scrollback(ctx_manager, pane),
+        LayoutNode::Leaf(pane) => {
+            inject_scrollback(ctx_manager, pane);
+            // `current` is this leaf's pane: the caller selected it
+            // before recursing (or it is the tab's base pane).
+            pane.is_active.then(|| ctx_manager.current_grid().current)
+        }
         LayoutNode::Split {
             direction,
             children,
@@ -827,13 +904,17 @@ fn build_node<T: EventListener + Clone + Send + 'static>(
                 );
                 leaves.push(created.then(|| ctx_manager.current_grid().current));
             }
+            let mut active = None;
             for (i, (_, child)) in children.iter().enumerate() {
                 // A failed split has no leaf; restoring its subtree
                 // would land in whichever pane is still current.
                 let Some(leaf) = leaves[i] else { continue };
                 ctx_manager.current_grid_mut().set_current(leaf);
-                build_node(ctx_manager, child, sugarloaf);
+                if let Some(node) = build_node(ctx_manager, child, sugarloaf) {
+                    active = Some(node);
+                }
             }
+            active
         }
     }
 }
@@ -867,30 +948,6 @@ fn inject_scrollback<T: EventListener + Clone + Send + 'static>(
     terminal.suppress_replies = true;
     processor.advance(&mut *terminal, pane.scrollback.as_bytes());
     terminal.suppress_replies = prev_suppress;
-}
-
-fn restore_active_pane<T: EventListener + Clone + Send + 'static>(
-    ctx_manager: &mut ContextManager<T>,
-    layout: &LayoutNode,
-) {
-    // Leaves were built depth-first in the same order to_layout_node
-    // walks them, so re-walk and select the one flagged active.
-    fn find_active_index(node: &LayoutNode, next: &mut usize) -> Option<usize> {
-        match node {
-            LayoutNode::Leaf(p) => {
-                let idx = *next;
-                *next += 1;
-                p.is_active.then_some(idx)
-            }
-            LayoutNode::Split { children, .. } => children
-                .iter()
-                .find_map(|(_, c)| find_active_index(c, next)),
-        }
-    }
-    let mut counter = 0;
-    if let Some(idx) = find_active_index(layout, &mut counter) {
-        ctx_manager.select_pane_by_order(idx);
-    }
 }
 
 #[cfg(test)]
@@ -1049,6 +1106,102 @@ mod close_disposition_tests {
         // Nothing writes nothing, consent or not.
         assert!(!w(false, SessionRestore::Never, false));
         assert!(!w(false, SessionRestore::Never, true));
+    }
+}
+
+#[cfg(test)]
+mod load_validation_tests {
+    use super::{
+        LayoutNode, PaneState, SessionState, SplitDir, TabState, WindowState,
+        SESSION_VERSION,
+    };
+    use std::path::PathBuf;
+
+    fn leaf() -> LayoutNode {
+        LayoutNode::Leaf(PaneState {
+            cwd: None,
+            title: None,
+            is_active: true,
+            scrollback: String::new(),
+            pane_id: None,
+            socket: None,
+            host: None,
+        })
+    }
+
+    fn state_with_tabs(tabs: Vec<TabState>) -> SessionState {
+        SessionState {
+            version: SESSION_VERSION,
+            windows: vec![WindowState {
+                tabs,
+                active_tab: 0,
+                size: (0, 0),
+                position: None,
+            }],
+        }
+    }
+
+    fn tmp_file(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "rio-session-test-{}-{name}.json",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn save_load_round_trip() {
+        let state = state_with_tabs(vec![TabState {
+            custom_title: None,
+            layout: LayoutNode::Split {
+                direction: SplitDir::Horizontal,
+                children: vec![(0.25, leaf()), (0.75, leaf())],
+            },
+        }]);
+        let path = tmp_file("round-trip");
+        state.save(&path).unwrap();
+        let loaded = SessionState::load(&path).expect("valid file loads");
+        assert_eq!(loaded.windows[0].tabs[0].layout.leaf_count(), 2);
+        SessionState::discard(&path);
+    }
+
+    #[test]
+    fn load_rejects_bad_weights() {
+        // -1 and 0 deserialize fine; 1e999 either fails to parse or
+        // lands as infinity — all four must reject the file.
+        for (name, weight) in [("neg", "-1.0"), ("zero", "0.0"), ("inf", "1e999")] {
+            let json = format!(
+                concat!(
+                    r#"{{"version":2,"windows":[{{"active_tab":0,"tabs":[{{"custom_title":null,"#,
+                    r#""layout":{{"Split":{{"direction":"Horizontal","children":["#,
+                    r#"[{},{{"Leaf":{{"cwd":null,"title":null,"is_active":true,"scrollback":""}}}}],"#,
+                    r#"[1.0,{{"Leaf":{{"cwd":null,"title":null,"is_active":false,"scrollback":""}}}}]"#,
+                    r#"]}}}}}}]}}]}}"#
+                ),
+                weight
+            );
+            let path = tmp_file(name);
+            std::fs::write(&path, json).unwrap();
+            assert!(
+                SessionState::load(&path).is_none(),
+                "weight {weight} must reject the file"
+            );
+            SessionState::discard(&path);
+        }
+    }
+
+    #[test]
+    fn load_rejects_pane_flood() {
+        let tabs: Vec<TabState> = (0..=SessionState::MAX_WINDOW_PANES)
+            .map(|_| TabState {
+                custom_title: None,
+                layout: leaf(),
+            })
+            .collect();
+        let state = state_with_tabs(tabs);
+        let path = tmp_file("flood");
+        state.save(&path).unwrap();
+        assert!(SessionState::load(&path).is_none());
+        SessionState::discard(&path);
     }
 }
 

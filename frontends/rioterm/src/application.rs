@@ -168,7 +168,7 @@ impl Application<'_> {
     /// old file referenced but no live window reattached.
     fn save_last_session(&mut self, focused: Option<WindowId>) {
         let path = rio_backend::config::session_file_path();
-        self.persist_session(&path, None, focused);
+        self.persist_session(&path, None, focused, crate::session::DaemonCheck::Probe);
     }
 
     /// Capture every currently-open window matching `filter`, keyed by
@@ -178,16 +178,20 @@ impl Application<'_> {
     /// stay recorded there, so a multi-window session persisted across
     /// several closes/quit is never shrunk to the still-open subset.
     /// `preferred` is written first so restore lands it in the launch
-    /// route.
+    /// route. `check` picks whether the carry-forward merge probes
+    /// candidate daemons: final saves (close/quit) probe, autosave
+    /// assumes — it runs on every structural change and must not
+    /// block the UI thread on per-pane socket connects.
     fn persist_session(
         &mut self,
         path: &std::path::Path,
         filter: Option<&str>,
         preferred: Option<WindowId>,
+        check: crate::session::DaemonCheck,
     ) {
         let captured = self.capture_by_id(filter);
         self.saved_windows
-            .accumulate_and_write(path, captured, preferred);
+            .accumulate_and_write(path, captured, preferred, check);
     }
 
     /// Snapshot exactly the currently-open windows matching `filter` to
@@ -219,7 +223,11 @@ impl Application<'_> {
         self.router
             .routes
             .iter()
-            .filter(|(_, route)| matches(route.session_name.as_deref()))
+            // Ephemeral windows (the settings editor) are tooling, not
+            // workspace: saving one would restore it as a junk shell.
+            .filter(|(_, route)| {
+                !route.ephemeral && matches(route.session_name.as_deref())
+            })
             .map(|(id, route)| {
                 (
                     *id,
@@ -278,7 +286,12 @@ impl Application<'_> {
                 .find(|(_, r)| r.session_name.as_deref() == Some(name.as_str()))
                 .map(|(id, _)| *id);
             let path = rio_backend::config::session_named_path(&name);
-            self.persist_session(&path, Some(&name), focused);
+            self.persist_session(
+                &path,
+                Some(&name),
+                focused,
+                crate::session::DaemonCheck::Probe,
+            );
         }
     }
 
@@ -415,6 +428,16 @@ impl Application<'_> {
     fn prompt_or_save_on_close(&mut self, window_id: WindowId) -> bool {
         use crate::renderer::session_prompt::SessionPromptKind;
         use crate::session::CloseDisposition;
+        // An ephemeral window is never captured, so there is nothing
+        // to save or ask about when it closes.
+        if self
+            .router
+            .routes
+            .get(&window_id)
+            .is_some_and(|r| r.ephemeral)
+        {
+            return false;
+        }
         let named = self
             .router
             .routes
@@ -459,7 +482,12 @@ impl Application<'_> {
             ),
             None => (rio_backend::config::session_file_path(), None),
         };
-        self.persist_session(&path, filter.as_deref(), Some(window_id));
+        self.persist_session(
+            &path,
+            filter.as_deref(),
+            Some(window_id),
+            crate::session::DaemonCheck::Probe,
+        );
     }
 
     /// Remove a window and exit the loop if it was the last one. Detaches
@@ -1005,7 +1033,12 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 if explicit {
                     self.snapshot_open_windows(&path, filter, window_id);
                 } else {
-                    self.persist_session(&path, filter, Some(window_id));
+                    self.persist_session(
+                        &path,
+                        filter,
+                        Some(window_id),
+                        crate::session::DaemonCheck::AssumeAlive,
+                    );
                 }
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
                     route

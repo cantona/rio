@@ -454,8 +454,15 @@ impl Screen<'_> {
         // Preserve existing Island (tab state) and update its colors
         let old_island = self.renderer.island.take();
         let was_focused = self.renderer.is_window_focused;
+        // The session prompt is live conversation state, not derived
+        // from config: dropping it across a hot-reload would leave a
+        // window whose pending save/resume question can never be
+        // answered (dead shell with no overlay, stranded
+        // pending_session).
+        let session_prompt = std::mem::take(&mut self.renderer.session_prompt);
         self.renderer = Renderer::new(config);
         self.renderer.is_window_focused = was_focused;
+        self.renderer.session_prompt = session_prompt;
         if let Some(mut island) = old_island {
             island.update_colors(config.colors.tabs, config.colors.tabs_active);
             island.title_font_size = config.navigation.tab_font_size;

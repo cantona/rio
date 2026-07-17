@@ -42,6 +42,11 @@ pub struct Route<'a> {
     /// quit-prompts target `sessions/<name>.json` instead of the
     /// implicit last-session slot.
     pub session_name: Option<String>,
+    /// Transient tooling window (the config editor), not part of the
+    /// user's workspace: session capture skips it, and closing it
+    /// never saves or prompts — otherwise an `always` save would
+    /// restore it next launch as a junk plain-shell window.
+    pub ephemeral: bool,
 }
 
 impl Route<'_> {
@@ -58,6 +63,7 @@ impl Route<'_> {
             window,
             pending_session: None,
             session_name: None,
+            ephemeral: false,
         }
     }
 }
@@ -184,8 +190,13 @@ impl Route<'_> {
         // Carry forward any still-alive daemons the old file recorded
         // that this session didn't reattach, so overwriting the file
         // never orphans them (and "new + keep old" stays resumable).
+        // A rare, user-triggered save: probing is affordable here.
         #[cfg(unix)]
-        crate::session::merge_kept_daemons(&mut state, &path);
+        crate::session::merge_kept_daemons(
+            &mut state,
+            &path,
+            crate::session::DaemonCheck::Probe,
+        );
         if let Err(err) = state.save(&path) {
             tracing::warn!("session save failed: {err}");
         }
@@ -1082,7 +1093,8 @@ impl Router<'_> {
             None,
         );
         let id = window.winit_window.id();
-        let route = Route::new(Assistant::new(), RoutePath::Terminal, window);
+        let mut route = Route::new(Assistant::new(), RoutePath::Terminal, window);
+        route.ephemeral = true;
         self.routes.insert(id, route);
         self.config_route = Some(id);
     }
@@ -1154,6 +1166,7 @@ impl Router<'_> {
             assistant: Assistant::new(),
             pending_session: None,
             session_name,
+            ephemeral: false,
         };
 
         if let Some(err) = &self.propagated_report {
@@ -1193,6 +1206,7 @@ impl Router<'_> {
                 assistant: Assistant::new(),
                 pending_session: None,
                 session_name: None,
+                ephemeral: false,
             },
         );
     }
