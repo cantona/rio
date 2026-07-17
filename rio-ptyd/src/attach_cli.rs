@@ -2,12 +2,19 @@
 //! (dumb byte relay for remote transports like ssh).
 
 use std::io::{self, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 use crate::protocol::{self, Decoder, FrameType};
 use crate::sockdir;
+
+/// Backpressure watermark for the --stdio relay buffers: past this,
+/// stop reading the producing fd until the consumer drains. Both
+/// stdin and stdout can be non-blocking (they usually share one
+/// open-file description), so without a cap a flow-stopped consumer
+/// lets the other side grow the buffer without bound.
+const RELAY_BUF_CAP: usize = 1 << 20;
 
 pub fn resolve_socket(target: &str) -> io::Result<PathBuf> {
     if target.ends_with(".sock") && Path::new(target).exists() {
@@ -44,14 +51,17 @@ pub fn attach_stdio(target: &str) -> io::Result<i32> {
         let mut fds = [
             pollfd(
                 stdin_fd,
-                if stdin_open && to_sock.len() < 1 << 20 {
+                if stdin_open && to_sock.len() < RELAY_BUF_CAP {
                     libc::POLLIN
                 } else {
                     0
                 },
             ),
             pollfd(sfd, {
-                let mut e = libc::POLLIN;
+                let mut e = 0;
+                if to_stdout.len() < RELAY_BUF_CAP {
+                    e |= libc::POLLIN;
+                }
                 if !to_sock.is_empty() {
                     e |= libc::POLLOUT;
                 }
@@ -71,7 +81,9 @@ pub fn attach_stdio(target: &str) -> io::Result<i32> {
             return Err(io::Error::last_os_error());
         }
 
-        if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+        if to_sock.len() < RELAY_BUF_CAP
+            && fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0
+        {
             match read_fd(stdin_fd, &mut to_sock) {
                 Ok(0) => stdin_open = false, // ssh closed our stdin
                 Ok(_) => {}
@@ -82,7 +94,11 @@ pub fn attach_stdio(target: &str) -> io::Result<i32> {
         if fds[1].revents & libc::POLLOUT != 0 {
             write_drain(sfd, &mut to_sock)?;
         }
-        if fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+        // POLLHUP is reported even with no read interest, so the cap
+        // has to gate the read itself, not just the poll events.
+        if to_stdout.len() < RELAY_BUF_CAP
+            && fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0
+        {
             match read_fd(sfd, &mut to_stdout) {
                 Ok(0) => {
                     // daemon gone: flush what we have and stop
@@ -100,6 +116,19 @@ pub fn attach_stdio(target: &str) -> io::Result<i32> {
         if !stdin_open && to_sock.is_empty() {
             // Upstream is gone and everything is flushed: detach.
             return Ok(0);
+        }
+    }
+}
+
+static mut WINCH_PIPE_W: RawFd = -1;
+
+/// Self-pipe: only async-signal-safe work here; the poll loop does
+/// the actual TIOCGWINSZ + Resize frame.
+extern "C" fn winch_handler(_sig: libc::c_int) {
+    unsafe {
+        if WINCH_PIPE_W >= 0 {
+            let b = [0u8; 1];
+            libc::write(WINCH_PIPE_W, b.as_ptr() as *const _, 1);
         }
     }
 }
@@ -128,9 +157,32 @@ pub fn attach_interactive(target: &str, no_replay: bool) -> io::Result<i32> {
         )?;
     }
 
+    let mut sp = [0i32; 2];
+    if unsafe { libc::pipe(sp.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let (winch_r, winch_w) =
+        unsafe { (OwnedFd::from_raw_fd(sp[0]), OwnedFd::from_raw_fd(sp[1])) };
+    set_nonblocking(winch_r.as_raw_fd())?;
+    set_nonblocking(winch_w.as_raw_fd())?;
+    unsafe {
+        WINCH_PIPE_W = winch_w.as_raw_fd();
+        libc::signal(
+            libc::SIGWINCH,
+            winch_handler as *const () as libc::sighandler_t,
+        );
+    }
+
     let raw = RawTty::enable()?;
-    let result = interactive_loop(&mut stream);
+    let result = interactive_loop(&mut stream, winch_r.as_raw_fd());
     drop(raw);
+    // Disarm the handler before its pipe fds close below.
+    unsafe {
+        libc::signal(libc::SIGWINCH, libc::SIG_DFL);
+        WINCH_PIPE_W = -1;
+    }
+    drop(winch_w);
+    drop(winch_r);
     // Undo any terminal modes the replayed stream switched on — the
     // pane's application state (mouse, alt screen, paste, keypad)
     // must not leak into the console we return to.
@@ -150,7 +202,7 @@ pub fn attach_interactive(target: &str, no_replay: bool) -> io::Result<i32> {
     result.map(|c| c.max(0))
 }
 
-fn interactive_loop(stream: &mut UnixStream) -> io::Result<i32> {
+fn interactive_loop(stream: &mut UnixStream, winch_fd: RawFd) -> io::Result<i32> {
     stream.set_nonblocking(true)?;
     // stdin stays BLOCKING: fds 0/1/2 usually share one tty open-file
     // description, so O_NONBLOCK on stdin would poison stdout writes
@@ -172,6 +224,7 @@ fn interactive_loop(stream: &mut UnixStream) -> io::Result<i32> {
                 }
                 e
             }),
+            pollfd(winch_fd, libc::POLLIN),
         ];
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
         if n < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
@@ -222,18 +275,28 @@ fn interactive_loop(stream: &mut UnixStream) -> io::Result<i32> {
                         queue_frame(&mut pending_out, FrameType::Stdin, &forward);
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                    // Possibly SIGWINCH via poll EINTR: resend size.
-                    if let Some((rows, cols)) = tty_size() {
-                        queue_frame(
-                            &mut pending_out,
-                            FrameType::Resize,
-                            &protocol::encode_resize(rows, cols, 0, 0),
-                        );
-                    }
-                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(e) => return Err(e),
+            }
+        }
+
+        if fds[2].revents & libc::POLLIN != 0 {
+            // Drain every queued wakeup so a burst of SIGWINCHes
+            // (interactive drag-resize) collapses into one Resize.
+            let mut b = [0u8; 64];
+            loop {
+                match read_raw(winch_fd, &mut b) {
+                    Ok(n) if n > 0 => {}
+                    _ => break,
+                }
+            }
+            if let Some((rows, cols)) = tty_size() {
+                queue_frame(
+                    &mut pending_out,
+                    FrameType::Resize,
+                    &protocol::encode_resize(rows, cols, 0, 0),
+                );
             }
         }
 

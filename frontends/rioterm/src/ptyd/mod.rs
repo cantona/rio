@@ -856,18 +856,11 @@ impl RemotePty {
     }
 }
 
-/// Pull "cwd":"..." out of the ServerHello meta json without a full
-/// parse. Returns None for null/absent.
+/// Pull "cwd" out of the ServerHello meta json. Returns None for
+/// null/absent/malformed meta.
 fn parse_hello_cwd(meta: &str) -> Option<String> {
-    let key = "\"cwd\":";
-    let i = meta.find(key)? + key.len();
-    let rest = meta[i..].trim_start();
-    if rest.starts_with("null") {
-        return None;
-    }
-    let rest = rest.strip_prefix('"')?;
-    let end = rest.find('"')?;
-    Some(rest[..end].replace("\\\"", "\"").replace("\\\\", "\\"))
+    let v: serde_json::Value = serde_json::from_str(meta).ok()?;
+    Some(v.get("cwd")?.as_str()?.to_string())
 }
 
 pub fn ptyd_binary() -> PathBuf {
@@ -1023,6 +1016,35 @@ fn parse_remote_pane_list(json: &str) -> Result<Vec<(String, String)>, String> {
         panes.push((pane_id.to_string(), format!("{program}  {cwd}  {state}")));
     }
     Ok(panes)
+}
+
+#[cfg(test)]
+mod hello_meta_tests {
+    use super::parse_hello_cwd;
+
+    #[test]
+    fn cwd_honors_json_string_escapes() {
+        assert_eq!(
+            parse_hello_cwd(r#"{"pane_id":"x","program":"sh","cwd":"/tmp/a\"b"}"#)
+                .as_deref(),
+            Some("/tmp/a\"b")
+        );
+        assert_eq!(
+            parse_hello_cwd(r#"{"cwd":"/tmp/a\\b"}"#).as_deref(),
+            Some("/tmp/a\\b")
+        );
+        assert_eq!(
+            parse_hello_cwd(r#"{"cwd":"/plain"}"#).as_deref(),
+            Some("/plain")
+        );
+    }
+
+    #[test]
+    fn cwd_null_absent_or_garbage_is_none() {
+        assert_eq!(parse_hello_cwd(r#"{"cwd":null}"#), None);
+        assert_eq!(parse_hello_cwd(r#"{"pane_id":"x"}"#), None);
+        assert_eq!(parse_hello_cwd("not json"), None);
+    }
 }
 
 #[cfg(test)]
