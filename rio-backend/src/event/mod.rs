@@ -152,8 +152,9 @@ pub enum RioEvent {
     CloseWindow,
     /// Close this window after its save-on-exit prompt was answered.
     /// The bool is the answer: `true` = save (the app does the all-windows
-    /// save before closing), `false` = discard (already handled). Never
-    /// re-runs the prompt logic, so an answer can't loop.
+    /// save before closing), `false` = discard (the app reaps the whole
+    /// saved slot — file and daemons — before closing). Never re-runs the
+    /// prompt logic, so an answer can't loop.
     CloseWindowConfirmed(bool),
     CreateNativeTab(Option<String>),
     CreateConfigEditor,
@@ -249,6 +250,13 @@ pub enum RioEvent {
     /// Quit confirmed by the "want to quit?" prompt. Runs the save + exit
     /// path directly, bypassing the confirm check that Quit re-triggers.
     QuitConfirmed,
+
+    /// The quit-time save prompt was answered. The bool is the answer:
+    /// `true` saves every Prompt-disposition session before exiting,
+    /// `false` discards them (files and daemons). Either way the whole
+    /// process exits — a quit covers every window, unlike
+    /// `CloseWindowConfirmed` which closes only the answering one.
+    QuitSaveAnswered(bool),
 
     /// Save the current session to disk (tabs/splits/CWDs/scrollback).
     /// `explicit` distinguishes a user "save now" (mirror the currently
@@ -365,6 +373,7 @@ impl Debug for RioEvent {
             RioEvent::Exit => write!(f, "Exit"),
             RioEvent::Quit => write!(f, "Quit"),
             RioEvent::QuitConfirmed => write!(f, "QuitConfirmed"),
+            RioEvent::QuitSaveAnswered(_) => write!(f, "QuitSaveAnswered"),
             RioEvent::SaveSession { .. } => write!(f, "SaveSession"),
             RioEvent::ClearSessionNotice => write!(f, "ClearSessionNotice"),
             RioEvent::CloseButtonArmed => write!(f, "CloseButtonArmed"),

@@ -244,6 +244,23 @@ pub fn close_disposition(
     }
 }
 
+/// Whether a quit/exit tail may write the session covering `named`
+/// windows without further interaction. `consented` carries the quit
+/// prompt's yes-answer when one was shown: Prompt-disposition sessions
+/// write only with it — a file whose mode promised to ask is never
+/// silently overwritten.
+pub fn write_on_quit(
+    named: bool,
+    mode: rio_backend::config::session::SessionRestore,
+    consented: bool,
+) -> bool {
+    match close_disposition(named, mode) {
+        CloseDisposition::Save => true,
+        CloseDisposition::Prompt => consented,
+        CloseDisposition::Nothing => false,
+    }
+}
+
 /// Assemble captured windows into a session and persist it to `path`,
 /// carrying forward any still-live daemon the old file referenced but no
 /// captured window reattached (so overwriting never orphans a daemon).
@@ -351,6 +368,14 @@ impl<K: Eq + std::hash::Hash + Copy> SavedWindows<K> {
         write_windows(path, windows);
     }
 
+    /// Drop everything recorded for `path` this run. Used when the
+    /// session is declined ("don't save"): a later save through the
+    /// accumulator must not resurrect windows whose daemons the
+    /// decline just killed.
+    pub fn forget(&mut self, path: &Path) {
+        self.per_file.remove(path);
+    }
+
     /// The pure part of `replace_and_write`: forget everything recorded
     /// for `path` this run, then record and return `captured` alone.
     fn replace<I>(
@@ -409,36 +434,80 @@ pub fn kill_persistent_panes<T: EventListener + Clone + Send + 'static>(
     }
 }
 
-/// Synchronously kill every LOCAL daemon named in a saved session,
-/// unlinking its socket. Used when the user declines a resume with
-/// "start new + discard old": the daemons were never restored into any
-/// context, so the only handle on them is the session file's saved
-/// sockets. Remote (ssh-hosted) panes are left alone — their lifecycle
-/// belongs to the other machine. Walk every tab's layout tree.
+/// Sockets a saved-session discard must kill: every LOCAL daemon the
+/// state references except those in `spare`. Remote (ssh-hosted) panes
+/// never qualify — their lifecycle belongs to the other machine. Split
+/// from the kill so target selection is testable without live daemons.
 #[cfg(unix)]
-pub fn kill_saved_session_daemons(state: &SessionState) {
-    fn kill_leaf(pane: &PaneState) {
-        if pane.host.is_some() {
-            return;
-        }
-        let Some(socket) = &pane.socket else {
-            return;
-        };
-        context::kill_local_daemon(std::path::Path::new(socket));
-    }
-    fn walk(node: &LayoutNode) {
+fn saved_session_kill_targets<'a>(
+    state: &'a SessionState,
+    spare: &std::collections::HashSet<String>,
+) -> Vec<&'a str> {
+    fn walk<'a>(
+        node: &'a LayoutNode,
+        spare: &std::collections::HashSet<String>,
+        out: &mut Vec<&'a str>,
+    ) {
         match node {
-            LayoutNode::Leaf(pane) => kill_leaf(pane),
+            LayoutNode::Leaf(pane) => {
+                if pane.host.is_some() {
+                    return;
+                }
+                let Some(socket) = &pane.socket else {
+                    return;
+                };
+                if !spare.contains(socket) {
+                    out.push(socket);
+                }
+            }
             LayoutNode::Split { children, .. } => {
                 for (_, c) in children {
-                    walk(c);
+                    walk(c, spare, out);
                 }
             }
         }
     }
+    let mut out = Vec::new();
     for win in &state.windows {
         for tab in &win.tabs {
-            walk(&tab.layout);
+            walk(&tab.layout, spare, &mut out);
+        }
+    }
+    out
+}
+
+/// Synchronously kill every LOCAL daemon named in a saved session,
+/// unlinking its socket. Used when the user discards a saved session
+/// (declined resume, declined save-on-close): the file may hold the
+/// only handle on daemons whose windows are long closed. Daemons whose
+/// socket is in `spare` are left alone — they are attached to a window
+/// that stays open, and that window's own close will decide their fate.
+#[cfg(unix)]
+pub fn kill_saved_session_daemons(
+    state: &SessionState,
+    spare: &std::collections::HashSet<String>,
+) {
+    for socket in saved_session_kill_targets(state, spare) {
+        context::kill_local_daemon(std::path::Path::new(socket));
+    }
+}
+
+/// Collect the socket paths of a window's local ptyd panes into `out`.
+/// Used to spare a still-open window's daemons when a shared session
+/// file it appears in is discarded.
+#[cfg(unix)]
+pub fn live_local_sockets<T: EventListener + Clone + Send + 'static>(
+    ctx_manager: &ContextManager<T>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    for grid in ctx_manager.grids() {
+        for item in grid.contexts().values() {
+            if let context::PaneBackend::Ptyd {
+                socket, host: None, ..
+            } = &item.val.backend
+            {
+                out.insert(socket.to_string_lossy().into_owned());
+            }
         }
     }
 }
@@ -929,11 +998,24 @@ mod saved_windows_tests {
         assert_eq!(out.len(), 1);
         assert_eq!(pane_ids(&out[0]), vec!["b"]);
     }
+
+    // A declined session must not come back through the accumulator: a
+    // later save for the same path starts from scratch.
+    #[test]
+    fn forget_clears_accumulated_windows() {
+        let mut sw: SavedWindows<u32> = SavedWindows::new();
+        let path = Path::new("unused");
+        sw.accumulate(path, vec![(1u32, window(&["a"]))], Some(1));
+        sw.forget(path);
+        let out = sw.accumulate(path, vec![(2u32, window(&["b"]))], Some(2));
+        assert_eq!(out.len(), 1);
+        assert_eq!(pane_ids(&out[0]), vec!["b"]);
+    }
 }
 
 #[cfg(test)]
 mod close_disposition_tests {
-    use super::{close_disposition, CloseDisposition};
+    use super::{close_disposition, write_on_quit, CloseDisposition};
     use rio_backend::config::session::SessionRestore;
 
     #[test]
@@ -948,5 +1030,81 @@ mod close_disposition_tests {
         assert_eq!(d(false, SessionRestore::Never), CloseDisposition::Nothing);
         assert_eq!(d(false, SessionRestore::Prompt), CloseDisposition::Prompt);
         assert_eq!(d(false, SessionRestore::Always), CloseDisposition::Save);
+    }
+
+    #[test]
+    fn quit_write_gate() {
+        // Prompt-disposition sessions write only with the quit prompt's
+        // consent; in particular a named file under Never/Prompt is
+        // never overwritten by a silent quit/exit tail.
+        let w = write_on_quit;
+        assert!(!w(true, SessionRestore::Never, false));
+        assert!(w(true, SessionRestore::Never, true));
+        assert!(!w(true, SessionRestore::Prompt, false));
+        assert!(w(true, SessionRestore::Prompt, true));
+        assert!(w(true, SessionRestore::Always, false));
+        assert!(!w(false, SessionRestore::Prompt, false));
+        assert!(w(false, SessionRestore::Prompt, true));
+        assert!(w(false, SessionRestore::Always, false));
+        // Nothing writes nothing, consent or not.
+        assert!(!w(false, SessionRestore::Never, false));
+        assert!(!w(false, SessionRestore::Never, true));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod kill_target_tests {
+    use super::{
+        saved_session_kill_targets, LayoutNode, PaneState, SessionState, SplitDir,
+        TabState, WindowState, SESSION_VERSION,
+    };
+
+    fn pane(socket: Option<&str>, host: Option<&str>) -> PaneState {
+        PaneState {
+            cwd: None,
+            title: None,
+            is_active: true,
+            scrollback: String::new(),
+            pane_id: Some("p".into()),
+            socket: socket.map(str::to_string),
+            host: host.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn spares_live_windows_and_remote_panes() {
+        let state = SessionState {
+            version: SESSION_VERSION,
+            windows: vec![WindowState {
+                tabs: vec![
+                    TabState {
+                        custom_title: None,
+                        layout: LayoutNode::Split {
+                            direction: SplitDir::Horizontal,
+                            children: vec![
+                                (1.0, LayoutNode::Leaf(pane(Some("/s/dead"), None))),
+                                (1.0, LayoutNode::Leaf(pane(Some("/s/live"), None))),
+                            ],
+                        },
+                    },
+                    TabState {
+                        custom_title: None,
+                        layout: LayoutNode::Leaf(pane(Some("/s/remote"), Some("host"))),
+                    },
+                    TabState {
+                        custom_title: None,
+                        layout: LayoutNode::Leaf(pane(None, None)),
+                    },
+                ],
+                active_tab: 0,
+                size: (0, 0),
+                position: None,
+            }],
+        };
+        let spare = std::collections::HashSet::from(["/s/live".to_string()]);
+        // Only the local, unspared socket is a kill target: the spared
+        // one belongs to a still-open window, the remote one to another
+        // machine, and a socketless pane has nothing to kill.
+        assert_eq!(saved_session_kill_targets(&state, &spare), vec!["/s/dead"]);
     }
 }

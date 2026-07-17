@@ -7,9 +7,13 @@ const RESUME_CHOICES: &str = "resume (r)  /  new+discard old (n)  /  new+keep ol
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum SessionPromptKind {
-    /// Quit-time "save session?" (restore = "prompt"). Declining
-    /// discards the session and kills any v2 daemons.
+    /// Close-time "save session?" for ONE window. Declining discards
+    /// the window's session slot and kills its v2 daemons.
     SaveOnExit,
+    /// Quit-time "save session?": the answer covers every
+    /// Prompt-disposition session in the process, then the app exits —
+    /// a quit must take all windows down, not just the answering one.
+    SaveOnQuit,
     /// Launch-time "resume last session?" (restore = "prompt").
     ResumeOnLaunch,
 }
@@ -54,7 +58,7 @@ impl SessionPrompt {
             return;
         };
         let (heading, choices) = match kind {
-            SessionPromptKind::SaveOnExit => {
+            SessionPromptKind::SaveOnExit | SessionPromptKind::SaveOnQuit => {
                 ("save session?", format!("{CONFIRM}  /  {DISMISS}"))
             }
             SessionPromptKind::ResumeOnLaunch => {
