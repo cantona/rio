@@ -827,10 +827,12 @@ impl Route<'_> {
                     {
                         // Consent given. The app-side handler does the
                         // all-windows save (this overlay can't reach the
-                        // other routes) and closes just this window.
+                        // other routes) and closes just this window. The
+                        // kill-vs-detach choice belongs to that handler
+                        // (it knows how the close started); setting the
+                        // detach flag here would pre-empt it and leave a
+                        // kill-close's daemons alive.
                         self.window.screen.renderer.session_prompt.set_active(None);
-                        #[cfg(unix)]
-                        crate::context::set_quit_detaching();
                         let ctx = self.window.screen.ctx();
                         ctx.event_proxy().send_event(
                             rio_backend::event::RioEventType::Rio(
@@ -884,30 +886,19 @@ impl Route<'_> {
                             || c.as_str() == "Y" =>
                     {
                         self.window.screen.renderer.session_prompt.set_active(None);
-                        if let Some(state) = self.pending_session.take() {
-                            // Accepted limitation: if another rio instance
-                            // is still attached to these daemons, the
-                            // reattach evicts its clients — the daemon
-                            // serves one client, and completing a
-                            // ClientHello IS the eviction. Nothing in the
-                            // meta file or ServerHello says "already has a
-                            // client", so detecting this cheaply needs a
-                            // protocol addition. Single-instance resume is
-                            // unaffected.
-                            let (leftover, restored) = self.restore_session(state);
-                            // Re-save so the file references the daemons
-                            // we just reattached rather than the ones the
-                            // window replaced; a crash before quit would
-                            // otherwise orphan them. This overlay has no
-                            // event loop, so extra saved windows can't be
-                            // opened here — keep the file (do not discard)
-                            // so their daemons stay resumable next launch.
-                            // With nothing restored (transient spawn
-                            // failure) the file stays intact too, or the
-                            // re-save would shrink it to the default tab.
-                            if restored && leftover.is_empty() {
-                                self.save_session();
-                            }
+                        // The overlay has no event loop, so it cannot
+                        // reopen the session's other windows; hand the
+                        // restore to the application, which runs the
+                        // same multi-window path always mode uses.
+                        // `pending_session` stays stashed for it.
+                        if self.pending_session.is_some() {
+                            let ctx = self.window.screen.ctx();
+                            ctx.event_proxy().send_event(
+                                rio_backend::event::RioEventType::Rio(
+                                    rio_backend::event::RioEvent::ResumeSessionAnswered,
+                                ),
+                                ctx.window_id(),
+                            );
                         }
                         self.request_overlay_redraw();
                     }

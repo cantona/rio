@@ -135,6 +135,28 @@ pub(crate) fn kill_local_daemon(socket: &std::path::Path) {
             &p::encode_client_hello(),
         );
         let _ = p::write_frame(&mut stream, p::FrameType::Kill, &[]);
+        // Wait (bounded) for the daemon to actually die: drain until it
+        // closes this connection, then until the socket is unlinked. A
+        // save that runs right after a close probes the socket to decide
+        // which daemons to carry forward — probing a daemon that is
+        // mid-cleanup reads "alive" and resurrects the killed panes as
+        // rescued tabs. Deliberate closes are rare, the daemon reacts in
+        // milliseconds, and both waits are capped so a wedged daemon
+        // can't hang the UI.
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let mut sink = [0u8; 256];
+        loop {
+            match std::io::Read::read(&mut stream, &mut sink) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        for _ in 0..40 {
+            if !socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 
@@ -1068,9 +1090,11 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     /// so a crash — which runs no clean-exit save — still leaves a
     /// current session. No-op in `prompt` mode: that mode never saves
     /// without the user's yes. Structural changes are rare user
-    /// actions, so the extra write is not on any hot path. Not explicit:
-    /// the save must accumulate, so a window closed earlier this run
-    /// survives a later change in an unrelated window.
+    /// actions, so the extra write is not on any hot path. The save
+    /// mirrors the open windows: a structural change proves the run
+    /// continued past any earlier window close, so a window the user
+    /// killed (exit, close-tab) drops out of the session instead of
+    /// resurrecting on resume.
     #[inline]
     pub fn autosave_on_change(&mut self) {
         if self.config.autosave {

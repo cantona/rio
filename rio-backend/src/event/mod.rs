@@ -156,6 +156,11 @@ pub enum RioEvent {
     /// saved slot — file and daemons — before closing). Never re-runs the
     /// prompt logic, so an answer can't loop.
     CloseWindowConfirmed(bool),
+    /// The launch resume prompt was answered "resume". Handled by the
+    /// application, which has the event loop needed to reopen every
+    /// saved window — the answering overlay can only restore into its
+    /// own window.
+    ResumeSessionAnswered,
     CreateNativeTab(Option<String>),
     CreateConfigEditor,
     SelectNativeTabByIndex(usize),
@@ -385,6 +390,7 @@ impl Debug for RioEvent {
             RioEvent::CreateWindow => write!(f, "CreateWindow"),
             RioEvent::CloseWindow => write!(f, "CloseWindow"),
             RioEvent::CloseWindowConfirmed(_) => write!(f, "CloseWindowConfirmed"),
+            RioEvent::ResumeSessionAnswered => write!(f, "ResumeSessionAnswered"),
             RioEvent::CreateNativeTab(_) => write!(f, "CreateNativeTab"),
             RioEvent::SelectNativeTabByIndex(tab_index) => {
                 write!(f, "SelectNativeTabByIndex({tab_index})")

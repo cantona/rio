@@ -350,13 +350,29 @@ pub struct SavedWindows<K: Eq + std::hash::Hash> {
         std::path::PathBuf,
         std::collections::HashMap<K, WindowState>,
     >,
+    /// Windows that must survive mirror saves after they close: a
+    /// close-tab on a window with a running process keeps it resumable
+    /// (daemons detached), so the pruning autosave that follows the
+    /// close must not drop it. Explicit save-now clears the pins — the
+    /// user asked for the file to mirror what is open.
+    pinned: std::collections::HashMap<std::path::PathBuf, std::collections::HashSet<K>>,
 }
 
 impl<K: Eq + std::hash::Hash + Copy> SavedWindows<K> {
     pub fn new() -> Self {
         SavedWindows {
             per_file: std::collections::HashMap::new(),
+            pinned: std::collections::HashMap::new(),
         }
+    }
+
+    /// Keep `key`'s recorded window across mirror saves of `path` even
+    /// once it is no longer open.
+    pub fn pin(&mut self, path: &Path, key: K) {
+        self.pinned
+            .entry(path.to_path_buf())
+            .or_default()
+            .insert(key);
     }
 
     /// Record `captured` (key, window) pairs for `path`, replacing any
@@ -411,14 +427,25 @@ impl<K: Eq + std::hash::Hash + Copy> SavedWindows<K> {
     /// write it. Used by explicit "save now" actions (Ctrl+Shift+S,
     /// Save As), where the saved file should mirror the windows currently
     /// open, not resurrect ones closed earlier this run.
-    pub fn replace_and_write<I>(&mut self, path: &Path, captured: I, preferred: Option<K>)
-    where
+    pub fn replace_and_write<I>(
+        &mut self,
+        path: &Path,
+        captured: I,
+        preferred: Option<K>,
+        check: DaemonCheck,
+        keep_pinned: bool,
+    ) where
         I: IntoIterator<Item = (K, WindowState)>,
     {
-        let windows = self.replace(path, captured, preferred);
-        // Explicit snapshots are rare user actions; always probe so
-        // the written file never carries a dead daemon.
-        write_windows(path, windows, DaemonCheck::Probe);
+        let (windows, dropped) = self.replace(path, captured, preferred, keep_pinned);
+        // A shrunken capture means a window closed since the last
+        // write: its daemons were killed, and only a probe keeps the
+        // carry-forward merge from resurrecting them as rescued tabs
+        // (while still carrying another instance's live daemons). The
+        // escalation is rare — one probed write per close — so an
+        // AssumeAlive caller keeps its cheap steady state.
+        let check = if dropped { DaemonCheck::Probe } else { check };
+        write_windows(path, windows, check);
     }
 
     /// Drop everything recorded for `path` this run. Used when the
@@ -427,21 +454,46 @@ impl<K: Eq + std::hash::Hash + Copy> SavedWindows<K> {
     /// decline just killed.
     pub fn forget(&mut self, path: &Path) {
         self.per_file.remove(path);
+        self.pinned.remove(path);
     }
 
     /// The pure part of `replace_and_write`: forget everything recorded
-    /// for `path` this run, then record and return `captured` alone.
+    /// for `path` this run, then record and return `captured` — plus
+    /// any pinned windows, which stay resumable across mirrors (unless
+    /// `keep_pinned` is false, which also clears the pins). Also
+    /// reports whether the previous record held windows the new
+    /// capture no longer has — the signal that a window closed since
+    /// the last write of `path`.
     fn replace<I>(
         &mut self,
         path: &Path,
         captured: I,
         preferred: Option<K>,
-    ) -> Vec<WindowState>
+        keep_pinned: bool,
+    ) -> (Vec<WindowState>, bool)
     where
         I: IntoIterator<Item = (K, WindowState)>,
     {
-        self.per_file.remove(path);
-        self.accumulate(path, captured, preferred)
+        let previous = self.per_file.remove(path);
+        if !keep_pinned {
+            self.pinned.remove(path);
+        }
+        if let Some(old) = &previous {
+            if let Some(pins) = self.pinned.get(path) {
+                let acc = self.per_file.entry(path.to_path_buf()).or_default();
+                for (k, w) in old {
+                    if pins.contains(k) {
+                        acc.insert(*k, w.clone());
+                    }
+                }
+            }
+        }
+        let windows = self.accumulate(path, captured, preferred);
+        let dropped = previous.is_some_and(|old| {
+            let acc = self.per_file.entry(path.to_path_buf()).or_default();
+            old.keys().any(|k| !acc.contains_key(k))
+        });
+        (windows, dropped)
     }
 }
 
@@ -1050,10 +1102,40 @@ mod saved_windows_tests {
         let mut sw: SavedWindows<u32> = SavedWindows::new();
         let path = Path::new("unused");
         sw.accumulate(path, vec![(1u32, window(&["a"]))], Some(1));
-        // Explicit snapshot with only window 2 open forgets window 1.
-        let out = sw.replace(path, vec![(2u32, window(&["b"]))], Some(2));
+        // Mirror snapshot with only window 2 open forgets window 1 and
+        // reports the drop, so the write escalates to a daemon probe.
+        let (out, dropped) =
+            sw.replace(path, vec![(2u32, window(&["b"]))], Some(2), true);
         assert_eq!(out.len(), 1);
         assert_eq!(pane_ids(&out[0]), vec!["b"]);
+        assert!(dropped, "window 1 dropping out must be reported");
+
+        // Steady state: same window again, nothing dropped.
+        let (out, dropped) =
+            sw.replace(path, vec![(2u32, window(&["b"]))], Some(2), true);
+        assert_eq!(out.len(), 1);
+        assert!(!dropped, "no drop when the open set is unchanged");
+    }
+
+    /// A pinned window (closed while its shell still ran a program)
+    /// survives mirror saves; an explicit save-now clears the pin.
+    #[test]
+    fn pinned_window_survives_mirror_saves() {
+        let mut sw: SavedWindows<u32> = SavedWindows::new();
+        let path = Path::new("unused");
+        sw.accumulate(path, vec![(1u32, window(&["a"]))], Some(1));
+        sw.pin(path, 1);
+
+        let (out, _) = sw.replace(path, vec![(2u32, window(&["b"]))], Some(2), true);
+        assert_eq!(out.len(), 2, "pinned window 1 must survive the mirror");
+        assert!(out.iter().any(|w| pane_ids(w) == vec!["a"]));
+
+        // Explicit save-now: mirror exactly, dropping the pin for good.
+        let (out, _) = sw.replace(path, vec![(2u32, window(&["b"]))], Some(2), false);
+        assert_eq!(out.len(), 1);
+        assert_eq!(pane_ids(&out[0]), vec!["b"]);
+        let (out, _) = sw.replace(path, vec![(2u32, window(&["b"]))], Some(2), true);
+        assert_eq!(out.len(), 1, "pin stays cleared after the explicit save");
     }
 
     // A declined session must not come back through the accumulator: a

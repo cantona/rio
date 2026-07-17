@@ -41,6 +41,12 @@ pub struct Application<'a> {
     /// WindowId. The accumulation/ordering/write policy lives in
     /// `session::SavedWindows`; this only holds the state.
     saved_windows: crate::session::SavedWindows<WindowId>,
+    /// Daemon fate stashed while a SaveOnExit prompt is open: the close
+    /// kind (kill for exit/close-tab, keep for the WM close button or a
+    /// busy window) is decided where the close starts, but prompt mode
+    /// defers the teardown to the answer — this carries the decision
+    /// across so both modes tear down identically.
+    pending_close_keeps: rustc_hash::FxHashMap<WindowId, bool>,
 }
 
 impl Application<'_> {
@@ -94,6 +100,7 @@ impl Application<'_> {
             app_id,
             session_name,
             saved_windows: crate::session::SavedWindows::new(),
+            pending_close_keeps: rustc_hash::FxHashMap::default(),
         }
     }
 
@@ -163,7 +170,7 @@ impl Application<'_> {
     /// Capture every open UNNAMED window into the implicit last-session
     /// slot, focused window first so it restores into the launch route.
     /// A single per-window writer would drop all the other windows; this
-    /// is the accumulating writer for autosave, window close and quit.
+    /// is the accumulating writer for window close and quit.
     /// `merge_kept_daemons` carries forward any still-live daemon the
     /// old file referenced but no live window reattached.
     fn save_last_session(&mut self, focused: Option<WindowId>) {
@@ -175,13 +182,13 @@ impl Application<'_> {
     /// WindowId, and hand them to the session accumulator to write. The
     /// router walk is Application's job; the accumulate/order/write policy
     /// lives in `session::SavedWindows`. Windows closed earlier this run
-    /// stay recorded there, so a multi-window session persisted across
-    /// several closes/quit is never shrunk to the still-open subset.
-    /// `preferred` is written first so restore lands it in the launch
-    /// route. `check` picks whether the carry-forward merge probes
-    /// candidate daemons: final saves (close/quit) probe, autosave
-    /// assumes — it runs on every structural change and must not
-    /// block the UI thread on per-pane socket connects.
+    /// stay recorded there, so a multi-window quit — where each window's
+    /// close-save sees a shrinking open set — is never reduced to the
+    /// still-open subset. Used by the close and quit paths only; saves
+    /// driven by live user activity (explicit save, autosave) mirror the
+    /// open windows via `snapshot_open_windows` instead. `preferred` is
+    /// written first so restore lands it in the launch route. `check`
+    /// picks whether the carry-forward merge probes candidate daemons.
     fn persist_session(
         &mut self,
         path: &std::path::Path,
@@ -196,17 +203,45 @@ impl Application<'_> {
 
     /// Snapshot exactly the currently-open windows matching `filter` to
     /// `path`, discarding any windows this run's accumulator recorded for
-    /// it. For explicit "save now" actions where the file should mirror
-    /// what is open, not resurrect earlier-closed windows.
+    /// it. For explicit "save now" actions and autosave, where the file
+    /// should mirror what is open, not resurrect earlier-closed windows.
     fn snapshot_open_windows(
         &mut self,
         path: &std::path::Path,
         filter: Option<&str>,
         preferred: WindowId,
+        check: crate::session::DaemonCheck,
+        keep_pinned: bool,
     ) {
         let captured = self.capture_by_id(filter);
-        self.saved_windows
-            .replace_and_write(path, captured, Some(preferred));
+        self.saved_windows.replace_and_write(
+            path,
+            captured,
+            Some(preferred),
+            check,
+            keep_pinned,
+        );
+    }
+
+    /// True when any persistent pane of the window has a program in the
+    /// foreground of its shell. A remote pane counts as busy — its
+    /// foreground is not inspectable from here, and keeping it is the
+    /// safe default. Plain-local panes never count: their shell dies
+    /// with the window regardless, so there is nothing to preserve.
+    #[cfg(unix)]
+    fn window_has_running_process(route: &crate::router::Route) -> bool {
+        route.window.screen.ctx().grids().iter().any(|grid| {
+            grid.contexts()
+                .values()
+                .any(|item| match &item.val.backend {
+                    crate::context::PaneBackend::Ptyd { host: None, .. } => {
+                        rio_ptyd::sockdir::foreground_activity(item.val.shell_pid as i32)
+                            .is_some()
+                    }
+                    crate::context::PaneBackend::Ptyd { host: Some(_), .. } => true,
+                    crate::context::PaneBackend::Local => false,
+                })
+        })
     }
 
     /// Capture (WindowId, WindowState) for every open window matching
@@ -425,7 +460,7 @@ impl Application<'_> {
     /// (SaveOnExit handler) removes it. Returns false when the close may
     /// proceed immediately (saved silently in `always`/named, or nothing
     /// to save in `disable`).
-    fn prompt_or_save_on_close(&mut self, window_id: WindowId) -> bool {
+    fn prompt_or_save_on_close(&mut self, window_id: WindowId, keeps: bool) -> bool {
         use crate::renderer::session_prompt::SessionPromptKind;
         use crate::session::CloseDisposition;
         // An ephemeral window is never captured, so there is nothing
@@ -460,6 +495,7 @@ impl Application<'_> {
                         .session_prompt
                         .set_active(Some(SessionPromptKind::SaveOnExit));
                     route.request_overlay_redraw();
+                    self.pending_close_keeps.insert(window_id, keeps);
                     true
                 } else {
                     false
@@ -490,16 +526,68 @@ impl Application<'_> {
         );
     }
 
+    /// The one close sequence every path shares: tear the window down
+    /// with the kill-vs-detach choice, then — for a kill-close that is
+    /// allowed to write (silent mode, or the user just consented) —
+    /// mirror the surviving windows so the closed one drops out of its
+    /// slot. The kill in Context::drop waits for the daemons to die,
+    /// so the mirror's probe never reads a dying daemon as alive.
+    fn teardown_closed_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        keeps: bool,
+        consented: bool,
+    ) {
+        let named = self
+            .router
+            .routes
+            .get(&window_id)
+            .and_then(|r| r.session_name.clone());
+        self.close_window_now(event_loop, window_id, keeps);
+        if !keeps && (self.config.session.restore.enabled() || consented) {
+            let (path, filter) = match &named {
+                Some(name) => (
+                    rio_backend::config::session_named_path(name),
+                    Some(name.clone()),
+                ),
+                None => (rio_backend::config::session_file_path(), None),
+            };
+            self.snapshot_open_windows(
+                &path,
+                filter.as_deref(),
+                window_id,
+                crate::session::DaemonCheck::AssumeAlive,
+                true,
+            );
+        }
+    }
+
     /// Remove a window and exit the loop if it was the last one. Detaches
     /// its persistent panes (daemons survive) rather than killing them.
     /// The save/prompt decision already happened; this only tears down.
-    fn close_window_now(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId) {
+    fn close_window_now(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        keep_daemons: bool,
+    ) {
+        // Kill-vs-detach pairs with the session write: a close that
+        // stays in the session (WM close button, save-prompt yes)
+        // detaches so the next launch reattaches; a close that prunes
+        // the window from the session (exit, close-tab) kills, or the
+        // daemons would linger unreferenced and a probed save would
+        // carry them back as rescued tabs.
         #[cfg(unix)]
         {
-            if let Some(route) = self.router.routes.get_mut(&window_id) {
-                route.detach_on_close();
+            if keep_daemons {
+                if let Some(route) = self.router.routes.get_mut(&window_id) {
+                    route.detach_on_close();
+                }
             }
         }
+        #[cfg(not(unix))]
+        let _ = keep_daemons;
         self.router.routes.remove(&window_id);
         #[cfg(unix)]
         crate::context::clear_quit_detaching();
@@ -518,6 +606,38 @@ impl Application<'_> {
     /// re-save (always mode) so the implicit file references the live
     /// daemons across every window instead of the pre-restore ones.
     /// Returns whether any of them restored a tab.
+    /// The one multi-window restore both modes share: window[0] into
+    /// `window_id`'s route, every leftover saved window into a fresh OS
+    /// window, then one save so the file references the daemons the
+    /// session just reattached (skipped when nothing restored, so a
+    /// transient spawn failure leaves the file intact for a retry).
+    fn restore_full_session(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        state: crate::session::SessionState,
+    ) {
+        let (leftover, restored) = self
+            .router
+            .routes
+            .get_mut(&window_id)
+            .map(|route| route.restore_session(state))
+            .unwrap_or_default();
+        let had_extra = !leftover.is_empty();
+        let extra_restored = self.restore_extra_windows(event_loop, leftover);
+        if (restored && had_extra) || extra_restored {
+            let focused = self.router.get_focused_route();
+            self.save_last_session(focused);
+        } else if restored {
+            // Single saved window: re-save just it, referencing the
+            // reattached daemons (the always path does this inside
+            // restore_session; the prompt path defers it to here).
+            if let Some(route) = self.router.routes.get_mut(&window_id) {
+                route.save_session();
+            }
+        }
+    }
+
     fn restore_extra_windows(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -656,24 +776,8 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         &rio_backend::config::session_file_path(),
                     ) {
                         if mode == SessionRestore::Always {
-                            let (leftover, restored) = self
-                                .router
-                                .routes
-                                .values_mut()
-                                .next()
-                                .map(|route| route.restore_session(state))
-                                .unwrap_or_default();
-                            let had_extra = !leftover.is_empty();
-                            let extra_restored =
-                                self.restore_extra_windows(event_loop, leftover);
-                            // One write after every window is open so the
-                            // file references the whole live session —
-                            // unless nothing restored at all, in which
-                            // case the file stays intact for a retry
-                            // instead of shrinking to the default tabs.
-                            if had_extra && (restored || extra_restored) {
-                                let focused = self.router.get_focused_route();
-                                self.save_last_session(focused);
+                            if let Some(id) = self.router.routes.keys().next().copied() {
+                                self.restore_full_session(event_loop, id, state);
                             }
                         } else if let Some(route) = self.router.routes.values_mut().next()
                         {
@@ -1013,11 +1117,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             RioEventType::Rio(RioEvent::SaveSession { explicit }) => {
                 // Named or implicit, the session spans every window of
                 // this process: save them all so a multi-window
-                // workspace comes back whole. The trigger picks the
-                // policy: an explicit "save now" mirrors the currently
-                // open windows, while autosave-on-change accumulates so
-                // a window closed earlier this run isn't dropped when a
-                // surviving window changes.
+                // workspace comes back whole.
                 let named = self
                     .router
                     .routes
@@ -1030,14 +1130,29 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     ),
                     None => (rio_backend::config::session_file_path(), None),
                 };
+                // Both mirror the open windows: a window the user closed
+                // (exit, close-tab, close button) must drop out of the
+                // session on the next save, or resume resurrects it.
+                // Multi-window quit stays whole regardless — the close
+                // and quit paths accumulate, and no autosave fires
+                // between the teardowns of a quit. Explicit saves probe
+                // every daemon; autosave assumes (escalated to a probe
+                // inside replace_and_write when a window dropped out).
                 if explicit {
-                    self.snapshot_open_windows(&path, filter, window_id);
-                } else {
-                    self.persist_session(
+                    self.snapshot_open_windows(
                         &path,
                         filter,
-                        Some(window_id),
+                        window_id,
+                        crate::session::DaemonCheck::Probe,
+                        false,
+                    );
+                } else {
+                    self.snapshot_open_windows(
+                        &path,
+                        filter,
+                        window_id,
                         crate::session::DaemonCheck::AssumeAlive,
+                        true,
                     );
                 }
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
@@ -1069,7 +1184,13 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     .and_then(|route| route.bind_session_name(&name));
                 if let Some(name) = bound {
                     let path = rio_backend::config::session_named_path(&name);
-                    self.snapshot_open_windows(&path, Some(&name), window_id);
+                    self.snapshot_open_windows(
+                        &path,
+                        Some(&name),
+                        window_id,
+                        crate::session::DaemonCheck::Probe,
+                        false,
+                    );
                 }
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
                     route
@@ -1239,9 +1360,11 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         // context stays put so the prompt has a surface to
                         // render on, and CloseWindowConfirmed tears down
                         // the whole route once answered.
-                        if !self.prompt_or_save_on_close(window_id) {
+                        if !self.prompt_or_save_on_close(window_id, false) {
                             self.scheduler.unschedule_window(route_id);
-                            self.close_window_now(event_loop, window_id);
+                            self.teardown_closed_window(
+                                event_loop, window_id, false, false,
+                            );
                         }
                     } else if route
                         .window
@@ -1257,7 +1380,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         // concurrent teardown). Close without prompting
                         // rather than leave an empty live window.
                         self.scheduler.unschedule_window(route_id);
-                        self.close_window_now(event_loop, window_id);
+                        self.teardown_closed_window(event_loop, window_id, false, false);
                     } else {
                         let size = route.window.screen.context_manager.len();
                         route.window.screen.resize_top_or_bottom_line(size);
@@ -1708,9 +1831,46 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             RioEventType::Rio(RioEvent::CloseWindow) => {
                 // Save (always/named) or ask (prompt) before closing. If a
                 // prompt is shown, defer the close — its answer fires
-                // CloseWindowConfirmed. Otherwise close now.
-                if !self.prompt_or_save_on_close(window_id) {
-                    self.close_window_now(event_loop, window_id);
+                // CloseWindowConfirmed. Otherwise close now. A window
+                // whose shell still runs a program is kept resumable —
+                // daemons detach and the window is pinned so the pruning
+                // autosave that follows a tab-close keeps it in the file;
+                // an idle window is pruned and its daemons killed.
+                #[cfg(unix)]
+                let busy = self
+                    .router
+                    .routes
+                    .get(&window_id)
+                    .is_some_and(Self::window_has_running_process);
+                #[cfg(not(unix))]
+                let busy = false;
+                if busy {
+                    let path = match self
+                        .router
+                        .routes
+                        .get(&window_id)
+                        .and_then(|r| r.session_name.as_deref())
+                    {
+                        Some(name) => rio_backend::config::session_named_path(name),
+                        None => rio_backend::config::session_file_path(),
+                    };
+                    self.saved_windows.pin(&path, window_id);
+                }
+                if !self.prompt_or_save_on_close(window_id, busy) {
+                    self.teardown_closed_window(event_loop, window_id, busy, false);
+                }
+            }
+            RioEventType::Rio(RioEvent::ResumeSessionAnswered) => {
+                // The resume prompt's "r": run the identical restore
+                // always mode runs at launch — every saved window
+                // reopens, not just the one the prompt lived in.
+                if let Some(state) = self
+                    .router
+                    .routes
+                    .get_mut(&window_id)
+                    .and_then(|route| route.pending_session.take())
+                {
+                    self.restore_full_session(event_loop, window_id, state);
                 }
             }
             RioEventType::Rio(RioEvent::CloseWindowConfirmed(save)) => {
@@ -1726,16 +1886,30 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     .routes
                     .get(&window_id)
                     .and_then(|r| r.session_name.clone());
+                // The close kind stashed when the prompt was shown: a
+                // yes must tear down exactly like always mode would —
+                // a kill-close (exit, idle close-tab) saves the OTHER
+                // windows and kills this one's daemons; a keep-close
+                // (WM close, busy window) saves everything and
+                // detaches. Absent (stale event) defaults to keep.
+                let keeps = self.pending_close_keeps.remove(&window_id).unwrap_or(true);
                 if save {
+                    // Consent = do exactly what always mode does for
+                    // this close kind: close-save with the window still
+                    // present (a last-window close leaves the file
+                    // resumable), then the shared teardown — which for
+                    // a kill-close prunes the window from the file and
+                    // for a keep-close detaches its daemons.
                     self.save_session_now(window_id, named);
+                    self.teardown_closed_window(event_loop, window_id, keeps, true);
                 } else {
                     let path = match &named {
                         Some(name) => rio_backend::config::session_named_path(name),
                         None => rio_backend::config::session_file_path(),
                     };
                     self.decline_session(&path, &[window_id]);
+                    self.close_window_now(event_loop, window_id, true);
                 }
-                self.close_window_now(event_loop, window_id);
             }
             #[cfg(target_os = "macos")]
             RioEventType::Rio(RioEvent::SelectNativeTabByIndex(tab_index)) => {
@@ -1922,16 +2096,16 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 if cfg!(any(target_os = "macos", target_os = "windows")) {
                     // Save (always/named) or prompt (prompt mode); a
                     // shown prompt defers the close to its answer.
-                    if !self.prompt_or_save_on_close(window_id) {
-                        self.close_window_now(event_loop, window_id);
+                    if !self.prompt_or_save_on_close(window_id, true) {
+                        self.teardown_closed_window(event_loop, window_id, true, false);
                     }
                     return;
                 }
 
                 if self.config.confirm_before_quit {
                     route.confirm_quit();
-                } else if !self.prompt_or_save_on_close(window_id) {
-                    self.close_window_now(event_loop, window_id);
+                } else if !self.prompt_or_save_on_close(window_id, true) {
+                    self.teardown_closed_window(event_loop, window_id, true, false);
                 }
             }
 
