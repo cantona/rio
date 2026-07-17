@@ -111,9 +111,38 @@ pub fn spawn_shell(spec: &SpawnSpec) -> io::Result<PtyChild> {
                 libc::close(slave);
             }
             // Close everything else (listener socket, pipes, master).
-            let max_fd = libc::sysconf(libc::_SC_OPEN_MAX).max(1024) as i32;
-            for fd in 3..max_fd {
-                libc::close(fd);
+            // One syscall where the OS offers it: _SC_OPEN_MAX can be
+            // ~1e9 under container nofile defaults, making a per-fd
+            // close() sweep prohibitively slow. The sweep remains as
+            // the fallback (Linux < 5.9 returns ENOSYS). The raw
+            // syscall keeps this async-signal-safe and independent of
+            // the libc wrapper (absent on musl, needs glibc >= 2.34).
+            #[cfg(target_os = "linux")]
+            let swept =
+                libc::syscall(libc::SYS_close_range, 3, libc::c_uint::MAX, 0) == 0;
+            #[cfg(any(
+                target_os = "freebsd",
+                target_os = "dragonfly",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            ))]
+            let swept = {
+                libc::closefrom(3);
+                true
+            };
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "freebsd",
+                target_os = "dragonfly",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            )))]
+            let swept = false;
+            if !swept {
+                let max_fd = libc::sysconf(libc::_SC_OPEN_MAX).max(1024) as i32;
+                for fd in 3..max_fd {
+                    libc::close(fd);
+                }
             }
             // Default signal dispositions + clear mask.
             for sig in [

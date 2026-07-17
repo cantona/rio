@@ -342,8 +342,10 @@ struct Daemon {
 impl Daemon {
     fn run(mut self) -> i32 {
         let _ = self.listener.set_nonblocking(true);
+        let mut fds: Vec<libc::pollfd> = Vec::with_capacity(4 + MAX_PENDING);
+        let mut pending_re: Vec<libc::c_short> = Vec::with_capacity(MAX_PENDING);
         loop {
-            let mut fds: Vec<libc::pollfd> = Vec::with_capacity(4);
+            fds.clear();
             let listener_idx = fds.len();
             fds.push(pollfd(self.listener.as_raw_fd(), libc::POLLIN));
             let sig_idx = fds.len();
@@ -360,14 +362,18 @@ impl Daemon {
                 None
             };
 
+            // POLLIN is disarmed while pty_inbuf is over the cap:
+            // pump_client_in won't read then, and unread socket data
+            // would make level-triggered poll return instantly forever
+            // while a non-reading foreground never drains the pty.
+            // Hangup detection survives — POLLHUP/POLLERR are reported
+            // regardless of requested events, even with events == 0.
+            let inbuf_full = self.pty_inbuf.len() > PTY_INBUF_CAP;
             let client_idx = self.client.as_ref().map(|c| {
-                // POLLIN stays armed even under pty backpressure: we
-                // must still see a hangup (POLLHUP) and control frames
-                // (Kill/Detach). Backpressure is applied by NOT feeding
-                // Stdin to the pty while pty_inbuf is full — not by
-                // refusing to read the socket (which would strand a
-                // close and busy-spin on the level-triggered POLLHUP).
-                let mut ev = libc::POLLIN;
+                let mut ev: libc::c_short = 0;
+                if !inbuf_full {
+                    ev |= libc::POLLIN;
+                }
                 if c.outbuf_off < c.outbuf.len() {
                     ev |= libc::POLLOUT;
                 }
@@ -426,9 +432,9 @@ impl Daemon {
             // closed without a hello is dropped; one that completes its
             // ClientHello is promoted, replacing the live client only
             // then.
-            let pending_re: Vec<libc::c_short> = (0..self.pending.len())
-                .map(|i| revents(&fds, pending_base + i))
-                .collect();
+            pending_re.clear();
+            pending_re
+                .extend((0..self.pending.len()).map(|i| revents(&fds, pending_base + i)));
             self.pump_pending(&pending_re);
 
             if revents(&fds, listener_idx) & libc::POLLIN != 0 {
@@ -461,6 +467,16 @@ impl Daemon {
             if pid == self.meta.shell_pid {
                 let code = decode_wait_status(status);
                 self.shell_exit = Some(code);
+                // The kernel may still hold output written just before
+                // death, and the master leaves the poll set once
+                // shell_exit is set — drain it through the normal path
+                // (ring + client queue) now or the tail of the session
+                // is lost. Bounded: reads stop at EAGAIN/EIO and the
+                // ring caps memory.
+                self.pump_pty_out();
+                // Queued stdin has no consumer anymore; dropping it
+                // also releases the read gate keyed on pty_inbuf.
+                self.pty_inbuf.clear();
                 if let Some(c) = &mut self.client {
                     c.queue(FrameType::Exited, &code.to_le_bytes());
                     // Flush what we can; then shut down.
@@ -1014,4 +1030,84 @@ fn flush_blocking(c: &mut ClientConn) -> io::Result<()> {
     c.outbuf.clear();
     c.outbuf_off = 0;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Output the shell wrote right before exiting must survive into
+    /// the ring: the reap path drains the master itself, because the
+    /// master leaves the poll set once shell_exit is set.
+    #[test]
+    fn shell_exit_drains_final_pty_output_into_ring() {
+        let base = std::env::temp_dir()
+            .join(format!("rio-ptyd-drain-test-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let sock_path = base.join("test.sock");
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        let mut sp = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(sp.as_mut_ptr()) }, 0);
+        let (sig_r, _sig_w) =
+            unsafe { (OwnedFd::from_raw_fd(sp[0]), OwnedFd::from_raw_fd(sp[1])) };
+        pty::set_nonblocking(sig_r.as_raw_fd()).unwrap();
+
+        let child = pty::spawn_shell(&SpawnSpec {
+            program: "/bin/sh",
+            args: &["-c".into(), "printf bye".into()],
+            cwd: None,
+            env: &[],
+            rows: 25,
+            cols: 80,
+        })
+        .unwrap();
+        let shell_pid = child.shell_pid;
+
+        let pane_id = "0123456789abcdef0123456789abcdef".to_string();
+        let mut d = Daemon {
+            base: base.clone(),
+            pane_id: pane_id.clone(),
+            listener,
+            sig_r,
+            pty: child,
+            meta: PaneMeta {
+                version: sockdir::METADATA_VERSION,
+                pane_id,
+                daemon_pid: std::process::id() as i32,
+                shell_pid,
+                program: "/bin/sh".into(),
+                args: Vec::new(),
+                cwd: None,
+                created_at: sockdir::now_epoch(),
+                exited_status: None,
+                session: None,
+            },
+            ring: ReplayRing::new(64 * 1024),
+            client: None,
+            pending: Vec::new(),
+            pty_inbuf: Vec::new(),
+            shell_exit: None,
+            kill_requested: false,
+        };
+
+        // No poll loop runs here, so the ring can only see the shell's
+        // output through the reap-time drain in handle_signals.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while d.shell_exit.is_none() {
+            assert!(d.handle_signals().is_none(), "detached daemon must linger");
+            assert!(Instant::now() < deadline, "shell did not exit in time");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let replay = d.ring.replay();
+        assert!(
+            replay.windows(3).any(|w| w == b"bye"),
+            "final shell output lost: {:?}",
+            String::from_utf8_lossy(&replay)
+        );
+        assert!(d.pty_inbuf.is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
