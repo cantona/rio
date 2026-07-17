@@ -97,13 +97,32 @@ pub fn spawn(args: SpawnArgs) -> io::Result<()> {
             // poll would be nicer but read-until-EOF on a pipe whose
             // writer either writes or dies is adequate here.
             f.read_to_string(&mut line)?;
-            if line.trim().is_empty() {
-                return Err(io::Error::other("daemon failed to start"));
-            }
-            println!("{}", line.trim());
+            println!("{}", parse_handshake_line(&line)?);
             Ok(())
         }
     }
+}
+
+/// Validate the daemon's handshake line. The daemon writes either the
+/// socket JSON or an {"error":...} line down the same pipe; only the
+/// former may reach stdout with exit 0, or callers scripting `spawn`
+/// would treat the failure as success.
+fn parse_handshake_line(line: &str) -> io::Result<&str> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Err(io::Error::other("daemon failed to start"));
+    }
+    let v: serde_json::Value = serde_json::from_str(line)
+        .map_err(|e| io::Error::other(format!("bad daemon handshake: {e}")))?;
+    if let Some(err) = v.get("error") {
+        return Err(io::Error::other(
+            err.as_str().unwrap_or("daemon failed to start").to_string(),
+        ));
+    }
+    if v.get("socket").is_none() {
+        return Err(io::Error::other("daemon handshake lacks socket"));
+    }
+    Ok(line)
 }
 
 fn daemonize(log_path: Option<&std::path::Path>) {
@@ -183,7 +202,7 @@ fn daemon_main(
     handshake: OwnedFd,
     args: SpawnArgs,
 ) {
-    let log_path = base.join(format!("{pane_id}.log"));
+    let log_path = sockdir::log_path(&base, &pane_id);
     daemonize(Some(&log_path));
 
     // Signal self-pipe.
@@ -232,6 +251,7 @@ fn daemon_main(
         cwd: args.cwd.clone(),
         created_at: sockdir::now_epoch(),
         exited_status: None,
+        exited_at: None,
         session: args.session.clone(),
     };
     if sockdir::write_meta(&base, &meta).is_err() {
@@ -477,12 +497,18 @@ impl Daemon {
                 // Queued stdin has no consumer anymore; dropping it
                 // also releases the read gate keyed on pty_inbuf.
                 self.pty_inbuf.clear();
+                // Only a client past its hello counts as attached: it
+                // has seen ServerHello, so Exited is in-contract. Never
+                // send Exited pre-hello, and never let a connection
+                // that hasn't identified itself stop the linger below.
                 if let Some(c) = &mut self.client {
-                    c.queue(FrameType::Exited, &code.to_le_bytes());
-                    // Flush what we can; then shut down.
-                    let _ = flush_blocking(c);
-                    self.cleanup();
-                    return Some(0);
+                    if c.hello_done {
+                        c.queue(FrameType::Exited, &code.to_le_bytes());
+                        // Flush what we can; then shut down.
+                        let _ = flush_blocking(c);
+                        self.cleanup();
+                        return Some(0);
+                    }
                 }
                 if self.kill_requested {
                     // Deliberate kill: never linger, even when the
@@ -490,8 +516,10 @@ impl Daemon {
                     self.cleanup();
                     return Some(0);
                 }
-                // Detached: linger with the ring; record status.
+                // Detached: linger with the ring; record status and the
+                // exit moment (gc's reap grace is measured from it).
                 self.meta.exited_status = Some(code);
+                self.meta.exited_at = Some(sockdir::now_epoch());
                 let _ = sockdir::write_meta(&self.base, &self.meta);
             }
         }
@@ -524,13 +552,13 @@ impl Daemon {
                 features: 0,
                 accepted_at: std::time::Instant::now(),
             };
-            // Park as pending: a bare probe (e.g. gc liveness check)
-            // that connects and closes without a hello must NOT evict
-            // the live client. Eviction happens only when the newcomer
-            // completes its ClientHello (see pump_pending).
-            if self.client.is_none() {
-                self.client = Some(conn);
-            } else if self.pending.len() < MAX_PENDING {
+            // Every connection parks as pending, even with no client
+            // attached: a bare probe (e.g. gc liveness check) must
+            // never become `self.client` — the shell-exit path treats
+            // an attached client as reason not to linger, and Exited
+            // must never be sent before ServerHello. Promotion happens
+            // only on a completed ClientHello (see pump_pending).
+            if self.pending.len() < MAX_PENDING {
                 self.pending.push(conn);
             }
             // Beyond the cap the connection drops here; the peer sees
@@ -583,13 +611,30 @@ impl Daemon {
             loop {
                 match conn.dec.next_frame() {
                     Ok(Some((h, payload))) => {
-                        if FrameType::from_u8(h.typ) == Some(FrameType::ClientHello)
-                            && protocol::decode_client_hello(&payload)
-                                == Some(protocol::PROTOCOL_VERSION)
-                        {
-                            conn.features =
-                                protocol::decode_client_hello_features(&payload);
-                            hello = true;
+                        if FrameType::from_u8(h.typ) == Some(FrameType::ClientHello) {
+                            let v = protocol::decode_client_hello(&payload);
+                            if v == Some(protocol::PROTOCOL_VERSION) {
+                                conn.features =
+                                    protocol::decode_client_hello_features(&payload);
+                                hello = true;
+                            } else {
+                                // Answer a mismatched hello here like the
+                                // attached path does; parking it until the
+                                // deadline would leave the peer staring at
+                                // a silent socket instead of the reason.
+                                let mut msg = vec![protocol::ERROR_VERSION_MISMATCH];
+                                msg.extend_from_slice(
+                                    format!(
+                                        "server speaks v{}, client sent v{:?}",
+                                        protocol::PROTOCOL_VERSION,
+                                        v
+                                    )
+                                    .as_bytes(),
+                                );
+                                conn.queue(FrameType::Error, &msg);
+                                let _ = flush_blocking(conn);
+                                closed = true;
+                            }
                             break;
                         }
                     }
@@ -653,9 +698,15 @@ impl Daemon {
         let exit_status = self.shell_exit.or(self.meta.exited_status).unwrap_or(0);
         // Prefer the shell's LIVE cwd (/proc/<pid>/cwd) over the
         // spawn-time cwd — the client caches it so a later fresh-spawn
-        // fallback (dead daemon) lands in the right directory.
-        let live_cwd =
-            crate::osproc::cwd(self.meta.shell_pid).or_else(|| self.meta.cwd.clone());
+        // fallback (dead daemon) lands in the right directory. Never
+        // probe once the shell has exited: the reaped pid may already
+        // belong to an unrelated same-uid process whose cwd the client
+        // would then cache.
+        let live_cwd = if shell_state == protocol::SHELL_EXITED {
+            self.meta.cwd.clone()
+        } else {
+            crate::osproc::cwd(self.meta.shell_pid).or_else(|| self.meta.cwd.clone())
+        };
         let meta_json = serde_json::json!({
             "pane_id": self.pane_id,
             "program": self.meta.program,
@@ -1036,6 +1087,18 @@ fn flush_blocking(c: &mut ClientConn) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn handshake_line_error_paths() {
+        assert!(parse_handshake_line("").is_err());
+        assert!(parse_handshake_line("  \n").is_err());
+        assert!(parse_handshake_line("not json").is_err());
+        let err = parse_handshake_line(r#"{"error":"spawn failed"}"#).unwrap_err();
+        assert!(err.to_string().contains("spawn failed"));
+        assert!(parse_handshake_line(r#"{"pane_id":"ab"}"#).is_err());
+        let ok = r#"{"pane_id":"ab","socket":"/run/x.sock"}"#;
+        assert_eq!(parse_handshake_line(&format!("{ok}\n")).unwrap(), ok);
+    }
+
     /// Output the shell wrote right before exiting must survive into
     /// the ring: the reap path drains the master itself, because the
     /// master leaves the poll set once shell_exit is set.
@@ -1082,6 +1145,7 @@ mod tests {
                 cwd: None,
                 created_at: sockdir::now_epoch(),
                 exited_status: None,
+                exited_at: None,
                 session: None,
             },
             ring: ReplayRing::new(64 * 1024),

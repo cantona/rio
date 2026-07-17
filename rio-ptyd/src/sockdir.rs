@@ -19,6 +19,11 @@ pub struct PaneMeta {
     pub cwd: Option<String>,
     pub created_at: u64,
     pub exited_status: Option<i32>,
+    /// When the shell exited (epoch seconds), recorded by the daemon as
+    /// it enters the lingering state. Absent in metadata written by
+    /// older daemons and while the shell is still running.
+    #[serde(default)]
+    pub exited_at: Option<u64>,
     /// Session name the spawning rio tagged this pane with (e.g.
     /// "com", "work"), so `list` can group panes by session. Absent
     /// for panes spawned outside a named session or by older daemons.
@@ -141,6 +146,11 @@ pub fn meta_path(base: &Path, pane_id: &str) -> PathBuf {
     base.join(format!("{pane_id}.json"))
 }
 
+/// Daemon stderr log, written only when RIO_PTYD_LOG is set at spawn.
+pub fn log_path(base: &Path, pane_id: &str) -> PathBuf {
+    base.join(format!("{pane_id}.log"))
+}
+
 pub fn write_meta(base: &Path, meta: &PaneMeta) -> io::Result<()> {
     let tmp = base.join(format!("{}.json.tmp", meta.pane_id));
     fs::write(&tmp, serde_json::to_vec(meta).map_err(io::Error::other)?)?;
@@ -155,6 +165,7 @@ pub fn read_meta(base: &Path, pane_id: &str) -> io::Result<PaneMeta> {
 pub fn remove_pane_files(base: &Path, pane_id: &str) {
     let _ = fs::remove_file(socket_path(base, pane_id));
     let _ = fs::remove_file(meta_path(base, pane_id));
+    let _ = fs::remove_file(log_path(base, pane_id));
 }
 
 /// All pane ids that have a metadata file, sorted by creation time.
@@ -283,12 +294,34 @@ mod tests {
             "created_at":0,"exited_status":null}"#;
         let m: PaneMeta = serde_json::from_str(legacy).unwrap();
         assert_eq!(m.session, None);
+        assert_eq!(m.exited_at, None);
 
         let tagged = r#"{"version":1,"pane_id":"a","daemon_pid":1,
             "shell_pid":2,"program":"/bin/sh","args":[],"cwd":null,
             "created_at":0,"exited_status":null,"session":"work"}"#;
         let m: PaneMeta = serde_json::from_str(tagged).unwrap();
         assert_eq!(m.session.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn meta_exited_at_round_trip() {
+        let m = PaneMeta {
+            version: METADATA_VERSION,
+            pane_id: "a".into(),
+            daemon_pid: 1,
+            shell_pid: 2,
+            program: "/bin/sh".into(),
+            args: Vec::new(),
+            cwd: None,
+            created_at: 100,
+            exited_status: Some(0),
+            exited_at: Some(160),
+            session: None,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let back: PaneMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.exited_at, Some(160));
+        assert_eq!(back.exited_status, Some(0));
     }
 
     #[test]

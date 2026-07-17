@@ -134,6 +134,7 @@ fn run(args: Vec<String>) -> i32 {
                 let entries: Vec<serde_json::Value> = panes
                     .iter()
                     .map(|m| {
+                        let alive = sockdir::pid_alive(m.daemon_pid);
                         serde_json::json!({
                             "pane_id": m.pane_id,
                             "daemon_pid": m.daemon_pid,
@@ -142,12 +143,13 @@ fn run(args: Vec<String>) -> i32 {
                             "args": m.args,
                             "cwd": m.cwd,
                             "created_at": m.created_at,
-                            "alive": sockdir::pid_alive(m.daemon_pid),
+                            "alive": alive,
                             "exited_status": m.exited_status,
                             "session": m.session,
-                            "foreground": m
-                                .exited_status
-                                .is_none()
+                            // Same liveness guard as the table path: a
+                            // dead daemon's shell_pid may already belong
+                            // to an unrelated process.
+                            "foreground": (m.exited_status.is_none() && alive)
                                 .then(|| sockdir::foreground_activity(m.shell_pid))
                                 .flatten(),
                         })
@@ -345,9 +347,11 @@ fn run(args: Vec<String>) -> i32 {
                 // lingering with its ring for a reattach that may never
                 // come. Reap it so it does not leak a process + PTY
                 // indefinitely. Only when reachable (so we can ask it to
-                // exit cleanly) and old enough to not race a just-exited
-                // pane the user is about to reattach.
-                if m.exited_status.is_some() && !unreachable && old_enough {
+                // exit cleanly) and long enough after the EXIT — gc runs
+                // at every rio startup, and a detached job that finished
+                // moments ago must keep its ring for the reattach that
+                // reads its output, however old the pane itself is.
+                if m.exited_status.is_some() && !unreachable && linger_reap_due(&m, now) {
                     if dry {
                         println!("would reap {} (exited, lingering)", m.pane_id);
                     } else {
@@ -355,10 +359,67 @@ fn run(args: Vec<String>) -> i32 {
                     }
                 }
             }
+
+            // Case 3: a bound socket with no metadata file. The daemon
+            // binds before it writes meta, so one that dies in between
+            // leaves a socket list_panes never sees. Reap only when it
+            // is both unconnectable (no daemon owns it) and old by its
+            // own mtime — the bind-to-meta window of a healthy daemon
+            // is milliseconds, never a minute.
+            if let Ok(entries) = std::fs::read_dir(&base) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".sock"))
+                    else {
+                        continue;
+                    };
+                    if !sockdir::is_valid_pane_id(id)
+                        || sockdir::meta_path(&base, id).exists()
+                    {
+                        continue;
+                    }
+                    let old_enough = entry
+                        .metadata()
+                        .and_then(|md| md.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age.as_secs() > 60);
+                    if !old_enough
+                        || std::os::unix::net::UnixStream::connect(entry.path()).is_ok()
+                    {
+                        continue;
+                    }
+                    if dry {
+                        println!("would remove {id} (orphaned socket)");
+                    } else {
+                        sockdir::remove_pane_files(&base, id);
+                    }
+                }
+            }
             0
         }
         _ => usage(),
     }
+}
+
+/// How long a lingering exited daemon keeps its ring before gc reaps
+/// it, measured from the shell's exit. Generous on purpose: rio runs
+/// gc at every startup, and the whole point of lingering is that the
+/// user can still come back and read a finished job's output.
+#[cfg(unix)]
+const LINGER_REAP_GRACE_SECS: u64 = 300;
+
+/// Whether gc may reap a lingering exited daemon. Grace runs from
+/// `exited_at`; metadata from older daemons lacks the stamp, so fall
+/// back to spawn age with the same grace — such panes stay reapable
+/// without a fresh exit being reaped on the next gc pass.
+#[cfg(unix)]
+fn linger_reap_due(m: &rio_ptyd::sockdir::PaneMeta, now: u64) -> bool {
+    let since = match m.exited_at {
+        Some(t) => now.saturating_sub(t),
+        None => now.saturating_sub(m.created_at),
+    };
+    since > LINGER_REAP_GRACE_SECS
 }
 
 /// Terminate one pane's daemon and remove its files. Prefers the
@@ -424,5 +485,53 @@ fn kill_pane(base: &std::path::Path, id: &str) {
             }
         }
         sockdir::remove_pane_files(base, id);
+    }
+}
+
+#[cfg(all(unix, test))]
+mod tests {
+    use super::*;
+    use rio_ptyd::sockdir::{PaneMeta, METADATA_VERSION};
+
+    fn meta(created_at: u64, exited_at: Option<u64>) -> PaneMeta {
+        PaneMeta {
+            version: METADATA_VERSION,
+            pane_id: "a".into(),
+            daemon_pid: 1,
+            shell_pid: 2,
+            program: "/bin/sh".into(),
+            args: Vec::new(),
+            cwd: None,
+            created_at,
+            exited_status: Some(0),
+            exited_at,
+            session: None,
+        }
+    }
+
+    #[test]
+    fn linger_reap_grace_runs_from_exit() {
+        let now = 100_000;
+        // Old pane, shell exited just now: not reapable yet.
+        assert!(!linger_reap_due(&meta(now - 10_000, Some(now - 5)), now));
+        // Exit past the grace: reapable.
+        assert!(linger_reap_due(
+            &meta(now - 10_000, Some(now - LINGER_REAP_GRACE_SECS - 1)),
+            now
+        ));
+        assert!(!linger_reap_due(
+            &meta(now - 10_000, Some(now - LINGER_REAP_GRACE_SECS)),
+            now
+        ));
+    }
+
+    #[test]
+    fn linger_reap_without_exit_stamp_falls_back_to_spawn_age() {
+        let now = 100_000;
+        assert!(!linger_reap_due(&meta(now - 30, None), now));
+        assert!(linger_reap_due(
+            &meta(now - LINGER_REAP_GRACE_SECS - 1, None),
+            now
+        ));
     }
 }
