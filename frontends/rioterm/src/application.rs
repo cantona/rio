@@ -160,10 +160,10 @@ impl Application<'_> {
         rio_notifier::send_notification(title, body, urgency);
     }
 
-    /// Capture every open window into the implicit last-session slot,
-    /// focused window first so it restores into the launch route. A
-    /// single per-window writer would drop all the other windows; this
-    /// is the writer for autosave, Ctrl+Shift+S, window close and quit.
+    /// Capture every open UNNAMED window into the implicit last-session
+    /// slot, focused window first so it restores into the launch route.
+    /// A single per-window writer would drop all the other windows; this
+    /// is the accumulating writer for autosave, window close and quit.
     /// `merge_kept_daemons` carries forward any still-live daemon the
     /// old file referenced but no live window reattached.
     fn save_last_session(&mut self, focused: Option<WindowId>) {
@@ -206,13 +206,16 @@ impl Application<'_> {
     }
 
     /// Capture (WindowId, WindowState) for every open window matching
-    /// `filter` (None = every window).
+    /// `filter`. `None` selects the implicit slot — only windows with no
+    /// session name — so named workspaces never bleed into session.json
+    /// (a plain launch would restore them unnamed and steal their
+    /// single-client daemons from the named instance).
     fn capture_by_id(
         &self,
         filter: Option<&str>,
     ) -> Vec<(WindowId, crate::session::WindowState)> {
         let max = self.config.session.max_scrollback_lines;
-        let matches = |name: Option<&str>| filter.is_none() || name == filter;
+        let matches = |name: Option<&str>| name == filter;
         self.router
             .routes
             .iter()
@@ -851,21 +854,30 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     }
                 }
             }
-            RioEventType::Rio(RioEvent::SaveSession) => {
+            RioEventType::Rio(RioEvent::SaveSession { explicit }) => {
                 // Named or implicit, the session spans every window of
                 // this process: save them all so a multi-window
-                // workspace comes back whole.
+                // workspace comes back whole. The trigger picks the
+                // policy: an explicit "save now" mirrors the currently
+                // open windows, while autosave-on-change accumulates so
+                // a window closed earlier this run isn't dropped when a
+                // surviving window changes.
                 let named = self
                     .router
                     .routes
                     .get(&window_id)
                     .and_then(|route| route.session_name.clone());
-                match named {
-                    Some(name) => {
-                        let path = rio_backend::config::session_named_path(&name);
-                        self.snapshot_open_windows(&path, Some(&name), window_id);
-                    }
-                    None => self.save_last_session(Some(window_id)),
+                let (path, filter) = match &named {
+                    Some(name) => (
+                        rio_backend::config::session_named_path(name),
+                        Some(name.as_str()),
+                    ),
+                    None => (rio_backend::config::session_file_path(), None),
+                };
+                if explicit {
+                    self.snapshot_open_windows(&path, filter, window_id);
+                } else {
+                    self.persist_session(&path, filter, Some(window_id));
                 }
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
                     route

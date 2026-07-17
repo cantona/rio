@@ -1055,10 +1055,12 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.event_proxy.send_event(RioEvent::Quit, self.window_id);
     }
 
+    /// Explicit user "save now" (keybinding): the saved file mirrors
+    /// the currently-open windows.
     #[inline]
     pub fn request_save_session(&mut self) {
         self.event_proxy
-            .send_event(RioEvent::SaveSession, self.window_id);
+            .send_event(RioEvent::SaveSession { explicit: true }, self.window_id);
     }
 
     /// Persist the session after a structural change (tab/pane
@@ -1066,11 +1068,14 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     /// so a crash — which runs no clean-exit save — still leaves a
     /// current session. No-op in `prompt` mode: that mode never saves
     /// without the user's yes. Structural changes are rare user
-    /// actions, so the extra write is not on any hot path.
+    /// actions, so the extra write is not on any hot path. Not explicit:
+    /// the save must accumulate, so a window closed earlier this run
+    /// survives a later change in an unrelated window.
     #[inline]
     pub fn autosave_on_change(&mut self) {
         if self.config.autosave {
-            self.request_save_session();
+            self.event_proxy
+                .send_event(RioEvent::SaveSession { explicit: false }, self.window_id);
         }
     }
 

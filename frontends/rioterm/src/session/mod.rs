@@ -347,8 +347,23 @@ impl<K: Eq + std::hash::Hash + Copy> SavedWindows<K> {
     where
         I: IntoIterator<Item = (K, WindowState)>,
     {
+        let windows = self.replace(path, captured, preferred);
+        write_windows(path, windows);
+    }
+
+    /// The pure part of `replace_and_write`: forget everything recorded
+    /// for `path` this run, then record and return `captured` alone.
+    fn replace<I>(
+        &mut self,
+        path: &Path,
+        captured: I,
+        preferred: Option<K>,
+    ) -> Vec<WindowState>
+    where
+        I: IntoIterator<Item = (K, WindowState)>,
+    {
         self.per_file.remove(path);
-        self.accumulate_and_write(path, captured, preferred);
+        self.accumulate(path, captured, preferred)
     }
 }
 
@@ -884,14 +899,33 @@ mod saved_windows_tests {
         assert!(w1.is_some(), "window 1 present with its grown tab set");
     }
 
+    // Autosave after a window closed: the save only captures the
+    // still-open window, but the union must keep the closed one — this
+    // is what makes autosave-on-change safe for multi-window sessions.
+    #[test]
+    fn accumulate_keeps_earlier_closed_windows() {
+        let mut sw: SavedWindows<u32> = SavedWindows::new();
+        let path = Path::new("unused");
+        sw.accumulate(
+            path,
+            vec![(1u32, window(&["a"])), (2u32, window(&["b"]))],
+            Some(2),
+        );
+        // Window 2 is gone; a tab change in window 1 triggers a save
+        // that sees only window 1.
+        let out = sw.accumulate(path, vec![(1u32, window(&["a", "c"]))], Some(1));
+        assert_eq!(out.len(), 2, "closed window 2 still recorded");
+        assert_eq!(pane_ids(&out[0]), vec!["a", "c"]);
+        assert!(out.iter().any(|w| pane_ids(w) == vec!["b"]));
+    }
+
     #[test]
     fn replace_drops_earlier_closed_windows() {
         let mut sw: SavedWindows<u32> = SavedWindows::new();
         let path = Path::new("unused");
         sw.accumulate(path, vec![(1u32, window(&["a"]))], Some(1));
         // Explicit snapshot with only window 2 open forgets window 1.
-        sw.per_file.remove(path);
-        let out = sw.accumulate(path, vec![(2u32, window(&["b"]))], Some(2));
+        let out = sw.replace(path, vec![(2u32, window(&["b"]))], Some(2));
         assert_eq!(out.len(), 1);
         assert_eq!(pane_ids(&out[0]), vec!["b"]);
     }

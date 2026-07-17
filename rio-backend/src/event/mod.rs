@@ -251,7 +251,12 @@ pub enum RioEvent {
     QuitConfirmed,
 
     /// Save the current session to disk (tabs/splits/CWDs/scrollback).
-    SaveSession,
+    /// `explicit` distinguishes a user "save now" (mirror the currently
+    /// open windows) from an autosave-on-change (accumulate, so windows
+    /// closed earlier this run are kept).
+    SaveSession {
+        explicit: bool,
+    },
 
     /// Hide the transient "session saved" notice.
     ClearSessionNotice,
@@ -360,7 +365,7 @@ impl Debug for RioEvent {
             RioEvent::Exit => write!(f, "Exit"),
             RioEvent::Quit => write!(f, "Quit"),
             RioEvent::QuitConfirmed => write!(f, "QuitConfirmed"),
-            RioEvent::SaveSession => write!(f, "SaveSession"),
+            RioEvent::SaveSession { .. } => write!(f, "SaveSession"),
             RioEvent::ClearSessionNotice => write!(f, "ClearSessionNotice"),
             RioEvent::CloseButtonArmed => write!(f, "CloseButtonArmed"),
             RioEvent::DisarmCloseButton => write!(f, "DisarmCloseButton"),
