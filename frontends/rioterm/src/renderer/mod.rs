@@ -1146,3 +1146,105 @@ impl Renderer {
         }
     }
 }
+
+#[cfg(test)]
+mod atlas_overlay_tests {
+    use super::Renderer;
+    use rio_backend::ansi::CursorShape;
+    use rio_backend::crosswords::{Crosswords, CrosswordsSize};
+    use rio_backend::event::{TerminalDamage, VoidListener};
+
+    /// Drive the renderer's real frame protocol (peek damage ->
+    /// snapshot_visible -> push_atlas_graphic_overlays) over two chafa
+    /// renders, the second starting from the bottom row, and assert the
+    /// second image's quads land on its final rows.
+    #[test]
+    fn second_sixel_render_quads_track_final_rows() {
+        let size = CrosswordsSize::new(20, 10);
+        let window_id = rio_backend::event::WindowId::from(0);
+        let mut term = Crosswords::new(
+            size,
+            CursorShape::Block,
+            VoidListener {},
+            window_id,
+            0,
+            10_000,
+        );
+        term.graphics.cell_width = 10.0;
+        term.graphics.cell_height = 10.0;
+        let mut processor = rio_backend::performer::handler::Processor::default();
+
+        let mut img = String::from("\x1b[?25l\x1b[?80l\x1b[?8452l");
+        img.push_str("\x1bP0;0;0q\"1;1;40;60#1;2;100;0;0");
+        for band in 0..10 {
+            if band > 0 {
+                img.push('-');
+            }
+            img.push_str("#1!40~");
+        }
+        img.push_str("\x1b\\\x1b[?25h");
+
+        let mut rc = crate::context::renderable::RenderableContent::new(
+            crate::context::renderable::Cursor::default(),
+        );
+
+        let frame = |term: &mut Crosswords<VoidListener>,
+                     rc: &mut crate::context::renderable::RenderableContent|
+         -> Vec<rio_backend::sugarloaf::GraphicOverlay> {
+            let damage = term.peek_damage_event().unwrap_or(TerminalDamage::Noop);
+            term.reset_damage();
+            let cols = term.columns();
+            term.snapshot_visible(
+                &damage,
+                cols,
+                &mut rc.visible_rows,
+                &mut rc.style_table,
+                &mut rc.extras,
+            );
+            let mut overlays = Vec::new();
+            Renderer::push_atlas_graphic_overlays(
+                &mut overlays,
+                rc,
+                0,
+                0.0,
+                0.0,
+                10.0,
+                10.0,
+            );
+            overlays
+        };
+
+        // Frame 1: first render near the top plus its prompt.
+        processor.advance(&mut term, img.as_bytes());
+        processor.advance(&mut term, b"\r\n$ ");
+        let f1 = frame(&mut term, &mut rc);
+        assert!(!f1.is_empty(), "first render should produce quads");
+        let min_y1 = f1.iter().map(|o| o.y as i32).min().unwrap();
+        assert_eq!(min_y1, 0, "first image starts at the top row");
+
+        // Frame 2: park the cursor on the bottom row, render again.
+        while term.grid.cursor.pos.row.0 < 9 {
+            processor.advance(&mut term, b"\n");
+        }
+        processor.advance(&mut term, img.as_bytes());
+        processor.advance(&mut term, b"\r\n$ ");
+        let f2 = frame(&mut term, &mut rc);
+
+        // The image is 6 rows tall and ends one scroll above the
+        // prompt: quads must sit exactly on rows 3..=8, each sourcing
+        // the band matching its row, and no quad may touch row 9.
+        let mut ys: Vec<i32> = f2.iter().map(|o| o.y as i32).collect();
+        ys.sort_unstable();
+        assert_eq!(ys, vec![30, 40, 50, 60, 70, 80], "quad rows wrong: {ys:?}");
+        for o in &f2 {
+            let row = (o.y / 10.0) as i32;
+            let band = (o.source_rect[1] * 60.0).round() as i32 / 10;
+            assert_eq!(
+                band,
+                row - 3,
+                "row {row} must source band {}, got {band}",
+                row - 3
+            );
+        }
+    }
+}

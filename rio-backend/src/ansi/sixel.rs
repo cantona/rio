@@ -510,9 +510,14 @@ impl Parser {
     }
 
     /// Returns the final graphic to append to the grid, with the palette
-    /// built in the process.
-    pub fn finish(mut self) -> Result<(GraphicData, Vec<ColorRgb>), Error> {
+    /// built in the process, and whether the stream ended with a
+    /// Graphics New Line that moved the sixel active position below the
+    /// painted picture. Emitters (chafa, img2sixel) end with `-` instead
+    /// of a text newline and rely on the terminal leaving the text
+    /// cursor below the image, per DEC STD 070.
+    pub fn finish(mut self) -> Result<(GraphicData, Vec<ColorRgb>, bool), Error> {
         self.finish_command()?;
+        let cursor_below = self.height > 0 && self.y >= self.height;
 
         trace!(
             "Finish Sixel parser: width={}, height={}, color_registers={}",
@@ -564,7 +569,7 @@ impl Parser {
             transmit_time: std::time::Instant::now(),
         };
 
-        Ok((data, self.color_registers))
+        Ok((data, self.color_registers, cursor_below))
     }
 }
 

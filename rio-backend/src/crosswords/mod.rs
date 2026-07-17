@@ -3832,8 +3832,21 @@ impl<U: EventListener> Handler for Crosswords<U> {
         if let Some(parser) = parser {
             match parser.finish() {
                 // Sixel uses None to indicate traditional Sixel cursor behavior
-                Ok((graphic, palette)) => {
-                    self.insert_graphic(graphic, Some(palette), None)
+                Ok((graphic, palette, cursor_below)) => {
+                    let inserted = graphic.height > 0 && graphic.width > 0;
+                    self.insert_graphic(graphic, Some(palette), None);
+                    // A stream ending in a Graphics New Line asks for the
+                    // text cursor below the image (DEC STD 070); emitters
+                    // like chafa and img2sixel end with `-` instead of a
+                    // newline, so leaving the cursor on the image's last
+                    // row would print the next prompt over the picture.
+                    if inserted
+                        && cursor_below
+                        && !self.mode.contains(Mode::SIXEL_DISPLAY)
+                        && !self.mode.contains(Mode::SIXEL_CURSOR_TO_THE_RIGHT)
+                    {
+                        self.linefeed();
+                    }
                 }
                 Err(err) => warn!("Failed to parse Sixel data: {}", err),
             }
@@ -6535,6 +6548,206 @@ mod tests {
 
         // Cell outside the image should NOT have graphics.
         assert!(!cw.grid[Line(0)][Column(2)].has_graphics());
+    }
+
+    /// Repro scaffold: second sixel inserted at the bottom row (every
+    /// image row scrolls the screen) must land with offset_y matching
+    /// its final screen rows, and the prompt row below it must be clean.
+    #[test]
+    fn sixel_second_insert_at_bottom_scrolls_correctly() {
+        let size = CrosswordsSize::new(20, 10);
+        let window_id = crate::event::WindowId::from(0);
+        let mut cw = Crosswords::new(
+            size,
+            CursorShape::Block,
+            VoidListener {},
+            window_id,
+            0,
+            10_000,
+        );
+        cw.graphics.cell_width = 10.0;
+        cw.graphics.cell_height = 10.0;
+
+        let mk = |h: usize| GraphicData {
+            id: sugarloaf::GraphicId::new(0),
+            width: 20,
+            height: h,
+            pixels: vec![0u8; 20 * h * 4],
+            color_type: sugarloaf::ColorType::Rgba,
+            is_opaque: true,
+            display_width: None,
+            display_height: None,
+            resize: None,
+            transmit_time: std::time::Instant::now(),
+        };
+        let mut processor = crate::performer::handler::Processor::default();
+
+        // First image: 4 rows at the top, then a prompt below it.
+        cw.insert_graphic(mk(40), None, None);
+        processor.advance(&mut cw, b"\r\n$ chafa again\r\n");
+
+        // Park the cursor on the bottom row.
+        while cw.grid.cursor.pos.row.0 < 9 {
+            processor.advance(&mut cw, b"\n");
+        }
+        assert_eq!(cw.grid.cursor.pos.row.0, 9);
+
+        // Second image: full screen height (10 rows), inserted at the
+        // bottom -> scrolls 9 times during insertion.
+        cw.insert_graphic(mk(100), None, None);
+        // Shell prints the prompt afterwards: one more scroll.
+        processor.advance(&mut cw, b"\r\n");
+        assert_eq!(cw.grid.cursor.pos.row.0, 9);
+
+        // Rows 0..=8 must show the second image's rows 1..=9 (row 0 of
+        // the image scrolled into history when the prompt line arrived).
+        for row in 0..9 {
+            let cell = &cw.grid[Line(row)][Column(0)];
+            assert!(cell.has_graphics(), "row {row} should carry the image");
+            let eid = cell.extras_id().expect("extras id");
+            let gc = cw
+                .grid
+                .extras_table
+                .get(eid)
+                .and_then(|e| e.graphic.as_ref())
+                .and_then(|g| g.first())
+                .expect("graphic cell");
+            assert_eq!(
+                gc.offset_y,
+                ((row + 1) * 10) as u16,
+                "row {row} offset_y wrong"
+            );
+        }
+        // The prompt row itself must be clean.
+        assert!(
+            !cw.grid[Line(9)][Column(0)].has_graphics(),
+            "prompt row must not carry image cells"
+        );
+    }
+
+    /// Same scenario through the real escape-sequence path, using the
+    /// exact prelude chafa emits (DECRST 25/80/8452, sixel DCS, ST).
+    #[test]
+    fn sixel_dcs_second_render_lands_on_final_rows() {
+        let size = CrosswordsSize::new(20, 10);
+        let window_id = crate::event::WindowId::from(0);
+        let mut cw = Crosswords::new(
+            size,
+            CursorShape::Block,
+            VoidListener {},
+            window_id,
+            0,
+            10_000,
+        );
+        cw.graphics.cell_width = 10.0;
+        cw.graphics.cell_height = 10.0;
+        let mut processor = crate::performer::handler::Processor::default();
+
+        // 40x60 px = 4 cols x 6 rows at 10x10 cells; 10 sixel bands.
+        let mut img = String::from("\x1b[?25l\x1b[?80l\x1b[?8452l");
+        img.push_str("\x1bP0;0;0q\"1;1;40;60#1;2;100;0;0");
+        for band in 0..10 {
+            if band > 0 {
+                img.push('-');
+            }
+            img.push_str("#1!40~");
+        }
+        img.push_str("\x1b\\\x1b[?25h");
+
+        // First render near the top, then the shell prompt.
+        processor.advance(&mut cw, img.as_bytes());
+        processor.advance(&mut cw, b"\r\n$ ");
+
+        // Second render from the bottom row.
+        while cw.grid.cursor.pos.row.0 < 9 {
+            processor.advance(&mut cw, b"\n");
+        }
+        processor.advance(&mut cw, img.as_bytes());
+        processor.advance(&mut cw, b"\r\n$ ");
+
+        // The second image started at the cursor column (2, after
+        // "$ "). It is 6 rows tall, drawn from the bottom row with
+        // scrolling, then one prompt scroll: its rows must now sit at
+        // screen rows 3..=8 with offset_y 0..=50, prompt row 9 clean.
+        for (i, row) in (3..9).enumerate() {
+            let cell = &cw.grid[Line(row)][Column(2)];
+            assert!(cell.has_graphics(), "row {row} should carry the image");
+            let gc = cell
+                .extras_id()
+                .and_then(|eid| cw.grid.extras_table.get(eid))
+                .and_then(|e| e.graphic.as_ref())
+                .and_then(|g| g.first())
+                .expect("graphic cell");
+            assert_eq!(gc.offset_y, (i * 10) as u16, "row {row} offset_y");
+        }
+        for row in 0..3 {
+            assert!(
+                !cw.grid[Line(row)][Column(2)].has_graphics(),
+                "row {row} above the image must be clean"
+            );
+        }
+        assert!(
+            !cw.grid[Line(9)][Column(2)].has_graphics(),
+            "prompt row must not carry image cells"
+        );
+    }
+
+    /// A sixel stream ending in a Graphics New Line (`-` before ST, the
+    /// way chafa and img2sixel terminate) leaves the text cursor on the
+    /// row below the image, so a shell prompt printed right after the
+    /// stream never lands on the picture's last row.
+    #[test]
+    fn sixel_trailing_gnl_puts_prompt_below_image() {
+        let size = CrosswordsSize::new(20, 10);
+        let window_id = crate::event::WindowId::from(0);
+        let mut cw = Crosswords::new(
+            size,
+            CursorShape::Block,
+            VoidListener {},
+            window_id,
+            0,
+            10_000,
+        );
+        cw.graphics.cell_width = 10.0;
+        cw.graphics.cell_height = 10.0;
+        let mut processor = crate::performer::handler::Processor::default();
+
+        // 40x30 px = 3 rows; every band followed by `-`, including the
+        // last one (trailing GNL).
+        let mut img = String::from("\x1b[?25l\x1b[?80l\x1b[?8452l");
+        img.push_str("\x1bP0;0;0q\"1;1;40;30#1;2;100;0;0");
+        for _ in 0..5 {
+            img.push_str("#1!40~-");
+        }
+        img.push_str("\x1b\\\x1b[?25h");
+        processor.advance(&mut cw, img.as_bytes());
+
+        // Image on rows 0..=2; cursor below it, so the prompt goes on
+        // the clean row 3.
+        assert_eq!(cw.grid.cursor.pos.row.0, 3, "cursor below the image");
+        processor.advance(&mut cw, b"$ ");
+        assert!(cw.grid[Line(2)][Column(0)].has_graphics());
+        assert!(!cw.grid[Line(3)][Column(0)].has_graphics());
+        assert_eq!(cw.grid[Line(3)][Column(0)].c(), '$');
+
+        // Without the trailing GNL the cursor stays on the image's
+        // last row (traditional behavior, unchanged).
+        let mut cw2 = Crosswords::new(
+            CrosswordsSize::new(20, 10),
+            CursorShape::Block,
+            VoidListener {},
+            window_id,
+            0,
+            10_000,
+        );
+        cw2.graphics.cell_width = 10.0;
+        cw2.graphics.cell_height = 10.0;
+        let mut p2 = crate::performer::handler::Processor::default();
+        let mut img2 = String::from("\x1bP0;0;0q\"1;1;40;30#1;2;100;0;0");
+        img2.push_str("#1!40~-#1!40~-#1!40~-#1!40~-#1!40~");
+        img2.push_str("\x1b\\");
+        p2.advance(&mut cw2, img2.as_bytes());
+        assert_eq!(cw2.grid.cursor.pos.row.0, 2, "cursor on last image row");
     }
 
     /// RIS drops graphics extras outright: the grid content is gone, so
