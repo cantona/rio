@@ -1228,9 +1228,17 @@ mod tests {
     #[test]
     fn test_filtered_commands_empty_query() {
         let palette = CommandPalette::new();
-        let filtered = palette.filtered_rows();
-        // ToggleAppearanceTheme is hidden when has_adaptive_theme is false
-        assert_eq!(filtered.len(), COMMANDS.len() - 1);
+        // Pin the precondition so a Default change fails here, not in
+        // the arithmetic below: ToggleAppearanceTheme is hidden while
+        // adaptive theme is off, and AttachRemotePane only exists on
+        // unix.
+        assert!(!palette.has_adaptive_theme);
+        let expected = if cfg!(unix) {
+            COMMANDS.len() - 1
+        } else {
+            COMMANDS.len() - 2
+        };
+        assert_eq!(palette.filtered_rows().len(), expected);
     }
 
     #[test]
