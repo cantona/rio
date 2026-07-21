@@ -1271,6 +1271,39 @@ mod load_validation_tests {
         }
     }
 
+    /// A hostile file with a deeply nested split tree must be rejected
+    /// at parse time, not blow the stack in the recursive tree walks
+    /// (well_formed, leaf_count, cap_scrollback). serde_json enforces a
+    /// 128-level JSON recursion limit by default; each LayoutNode level
+    /// costs several JSON levels, so nesting dies in from_slice long
+    /// before any walk runs. This test locks that guarantee.
+    #[test]
+    fn load_rejects_deep_nesting() {
+        // Build {"Split":{"direction":"Horizontal","children":[[1.0, ...]]}}
+        // nested 2000 deep, then a leaf.
+        let mut json = String::new();
+        let depth = 2000;
+        for _ in 0..depth {
+            json.push_str("{\"Split\":{\"direction\":\"Horizontal\",\"children\":[[1.0,");
+        }
+        json.push_str(
+            "{\"Leaf\":{\"cwd\":null,\"title\":null,\"is_active\":true,\"scrollback\":\"\"}}",
+        );
+        for _ in 0..depth {
+            json.push_str("]]}}");
+        }
+        let file = format!(
+            "{{\"version\":{SESSION_VERSION},\"windows\":[{{\"tabs\":[{{\"layout\":{json},\"custom_title\":null}}],\"active_tab\":0}}]}}"
+        );
+        let path = tmp_file("deep-nest");
+        std::fs::write(&path, file).unwrap();
+        assert!(
+            SessionState::load(&path).is_none(),
+            "deeply nested tree must be rejected"
+        );
+        SessionState::discard(&path);
+    }
+
     #[test]
     fn load_rejects_pane_flood() {
         let tabs: Vec<TabState> = (0..=SessionState::MAX_WINDOW_PANES)
