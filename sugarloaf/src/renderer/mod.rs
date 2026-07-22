@@ -2504,23 +2504,24 @@ impl Renderer {
         // texture lookup needs an immutable borrow on
         // `self.image_textures` which would conflict with the
         // brush's `&mut self`.
-        let below: Vec<(ash::vk::DescriptorSet, ImageInstance)> = self
+        // Order images by layer (BelowText first, then AboveText) into a
+        // SINGLE list. `render_image_overlays` writes every instance from
+        // offset 0 of one shared per-slot buffer, so two separate calls in
+        // one frame would clobber each other — the second call's buffer
+        // write lands before the GPU executes the first call's draw, so
+        // only the last-submitted layer renders and the other goes blank
+        // (kitty-then-sixel vs sixel-then-kitty each hid the earlier one).
+        // One call keeps every instance at its own offset. Painter order is
+        // the list order, so BelowText still draws under AboveText.
+        let ordered: Vec<(ash::vk::DescriptorSet, ImageInstance)> = self
             .image_draws
             .iter()
             .filter(|d| d.layer == ImageLayer::BelowText)
-            .filter_map(|d| {
-                let entry = self.image_textures.get(&d.image_id)?;
-                if let ImageTexture::Vulkan(tex) = &entry.gpu {
-                    Some((tex.descriptor_set, d.instance))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let above: Vec<(ash::vk::DescriptorSet, ImageInstance)> = self
-            .image_draws
-            .iter()
-            .filter(|d| d.layer == ImageLayer::AboveText)
+            .chain(
+                self.image_draws
+                    .iter()
+                    .filter(|d| d.layer == ImageLayer::AboveText),
+            )
             .filter_map(|d| {
                 let entry = self.image_textures.get(&d.image_id)?;
                 if let ImageTexture::Vulkan(tex) = &entry.gpu {
@@ -2543,10 +2544,9 @@ impl Renderer {
                 }
             }
 
-            brush.render_image_overlays(cmd, slot, viewport, &below);
+            brush.render_image_overlays(cmd, slot, viewport, &ordered);
             brush.render_quads(cmd, slot, viewport, &self.instances);
             brush.render_geometry(cmd, slot, viewport, &self.vertices);
-            brush.render_image_overlays(cmd, slot, viewport, &above);
             brush.draw_bootstrap(cmd);
         }
     }
