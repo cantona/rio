@@ -983,6 +983,7 @@ pub struct Router<'a> {
     propagated_report: Option<RioError>,
     pub font_library: Box<rio_backend::sugarloaf::font::FontLibrary>,
     pub config_route: Option<WindowId>,
+    pub quake_window_id: Option<WindowId>,
     pub clipboard: Clipboard,
     current_tab_id: u64,
 }
@@ -1008,6 +1009,7 @@ impl Router<'_> {
             routes: FxHashMap::default(),
             propagated_report,
             config_route: None,
+            quake_window_id: None,
             font_library: Box::new(font_library),
             clipboard,
             current_tab_id: 0,
@@ -1082,6 +1084,7 @@ impl Router<'_> {
             None,
             None,
             None,
+            false,
         );
         let id = window.winit_window.id();
         let mut route = Route::new(Assistant::new(), RoutePath::Terminal, window);
@@ -1148,6 +1151,7 @@ impl Router<'_> {
             open_url,
             app_id,
             session_name.clone(),
+            false,
         );
         let id = window.winit_window.id();
 
@@ -1166,6 +1170,45 @@ impl Router<'_> {
         }
 
         self.routes.insert(id, route);
+    }
+
+    /// Create the quake dropdown window: borderless, always on top,
+    /// anchored to the top of the primary monitor. Created lazily on
+    /// the first toggle and reused afterwards.
+    pub fn create_quake_window<'a>(
+        &'a mut self,
+        event_loop: &'a ActiveEventLoop,
+        event_proxy: EventProxy,
+        config: &'a rio_backend::config::Config,
+    ) {
+        let window = RouteWindow::from_target(
+            event_loop,
+            event_proxy,
+            config,
+            &self.font_library,
+            RIO_TITLE,
+            None,
+            None,
+            None,
+            None,
+            true,
+        );
+        let id = window.winit_window.id();
+        self.routes.insert(
+            id,
+            Route {
+                window,
+                path: RoutePath::Terminal,
+                assistant: Assistant::new(),
+                pending_session: None,
+                session_name: None,
+                // The quake dropdown is transient tooling, never part of
+                // the saved workspace — same treatment as the settings
+                // window, so session capture skips it.
+                ephemeral: true,
+            },
+        );
+        self.quake_window_id = Some(id);
     }
 
     #[cfg(target_os = "macos")]
@@ -1188,6 +1231,7 @@ impl Router<'_> {
             open_url,
             None,
             None,
+            false,
         );
         self.routes.insert(
             window.winit_window.id(),
@@ -1308,10 +1352,18 @@ impl<'a> RouteWindow<'a> {
         open_url: Option<String>,
         app_id: Option<&str>,
         session_name: Option<String>,
+        quake: bool,
     ) -> RouteWindow<'a> {
         #[allow(unused_mut)]
         let mut window_builder =
-            create_window_builder(window_name, config, tab_id, app_id);
+            create_window_builder(window_name, config, tab_id, app_id, quake);
+
+        // The quake window starts hidden; the caller anchors it to the
+        // monitor under the cursor and shows it (position changes on
+        // every toggle, not just at creation).
+        if quake {
+            window_builder = window_builder.with_visible(false);
+        }
 
         #[cfg(not(any(target_os = "macos", windows)))]
         if let Some(token) = event_loop.read_token_from_env() {

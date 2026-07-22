@@ -442,6 +442,11 @@ impl Screen<'_> {
 
         if should_update_font_library {
             self.sugarloaf.update_font(font_library);
+            // Caches keyed by font_id would serve the old font's data.
+            self.grid_rasterizer.clear_font_caches();
+            for grid in self.grids.values_mut() {
+                grid.clear_atlas();
+            }
         }
         let s = self.sugarloaf.style_mut();
         s.font_size = config.fonts.size;
@@ -450,6 +455,10 @@ impl Screen<'_> {
         #[cfg(feature = "wgpu")]
         self.sugarloaf
             .update_filters(config.renderer.filters.as_slice());
+
+        // Rebuild bindings so `[bindings]` edits live-reload like the
+        // rest of the config instead of waiting for a new window.
+        self.bindings = crate::bindings::default_key_bindings(config);
 
         // Preserve existing Island (tab state) and update its colors
         let old_island = self.renderer.island.take();
@@ -819,7 +828,32 @@ impl Screen<'_> {
 
         let build_key_sequence = Self::should_build_sequence(key, text, mode, mods);
 
-        let bytes = if build_key_sequence {
+        // Legacy ctrl encoding runs before trusting the platform text:
+        // the OS is inconsistent about synthesizing C0 characters for
+        // combos like ctrl+6 or ctrl+/ (macOS reports the plain char,
+        // Windows reports nothing), so the byte is computed from the
+        // kitty C0 table directly. Gated on the exact flag set that
+        // makes `build_key_sequence` produce CSI u (`kitty_seq`), so
+        // kitty-protocol encoding is untouched in every mode where it
+        // applies.
+        let kitty_seq = mode.intersects(
+            Mode::REPORT_ALL_KEYS_AS_ESC
+                | Mode::DISAMBIGUATE_ESC_CODES
+                | Mode::REPORT_EVENT_TYPES,
+        );
+        let ctrl_c0 = if kitty_seq {
+            None
+        } else {
+            crate::bindings::ctrl_seq(&key.logical_key, text, mods)
+        };
+
+        let bytes = if let Some(c0) = ctrl_c0 {
+            if mods.alt_key() {
+                vec![b'\x1b', c0]
+            } else {
+                vec![c0]
+            }
+        } else if build_key_sequence {
             crate::bindings::kitty_keyboard::build_key_sequence(key, mods, mode)
         } else {
             let mut bytes = Vec::with_capacity(text.len() + 1);
@@ -1162,6 +1196,9 @@ impl Screen<'_> {
                     Act::WindowCreateNew => {
                         self.context_manager.create_new_window();
                     }
+                    Act::ToggleQuake => {
+                        self.context_manager.toggle_quake();
+                    }
                     Act::CloseCurrentSplitOrTab => {
                         self.close_split_or_tab(clipboard);
                     }
@@ -1199,6 +1236,24 @@ impl Screen<'_> {
                     }
                     Act::ResetFontSize => {
                         self.change_font_size(FontSizeAction::Reset);
+                    }
+                    Act::ScrollToPrevPrompt => {
+                        let current = self.context_manager.current_mut();
+                        let rtid = current.rich_text_id;
+                        let mut terminal = current.terminal.lock();
+                        terminal.scroll_to_prompt(false);
+                        drop(terminal);
+                        self.renderer.scrollbar.notify_scroll(rtid);
+                        self.mark_dirty();
+                    }
+                    Act::ScrollToNextPrompt => {
+                        let current = self.context_manager.current_mut();
+                        let rtid = current.rich_text_id;
+                        let mut terminal = current.terminal.lock();
+                        terminal.scroll_to_prompt(true);
+                        drop(terminal);
+                        self.renderer.scrollbar.notify_scroll(rtid);
+                        self.mark_dirty();
                     }
                     Act::ScrollPageUp => {
                         // Move vi mode cursor.
@@ -1727,8 +1782,6 @@ impl Screen<'_> {
     }
 
     pub fn resize_top_or_bottom_line(&mut self, num_tabs: usize) {
-        let layout = self.context_manager.current().dimension;
-        let previous_margin = layout.margin;
         let padding_y_top = padding_top_from_config(
             &self.renderer.navigation,
             self.renderer.margin.top,
@@ -1737,25 +1790,38 @@ impl Screen<'_> {
         );
         let padding_y_bottom = self.renderer.margin.bottom;
 
-        if previous_margin.top != padding_y_top
-            || previous_margin.bottom != padding_y_bottom
-        {
-            let current_dim = self.context_manager.current().dimension;
-            if current_dim.font_size > 0.0 {
-                let s = self.sugarloaf.style_mut();
-                s.font_size = current_dim.font_size;
-                s.line_height = current_dim.line_height;
+        let scale = self.sugarloaf.scale_factor();
+        let scaled_top = padding_y_top * scale;
+        let scaled_bottom = padding_y_bottom * scale;
 
-                let scale = self.sugarloaf.scale_factor();
-                let d = self.context_manager.current_grid_mut();
-                d.update_scaled_margin(Margin::new(
-                    padding_y_top * scale,
-                    d.scaled_margin.right,
-                    padding_y_bottom * scale,
-                    d.scaled_margin.left,
-                ));
-                self.resize_all_contexts();
-            }
+        // Compare against the grid's scaled margin, the value the
+        // layout actually uses. The per panel dimension margin is
+        // zeroed by the taffy pass so it cannot be used as a guard.
+        let current_margin = self.context_manager.current_grid().scaled_margin;
+        if current_margin.top == scaled_top && current_margin.bottom == scaled_bottom {
+            return;
+        }
+
+        let current_dim = self.context_manager.current().dimension;
+        if current_dim.font_size <= 0.0 {
+            return;
+        }
+
+        let s = self.sugarloaf.style_mut();
+        s.font_size = current_dim.font_size;
+        s.line_height = current_dim.line_height;
+
+        // Every tab shares the window, so every grid needs the new
+        // margin and a layout pass, not just the current one.
+        for context_grid in self.context_manager.contexts_mut() {
+            let margin = context_grid.scaled_margin;
+            context_grid.update_scaled_margin(Margin::new(
+                scaled_top,
+                margin.right,
+                scaled_bottom,
+                margin.left,
+            ));
+            context_grid.update_dimensions(&mut self.sugarloaf);
         }
     }
 
@@ -4473,10 +4539,13 @@ impl Screen<'_> {
                         // (cursor_pos moved, etc.) take effect.
                     }
                     RowsToRebuild::All => {
+                        // Clear the flag before rebuilding so an
+                        // atlas-full clear inside `rebuild_row` can
+                        // re-set it for the recovery pass below.
+                        grid.mark_full_rebuild_done();
                         for y in 0..p.visible_rows.len() {
                             rebuild_row(p, y, grid, rasterizer);
                         }
-                        grid.mark_full_rebuild_done();
                     }
                     RowsToRebuild::Dirty => {
                         // Walk the snapshot rows; rebuild + clear the
@@ -4490,6 +4559,16 @@ impl Screen<'_> {
                             rebuild_row(p, y, grid, rasterizer);
                             p.visible_rows[y].dirty = false;
                         }
+                    }
+                }
+
+                // Atlas-full recovery: the backend cleared the atlas
+                // during the rebuild above, so rows written before the
+                // clear reference stale slots. Re-emit everything.
+                if grid.needs_full_rebuild() {
+                    grid.mark_full_rebuild_done();
+                    for y in 0..p.visible_rows.len() {
+                        rebuild_row(p, y, grid, rasterizer);
                     }
                 }
 

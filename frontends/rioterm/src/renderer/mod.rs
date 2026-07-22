@@ -412,7 +412,11 @@ impl Renderer {
                             })
                             .cloned()
                             .collect();
-                        placements.sort_by_key(|p| p.z_index);
+                        // Tie-break on the unique key so equal
+                        // z-indexes keep a stable paint order across
+                        // frames (map iteration order is not).
+                        placements
+                            .sort_by_key(|p| (p.z_index, p.image_id, p.placement_id));
                         placements
                     };
                     context.renderable_content.kitty_graphics_dirty = true;
@@ -450,65 +454,61 @@ impl Renderer {
                 overlays.clear();
 
                 if has_overlays {
-                    let history_size = rc.history_size as i64;
-                    let display_offset = rc.display_offset as i64;
-                    let screen_lines = rc.screen_lines as i64;
+                    let viewport = rio_backend::ansi::graphics::OverlayViewport {
+                        cell_width,
+                        cell_height,
+                        origin_x,
+                        origin_y,
+                        history_size: rc.history_size as i64,
+                        display_offset: rc.display_offset as i64,
+                        screen_lines: rc.screen_lines as i64,
+                    };
 
                     for p in &rc.kitty_placements {
-                        let screen_row = p.dest_row - (history_size - display_offset);
-                        let image_bottom_row = screen_row + p.rows as i64;
-                        // Cull only if fully off-screen (like )
-                        if image_bottom_row <= 0 || screen_row >= screen_lines {
+                        let (image_width, image_height) = rc
+                            .kitty_images
+                            .get(&p.image_id)
+                            .map(|stored| (stored.data.width, stored.data.height))
+                            .unwrap_or((0, 0));
+                        let Some(geometry) =
+                            rio_backend::ansi::graphics::kitty_overlay_geometry(
+                                p,
+                                image_width,
+                                image_height,
+                                &viewport,
+                            )
+                        else {
+                            continue;
+                        };
+                        // This renderer sets no grid scissor, so clip the
+                        // quad to the grid band on the CPU: an image
+                        // scrolled above the top row would otherwise draw
+                        // up into the tab bar, and one past the last row
+                        // over the split/padding below. Map the visible
+                        // screen band back into the geometry's (possibly
+                        // source-cropped) v-range.
+                        let grid_bottom = origin_y + rc.screen_lines as f32 * cell_height;
+                        let top = geometry.y.max(origin_y);
+                        let bottom = (geometry.y + geometry.height).min(grid_bottom);
+                        if bottom <= top || geometry.height <= 0.0 {
                             continue;
                         }
-                        let full_height = p.pixel_height as f32;
-                        if full_height <= 0.0 {
-                            continue;
-                        }
-                        let mut y = origin_y
-                            + screen_row as f32 * cell_height
-                            + p.cell_y_offset as f32;
-                        let mut height = full_height;
-                        let mut src_top = 0.0;
-                        let mut src_bottom = 1.0;
-                        // Clip against the grid band: the scissor covers the
-                        // whole surface, so a placement whose first rows
-                        // scrolled above the viewport would draw up into the
-                        // tab bar, and one extending past the last line would
-                        // draw over the padding or the split below. Crop the
-                        // hidden bands out of the source rect, clamp the dest
-                        // quad, and skip when nothing remains visible.
-                        if y < origin_y {
-                            let hidden = origin_y - y;
-                            if hidden >= height {
-                                continue;
-                            }
-                            src_top = hidden / full_height;
-                            height -= hidden;
-                            y = origin_y;
-                        }
-                        let grid_bottom = origin_y + screen_lines as f32 * cell_height;
-                        let overhang = (y + height) - grid_bottom;
-                        if overhang > 0.0 {
-                            if overhang >= height {
-                                continue;
-                            }
-                            src_bottom = 1.0 - overhang / full_height;
-                            height -= overhang;
-                        }
+                        let [u0, v0, u1, v1] = geometry.source_rect;
+                        let v_at = |sy: f32| {
+                            v0 + (v1 - v0) * (sy - geometry.y) / geometry.height
+                        };
                         overlays.push(rio_backend::sugarloaf::GraphicOverlay {
+                            // Per-route image key: the window-level store
+                            // is shared across tabs while kitty ids are
+                            // per-terminal, so scope by route to avoid
+                            // cross-tab collisions.
                             image_id: ImageKey::kitty(context.route_id, p.image_id),
-                            // kitty X=/Y= offset, supports sub-cell positioning
-                            x: origin_x
-                                + p.dest_col as f32 * cell_width
-                                + p.cell_x_offset as f32,
-                            y,
-                            width: p.pixel_width as f32,
-                            height,
+                            x: geometry.x,
+                            y: top,
+                            width: geometry.width,
+                            height: bottom - top,
                             z_index: p.z_index,
-                            // source_rect is [u0, v0, u1, v1]; the clipped
-                            // bands raise v0 / lower v1.
-                            source_rect: [0.0, src_top, 1.0, src_bottom],
+                            source_rect: [u0, v_at(top), u1, v_at(bottom)],
                         });
                     }
                 }
@@ -954,6 +954,7 @@ impl Renderer {
                 vp.rows,
                 img.data.width as u32,
                 img.data.height as u32,
+                (vp.x, vp.y, vp.width, vp.height),
                 cell_width,
                 cell_height,
                 origin_x,

@@ -86,7 +86,7 @@ pub struct Graphic {
 }
 
 /// Which protocol id space an `ImageKey`'s id lives in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ImageSource {
     /// Sixel/iTerm2 atlas graphic (`GraphicId` space, u64).
     Atlas,
@@ -100,7 +100,7 @@ pub enum ImageSource {
 /// bare numeric id cannot address the shared store: one terminal's image
 /// would clobber another's, and a kitty id could land on a sixel's entry.
 /// The key carries all three coordinates so live images never collide.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ImageKey {
     /// Opaque per-terminal namespace supplied by the frontend (rioterm
     /// passes the route id).

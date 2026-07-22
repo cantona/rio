@@ -149,6 +149,7 @@ pub enum RioEvent {
     HideOtherApplications,
     UpdateConfig,
     CreateWindow,
+    ToggleQuake,
     CloseWindow,
     /// Close this window after its save-on-exit prompt was answered.
     /// The bool is the answer: `true` = save (the app does the all-windows
@@ -388,6 +389,7 @@ impl Debug for RioEvent {
             RioEvent::RemotePanesListed { .. } => write!(f, "RemotePanesListed"),
             RioEvent::CloseTerminal(route) => write!(f, "CloseTerminal {route}"),
             RioEvent::CreateWindow => write!(f, "CreateWindow"),
+            RioEvent::ToggleQuake => write!(f, "ToggleQuake"),
             RioEvent::CloseWindow => write!(f, "CloseWindow"),
             RioEvent::CloseWindowConfirmed(_) => write!(f, "CloseWindowConfirmed"),
             RioEvent::ResumeSessionAnswered => write!(f, "ResumeSessionAnswered"),

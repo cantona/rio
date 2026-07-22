@@ -486,6 +486,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 tracing::info!("rio -> teletypewriter: create_pty_with_fork");
                 pty = match create_pty_with_fork(
                     &Cow::Borrowed(&config.shell.program),
+                    &config.shell.args,
                     cols,
                     rows,
                     initial_winsize.width,
@@ -948,6 +949,12 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     pub fn create_new_window(&self) {
         self.event_proxy
             .send_event(RioEvent::CreateWindow, self.window_id);
+    }
+
+    #[inline]
+    pub fn toggle_quake(&self) {
+        self.event_proxy
+            .send_event(RioEvent::ToggleQuake, self.window_id);
     }
 
     #[inline]

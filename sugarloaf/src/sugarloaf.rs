@@ -996,6 +996,10 @@ impl Sugarloaf<'_> {
             bg,
             grids,
             &self.text,
+            &crate::renderer::cpu::ImageLayers {
+                overlays: &self.image_overlays,
+                data: &self.image_data,
+            },
         );
 
         self.reset();
