@@ -192,12 +192,20 @@ notify = { title = "Error", body = "\\1", urgency = "critical" }
 - **Recolor the tab** — flag a build failure or a finished job at a glance.
 - **Desktop notify**, with urgency levels (`low` / `normal` / `critical`).
 - **Run a command**, detached, on match.
-- **Pipe the screen to a coprocess** — the visible screen, not just the
-  matched line, so the command can see multi-line context.
+- **Pipe the screen to a coprocess** — `feed_screen = true` sends the
+  visible screen plus recent scrollback to the command's stdin, not just
+  the matched line, so it can act on multi-line context; whatever the
+  command prints comes back into the pty.
 - **Type text back into the pty** — auto-answer a prompt.
 
+Regex capture groups substitute into notify / run / send_text /
+coprocess with `\1`…`\9` (`\0` = whole match), as in the error-notify
+example above.
+
 Rules scan the focused pane as it renders; a background tab's output is
-picked up when you switch to it. When a capture feeds a command's
+picked up when you switch to it. Matching is redraw-safe — a rule fires
+once per fresh line, so a repainting TUI or scrolling back doesn't
+re-fire what's already on screen. When a capture feeds a command's
 arguments, put `--` before it so hostile output can't smuggle an option
 (`args = ["--", "\1"]`).
 
