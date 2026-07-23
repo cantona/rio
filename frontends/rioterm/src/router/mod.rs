@@ -1392,6 +1392,7 @@ impl<'a> RouteWindow<'a> {
             font_library,
             open_url,
             session_name,
+            quake,
         )
         .expect("Screen not created");
 

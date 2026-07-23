@@ -121,6 +121,7 @@ impl Screen<'_> {
         font_library: &rio_backend::sugarloaf::font::FontLibrary,
         open_url: Option<String>,
         session_name: Option<String>,
+        ephemeral: bool,
     ) -> Result<Screen<'screen>, Box<dyn Error>> {
         let size = window_properties.size;
         let scale = window_properties.scale;
@@ -220,15 +221,22 @@ impl Screen<'_> {
             shell,
             working_dir,
             spawn_performer: true,
-            persistence: if cfg!(unix) && config.session.uses_daemons() {
+            // An ephemeral window (quake dropdown, settings) is transient
+            // tooling that is never captured in the session, so its panes
+            // must not run behind rio-ptyd daemons — otherwise a daemon is
+            // spawned that the session lifecycle never reaps, and the busy-
+            // shell close rules keep the window open instead of dismissing
+            // it. Force non-persistent, non-autosaving regardless of config.
+            persistence: if !ephemeral && cfg!(unix) && config.session.uses_daemons() {
                 Some(crate::context::PersistenceOptions {
                     ring_bytes: config.session.ring_bytes,
                 })
             } else {
                 None
             },
-            autosave: config.session.restore
-                == rio_backend::config::session::SessionRestore::Always,
+            autosave: !ephemeral
+                && config.session.restore
+                    == rio_backend::config::session::SessionRestore::Always,
             // Set before the initial tab's daemon spawns so it carries the
             // session tag (`rio-ptyd list` groups by it). Patching the
             // config after Screen::new left the first pane untagged.

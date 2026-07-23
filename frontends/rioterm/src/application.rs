@@ -592,6 +592,15 @@ impl Application<'_> {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
                     route.detach_on_close();
                 }
+            } else if let Some(route) = self.router.routes.get(&window_id) {
+                // An ephemeral window (quake dropdown, settings) is never
+                // written to the session, so the session-write kill path
+                // never reaps its daemons. Kill them here or they linger
+                // unreferenced — visible in the rio-ptyd list but with no
+                // window to reattach, so they can never be resumed.
+                if route.ephemeral {
+                    crate::session::kill_persistent_panes(route.window.screen.ctx());
+                }
             }
         }
         #[cfg(not(unix))]
