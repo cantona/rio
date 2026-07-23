@@ -430,8 +430,25 @@ where
                         {
                             #[cfg(unix)]
                             if UnixReady::from(event.readiness()).is_hup() {
-                                // Don't try to do I/O on a dead PTY.
-                                continue;
+                                // The peer hung up (POLLHUP). A local PTY
+                                // also raises a separate ChildEvent::Exited
+                                // via SIGCHLD, so skipping I/O here is safe
+                                // for it — but a remote rio-ptyd PTY only
+                                // learns it died by reading EOF from its
+                                // socket. If we just `continue`, the dead fd
+                                // stays epoll-ready and the reregister below
+                                // re-arms it, spinning this loop at 100% CPU
+                                // forever (one dead daemon pane = one pegged
+                                // core). Drain the final bytes, then tear the
+                                // reader down: HUP is terminal for both a PTY
+                                // master (slave closed) and a socket (daemon
+                                // gone).
+                                let _ = self.pty_read(&mut state, &mut buf);
+                                let _ = self.pty.next_child_event();
+                                self.terminal.lock().exit();
+                                self.event_proxy
+                                    .send_event(RioEvent::Render, self.window_id);
+                                break 'event_loop;
                             }
                             if event.readiness().is_readable() {
                                 if let Err(err) = self.pty_read(&mut state, &mut buf) {
