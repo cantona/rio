@@ -301,6 +301,12 @@ pub struct PersistenceOptions {
 
 #[derive(Clone, Default)]
 pub struct ContextManagerConfig {
+    /// Build contexts without spawning a PTY (see
+    /// `create_dead_context`). Unit tests fork one real `$SHELL` per
+    /// context otherwise, which is slow and flaky under the parallel
+    /// test runner (fork failures surface as random test panics).
+    #[cfg(test)]
+    pub dead_pty: bool,
     pub shell: Shell,
     /// Some = run every pane behind a rio-ptyd daemon so it survives
     /// rio exiting. None on Windows or when [session] persistent=false.
@@ -389,17 +395,7 @@ pub fn create_mock_context<
     dimension: ContextDimension,
 ) -> Context<T> {
     let config = ContextManagerConfig {
-        #[cfg(not(target_os = "windows"))]
-        use_fork: true,
-        working_dir: None,
-        shell: Shell {
-            program: std::env::var("SHELL").unwrap_or("bash".to_string()),
-            args: vec![],
-        },
-        spawn_performer: false,
-        is_native: false,
-        should_update_title_extra: false,
-        cwd: false,
+        dead_pty: true,
         ..ContextManagerConfig::default()
     };
     ContextManager::create_context(
@@ -463,6 +459,18 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         let _ = attach;
 
         let route_id = ROUTE_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+
+        #[cfg(test)]
+        if config.dead_pty {
+            return Ok(create_dead_context(
+                event_proxy,
+                window_id,
+                route_id,
+                rich_text_id,
+                dimension,
+            ));
+        }
+
         let cols: u16 = dimension.columns.try_into().unwrap_or(MIN_COLUMNS as u16);
         let rows: u16 = dimension.lines.try_into().unwrap_or(MIN_LINES as u16);
         #[cfg(not(target_os = "windows"))]
@@ -785,17 +793,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         window_id: WindowId,
     ) -> Result<Self, Box<dyn Error>> {
         let config = ContextManagerConfig {
-            #[cfg(not(target_os = "windows"))]
-            use_fork: true,
-            working_dir: None,
-            shell: Shell {
-                program: std::env::var("SHELL").unwrap_or("bash".to_string()),
-                args: vec![],
-            },
-            spawn_performer: false,
-            is_native: false,
-            should_update_title_extra: false,
-            cwd: false,
+            #[cfg(test)]
+            dead_pty: true,
             ..ContextManagerConfig::default()
         };
         let initial_context = ContextManager::create_context(
@@ -1727,6 +1726,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         );
 
         let context_manager_config = ContextManagerConfig {
+            #[cfg(test)]
+            dead_pty: false,
             cwd: config.navigation.current_working_directory,
             shell,
             working_dir,

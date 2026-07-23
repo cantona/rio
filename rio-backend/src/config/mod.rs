@@ -660,6 +660,9 @@ impl Config {
             if let Some(fill) = navigation_overwrite.unfocused_split_fill {
                 self.navigation.unfocused_split_fill = Some(fill);
             }
+            if let Some(max_tab_width) = navigation_overwrite.max_tab_width {
+                self.navigation.tab_max_width = max_tab_width;
+            }
         }
 
         // Clamp after platform merge so both the base and any override go

@@ -214,6 +214,8 @@ impl Screen<'_> {
         );
 
         let context_manager_config = context::ContextManagerConfig {
+            #[cfg(test)]
+            dead_pty: false,
             cwd: config.navigation.current_working_directory,
             shell,
             working_dir,
@@ -393,6 +395,10 @@ impl Screen<'_> {
             .select_current_based_on_mouse(&self.mouse)
         {
             self.context_manager.select_route_from_current_grid();
+            // The focusing click never reaches on_left_click, so a
+            // selection left behind in the target panel would
+            // drag-extend from its stale anchor; drop it on switch.
+            self.clear_selection();
             return true;
         }
         false
@@ -2439,8 +2445,28 @@ impl Screen<'_> {
         #[cfg(target_os = "macos")]
         self.exec("open", [&processed_uri]);
 
+        // Going through `cmd /c start` re-quotes the argument and
+        // mangles URLs (metacharacters plus cmd.exe batch escaping);
+        // hand the URL to the default handler directly instead.
         #[cfg(windows)]
-        self.exec("cmd", ["/c", "start", "", &processed_uri]);
+        {
+            use std::os::windows::ffi::OsStrExt;
+            let uri: Vec<u16> = std::ffi::OsStr::new(&processed_uri)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let operation: Vec<u16> = "open\0".encode_utf16().collect();
+            unsafe {
+                windows_sys::Win32::UI::Shell::ShellExecuteW(
+                    std::ptr::null_mut(),
+                    operation.as_ptr(),
+                    uri.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+                );
+            }
+        }
     }
 
     pub fn exec<I, S>(&self, program: &str, args: I)
@@ -4543,6 +4569,7 @@ impl Screen<'_> {
                         // atlas-full clear inside `rebuild_row` can
                         // re-set it for the recovery pass below.
                         grid.mark_full_rebuild_done();
+                        #[allow(clippy::needless_range_loop)]
                         for y in 0..p.visible_rows.len() {
                             rebuild_row(p, y, grid, rasterizer);
                         }
@@ -4552,6 +4579,7 @@ impl Screen<'_> {
                         // per-row dirty bit. Set by `snapshot_visible`
                         // for rows it copied this frame; cleared here
                         // so next frame starts clean.
+                        #[allow(clippy::needless_range_loop)]
                         for y in 0..p.visible_rows.len() {
                             if !p.visible_rows[y].dirty {
                                 continue;

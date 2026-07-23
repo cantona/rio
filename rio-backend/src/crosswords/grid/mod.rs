@@ -67,6 +67,14 @@ pub struct Grid<T> {
     /// which per-line dedup (terminal triggers) relies on.
     scroll_epoch: i64,
 
+    /// Total lines ever evicted off the scrollback ring (dropped from
+    /// history at the cap, shrunk by a config change, or purged by
+    /// `clear_history`). Together with `history_size` this defines a
+    /// stable absolute row space: image placements anchor at
+    /// `total_lines_scrolled + history_size + screen_row` and stay
+    /// glued to their content even after the ring saturates.
+    total_lines_scrolled: u64,
+
     /// Per-grid intern table for cell styles. Cells store only a `StyleId`;
     /// the actual fg/bg/underline_color/sgr-flags live here and are looked up
     /// at render/SGR-mutation time. The renderer snapshots a clone under the
@@ -76,6 +84,47 @@ pub struct Grid<T> {
     /// Per-grid storage for the rare per-cell data that used to live inside
     /// `CellExtra` (zero-width chars, hyperlinks, sixel/iterm graphics).
     pub extras_table: ExtrasTable,
+
+    /// When set before `resize`, the column reflow records an exact
+    /// old-row to new-row mapping into `reflow_remap` so the caller
+    /// can re-anchor image placements to wherever their rows landed.
+    /// Costs one Vec sized to the ring, so it is only requested when
+    /// placements exist.
+    pub track_reflow_remap: bool,
+
+    /// Output of the last tracked column reflow; `None` when tracking
+    /// was off or the column count did not change.
+    pub reflow_remap: Option<ReflowRemap>,
+}
+
+/// Exact row mapping recorded during a column reflow, in oldest-first
+/// ring positions. A row's absolute index is `base_abs + position`;
+/// this holds on both sides of the reflow because cap truncation drops
+/// oldest rows and advances the eviction base by the same amount.
+#[derive(Debug, Clone)]
+pub struct ReflowRemap {
+    /// Absolute index of ring position 0 when the reflow started.
+    pub base_abs: u64,
+    /// For each old position, the position where that row's first
+    /// cell landed, or `-1` if the row's content was dropped.
+    pub new_pos: Vec<i64>,
+}
+
+impl ReflowRemap {
+    /// Remap an absolute row through the reflow. `None` means the row
+    /// was dropped. Rows already off the ring pass through unchanged;
+    /// scrollback expiry owns those.
+    pub fn remap_abs(&self, abs: i64) -> Option<i64> {
+        let pos = abs - self.base_abs as i64;
+        if pos < 0 {
+            return Some(abs);
+        }
+        let new = *self.new_pos.get(pos as usize)?;
+        if new < 0 {
+            return None;
+        }
+        Some(self.base_abs as i64 + new)
+    }
 }
 
 /// Slot table for `square::Extras`. Index `0` is reserved as the "no extras"
@@ -90,13 +139,26 @@ pub struct ExtrasTable {
     /// Doubles after every sweep that stays populated, so a grid full of
     /// genuinely live extras isn't re-swept on each image insert.
     gc_watermark: usize,
+
+    /// Allocations since the last mark-and-sweep. The table holds
+    /// hyperlink and zero-width data whose slots stay referenced by
+    /// cells until their rows scroll off the ring; without a periodic
+    /// sweep, hyperlink-heavy workloads exhaust the u16 id space and
+    /// new hyperlinks silently drop. (Images no longer live here;
+    /// placements own them with deterministic cleanup.)
+    allocs_since_reclaim: usize,
 }
 
-/// Sweep floor: well below the u16 id ceiling so orphaned graphic slots
-/// (each pinning a row of pixels via its `TextureRef`) are reclaimed
-/// long before they can pin gigabytes, yet high enough that ordinary
-/// zerowidth/hyperlink churn never triggers a sweep.
+/// Sweep floor: well below the u16 id ceiling so orphaned slots are
+/// reclaimed long before they can exhaust the id space, yet high enough
+/// that ordinary zerowidth/hyperlink churn never triggers a sweep.
 pub const EXTRAS_GC_WATERMARK: usize = 4096;
+
+/// One `reclaim_extras` mark-and-sweep per this many allocations. The
+/// mark walks history rows gated by `has_extras`, so the amortized
+/// cost per allocation stays sub-microsecond while dead slots are
+/// recycled within a bounded drift window.
+const EXTRAS_RECLAIM_CADENCE: usize = 4096;
 
 impl ExtrasTable {
     pub fn new() -> Self {
@@ -106,6 +168,7 @@ impl ExtrasTable {
             slots: vec![None],
             free: Vec::new(),
             gc_watermark: EXTRAS_GC_WATERMARK,
+            allocs_since_reclaim: 0,
         }
     }
 
@@ -128,6 +191,7 @@ impl ExtrasTable {
         &mut self,
         extras: crate::crosswords::square::Extras,
     ) -> crate::crosswords::square::ExtrasId {
+        self.allocs_since_reclaim += 1;
         if let Some(id) = self.free.pop() {
             self.slots[id as usize] = Some(extras);
             return id;
@@ -146,13 +210,23 @@ impl ExtrasTable {
         self.slots.len().saturating_sub(self.free.len() + 1)
     }
 
-    /// Time for `Grid::gc_extras`: either the u16 id space is nearly
+    /// Time for a mark-and-sweep: either the u16 id space is nearly
     /// exhausted, or live slots crossed the doubling watermark — meaning
     /// orphaned slots (cells overwritten by text, rows dropped off the
-    /// scrollback ring) may be pinning dead pixel data via `TextureRef`.
+    /// scrollback ring) may be pinning dead data.
     pub fn under_pressure(&self) -> bool {
         (self.slots.len() >= u16::MAX as usize && self.free.len() < 256)
             || self.live_slots() >= self.gc_watermark
+    }
+
+    /// Whether the caller should run `reclaim_extras` now: either the
+    /// allocation cadence elapsed, or the table is under pressure.
+    pub fn should_reclaim(&self) -> bool {
+        self.allocs_since_reclaim >= EXTRAS_RECLAIM_CADENCE || self.under_pressure()
+    }
+
+    pub(crate) fn reset_reclaim_cadence(&mut self) {
+        self.allocs_since_reclaim = 0;
     }
 
     /// Free every allocated slot whose bit is not set in `live`.
@@ -195,6 +269,9 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
             raw: Storage::with_capacity(lines, columns),
             max_scroll_limit,
             scroll_epoch: 0,
+            total_lines_scrolled: 0,
+            track_reflow_remap: false,
+            reflow_remap: None,
             display_offset: 0,
             saved_cursor: Cursor::default(),
             cursor: Cursor::default(),
@@ -216,7 +293,9 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
     pub fn update_history(&mut self, history_size: usize) {
         let current_history_size = self.history_size();
         if current_history_size > history_size {
-            self.raw.shrink_lines(current_history_size - history_size);
+            let dropped = current_history_size - history_size;
+            self.total_lines_scrolled += dropped as u64;
+            self.raw.shrink_lines(dropped);
         }
         self.display_offset = min(self.display_offset, history_size);
         self.max_scroll_limit = history_size;
@@ -243,6 +322,9 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
     }
 
     fn decrease_scroll_limit(&mut self, count: usize) {
+        // NOTE: not counted into `total_lines_scrolled`. The only
+        // caller is `grow_lines`, which trims the surplus rows created
+        // by growing the visible area; no content leaves the ring.
         let count = min(count, self.history_size());
         if count != 0 {
             self.raw.shrink_lines(min(count, self.history_size()));
@@ -356,7 +438,10 @@ impl<T: GridSquare + Default + PartialEq + Clone> Grid<T> {
             // line even when the history below is already saturated.
             self.scroll_epoch += positions as i64;
 
-            // Create scrollback for the new lines.
+            // Create scrollback for the new lines. Whatever the cap
+            // refuses to grow is evicted off the ring instead.
+            let grown = min(positions, self.max_scroll_limit - self.history_size());
+            self.total_lines_scrolled += (positions - grown) as u64;
             self.increase_scroll_limit(positions);
 
             // Swap the lines fixed at the top to their target positions after rotation.
@@ -469,9 +554,16 @@ impl<T> Grid<T> {
         }
     }
 
+    /// Absolute index of the oldest row still in the ring: the base
+    /// of the stable absolute row space image placements anchor in.
     #[inline]
+    pub fn lines_evicted(&self) -> u64 {
+        self.total_lines_scrolled
+    }
+
     pub fn clear_history(&mut self) {
         // Explicitly purge all lines from history.
+        self.total_lines_scrolled += self.history_size() as u64;
         self.raw.shrink_lines(self.history_size());
 
         // Reset display offset.
@@ -546,14 +638,13 @@ use crate::crosswords::square::Square;
 use crate::crosswords::style::{Style, StyleId};
 
 impl Grid<Square> {
-    /// Free extras slots no longer referenced by any cell.
+    /// Free extras slots no longer referenced by any cell. Mark every
+    /// slot referenced by a live row (visible + history) or a cursor
+    /// template, then free the rest.
     ///
     /// Cells are overwritten and rows drop off the scrollback ring without
-    /// freeing their extras slot, so a session heavy on per-cell extras —
-    /// inline graphics above all — eventually exhausts the u16 id space.
-    /// Mark every slot referenced by a live row (visible + history) or a
-    /// cursor template, then free the rest. Swept graphic slots drop their
-    /// `TextureRef`, which queues the image removal downstream.
+    /// freeing their extras slot, so a session heavy on per-cell extras
+    /// eventually exhausts the u16 id space.
     pub fn gc_extras(&mut self) {
         #[inline]
         fn mark(live: &mut [u64], sq: &Square) {
@@ -580,6 +671,27 @@ impl Grid<Square> {
         mark(&mut live, &self.cursor.template);
         mark(&mut live, &self.saved_cursor.template);
         self.extras_table.sweep_unmarked(&live);
+    }
+
+    /// Allocate an extras slot, transparently running the cadence
+    /// mark-and-sweep when it is due. Callers never orchestrate
+    /// reclamation; the table counts allocations internally and this
+    /// is the only place that acts on the signal.
+    pub fn alloc_extras(
+        &mut self,
+        extras: crate::crosswords::square::Extras,
+    ) -> crate::crosswords::square::ExtrasId {
+        if self.extras_table.should_reclaim() {
+            self.reclaim_extras();
+        }
+        self.extras_table.alloc(extras)
+    }
+
+    /// Cadence-driven counterpart to `gc_extras`: resets the allocation
+    /// counter, then runs the same mark-and-sweep.
+    pub fn reclaim_extras(&mut self) {
+        self.extras_table.reset_reclaim_cadence();
+        self.gc_extras();
     }
 
     /// Read the style associated with the cell's style id.

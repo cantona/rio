@@ -395,6 +395,7 @@ impl Renderer {
                 context.renderable_content.columns = snapshot_cols;
                 context.renderable_content.screen_lines = terminal.screen_lines();
                 context.renderable_content.history_size = terminal.history_size();
+                context.renderable_content.lines_evicted = terminal.lines_evicted();
                 context.renderable_content.blinking_cursor = terminal.blinking_cursor;
                 context.renderable_content.cursor.state = terminal.cursor();
                 if terminal.graphics.kitty_graphics_dirty {
@@ -419,13 +420,13 @@ impl Renderer {
                             .sort_by_key(|p| (p.z_index, p.image_id, p.placement_id));
                         placements
                     };
+                    context.renderable_content.atlas_placements =
+                        terminal.graphics.atlas_placements.clone();
                     context.renderable_content.kitty_graphics_dirty = true;
                     terminal.graphics.kitty_graphics_dirty = false;
                 } else {
                     context.renderable_content.kitty_graphics_dirty = false;
                 }
-                context.renderable_content.has_atlas_graphics =
-                    !terminal.graphics.placed_textures.is_empty();
                 context.renderable_content.frame_damage = damage;
                 drop(terminal);
             }
@@ -436,7 +437,7 @@ impl Renderer {
             let rc = &context.renderable_content;
             let has_overlays = !rc.kitty_placements.is_empty();
             let has_virtual = !rc.kitty_virtual_placements.is_empty();
-            let has_atlas = rc.has_atlas_graphics;
+            let has_atlas = !rc.atlas_placements.is_empty();
             if has_overlays || has_virtual || has_atlas {
                 let layout = context.dimension;
                 // Canonical integer cell stride — line_height already
@@ -444,8 +445,20 @@ impl Renderer {
                 // grid uniform paints with.
                 let cell_width = layout.cell.cell_width as f32;
                 let cell_height = layout.cell.cell_height as f32;
-                let origin_x = panel_rect[0] + grid_scaled_margin.left;
-                let origin_y = panel_rect[1] + grid_scaled_margin.top;
+                // Rounded like the grid's own paint origin
+                // (screen/mod.rs panel_left/panel_top), so image quads
+                // and the clip rect sit exactly on the painted cell
+                // grid instead of up to half a pixel off.
+                let origin_x = (panel_rect[0] + grid_scaled_margin.left).round();
+                let origin_y = (panel_rect[1] + grid_scaled_margin.top).round();
+
+                // Images clip to the panel's cell grid, exactly like
+                // text: without this a wide image paints across split
+                // dividers onto neighbor panels.
+                let clip_x0 = origin_x;
+                let clip_y0 = origin_y;
+                let clip_x1 = origin_x + rc.columns as f32 * cell_width;
+                let clip_y1 = origin_y + rc.screen_lines as f32 * cell_height;
 
                 let overlays = sugarloaf
                     .image_overlays
@@ -453,17 +466,54 @@ impl Renderer {
                     .or_default();
                 overlays.clear();
 
-                if has_overlays {
-                    let viewport = rio_backend::ansi::graphics::OverlayViewport {
-                        cell_width,
-                        cell_height,
-                        origin_x,
-                        origin_y,
-                        history_size: rc.history_size as i64,
-                        display_offset: rc.display_offset as i64,
-                        screen_lines: rc.screen_lines as i64,
-                    };
+                let viewport = rio_backend::ansi::graphics::OverlayViewport {
+                    cell_width,
+                    cell_height,
+                    origin_x,
+                    origin_y,
+                    // Absolute lines above the screen top: ring
+                    // evictions + current history.
+                    history_size: rc.lines_evicted as i64 + rc.history_size as i64,
+                    display_offset: rc.display_offset as i64,
+                    screen_lines: rc.screen_lines as i64,
+                };
 
+                if has_atlas {
+                    // Sixel/iTerm2 grid-plane images draw below text
+                    // and below kitty overlays at the same z.
+                    for p in &rc.atlas_placements {
+                        let Some(geometry) =
+                            rio_backend::ansi::graphics::atlas_overlay_geometry(
+                                p, &viewport,
+                            )
+                        else {
+                            continue;
+                        };
+                        let mut overlay = rio_backend::sugarloaf::GraphicOverlay {
+                            // Per-route atlas key: the window store is shared
+                            // across tabs while GraphicIds restart per
+                            // terminal, so scope by route.
+                            image_id: ImageKey::atlas(context.route_id, p.image_key),
+                            x: geometry.x,
+                            y: geometry.y,
+                            width: geometry.width,
+                            height: geometry.height,
+                            z_index: -1,
+                            source_rect: geometry.source_rect,
+                        };
+                        if rio_backend::ansi::graphics::clip_overlay_to_rect(
+                            &mut overlay,
+                            clip_x0,
+                            clip_y0,
+                            clip_x1,
+                            clip_y1,
+                        ) {
+                            overlays.push(overlay);
+                        }
+                    }
+                }
+
+                if has_overlays {
                     for p in &rc.kitty_placements {
                         let (image_width, image_height) = rc
                             .kitty_images
@@ -480,36 +530,28 @@ impl Renderer {
                         else {
                             continue;
                         };
-                        // This renderer sets no grid scissor, so clip the
-                        // quad to the grid band on the CPU: an image
-                        // scrolled above the top row would otherwise draw
-                        // up into the tab bar, and one past the last row
-                        // over the split/padding below. Map the visible
-                        // screen band back into the geometry's (possibly
-                        // source-cropped) v-range.
-                        let grid_bottom = origin_y + rc.screen_lines as f32 * cell_height;
-                        let top = geometry.y.max(origin_y);
-                        let bottom = (geometry.y + geometry.height).min(grid_bottom);
-                        if bottom <= top || geometry.height <= 0.0 {
-                            continue;
-                        }
-                        let [u0, v0, u1, v1] = geometry.source_rect;
-                        let v_at = |sy: f32| {
-                            v0 + (v1 - v0) * (sy - geometry.y) / geometry.height
-                        };
-                        overlays.push(rio_backend::sugarloaf::GraphicOverlay {
-                            // Per-route image key: the window-level store
-                            // is shared across tabs while kitty ids are
-                            // per-terminal, so scope by route to avoid
-                            // cross-tab collisions.
+                        // Per-route image key: the window-level store is
+                        // shared across tabs while kitty ids are
+                        // per-terminal, so scope by route to avoid
+                        // cross-tab collisions.
+                        let mut overlay = rio_backend::sugarloaf::GraphicOverlay {
                             image_id: ImageKey::kitty(context.route_id, p.image_id),
                             x: geometry.x,
-                            y: top,
+                            y: geometry.y,
                             width: geometry.width,
-                            height: bottom - top,
+                            height: geometry.height,
                             z_index: p.z_index,
-                            source_rect: [u0, v_at(top), u1, v_at(bottom)],
-                        });
+                            source_rect: geometry.source_rect,
+                        };
+                        if rio_backend::ansi::graphics::clip_overlay_to_rect(
+                            &mut overlay,
+                            clip_x0,
+                            clip_y0,
+                            clip_x1,
+                            clip_y1,
+                        ) {
+                            overlays.push(overlay);
+                        }
                     }
                 }
 
@@ -522,23 +564,12 @@ impl Renderer {
                         origin_y,
                         cell_width,
                         cell_height,
+                        (clip_x0, clip_y0, clip_x1, clip_y1),
                     );
                 }
-
-                if has_atlas {
-                    Self::push_atlas_graphic_overlays(
-                        overlays,
-                        rc,
-                        context.route_id,
-                        origin_x,
-                        origin_y,
-                        cell_width,
-                        cell_height,
-                    );
-                }
-            } else {
-                // No placements of any kind — drop stale overlays (kitty
-                // deletes, or the last atlas graphic scrolled out).
+            } else if rc.kitty_graphics_dirty {
+                // All placements (kitty and atlas) were removed, so drop
+                // this panel's overlay vec.
                 sugarloaf.clear_image_overlays_for(context.rich_text_id);
             }
 
@@ -799,6 +830,7 @@ impl Renderer {
     ///    partial visibility (placement scrolled half off-screen) and
     ///    cells that fall in the centering padding
     ///    (`renderPlacement`, `graphics_unicode.zig:212-329`).
+    #[allow(clippy::too_many_arguments)]
     fn push_virtual_placeholder_overlays(
         overlays: &mut Vec<rio_backend::sugarloaf::GraphicOverlay>,
         rc: &RenderableContent,
@@ -807,6 +839,7 @@ impl Renderer {
         origin_y: f32,
         cell_width: f32,
         cell_height: f32,
+        clip: (f32, f32, f32, f32),
     ) {
         use rio_backend::ansi::kitty_virtual::{
             IncompletePlacement, PlaceholderRun, PLACEHOLDER,
@@ -845,6 +878,7 @@ impl Renderer {
                             cell_width,
                             cell_height,
                             VIRTUAL_Z_INDEX,
+                            clip,
                         );
                     }
                     continue;
@@ -881,6 +915,7 @@ impl Renderer {
                                 cell_width,
                                 cell_height,
                                 VIRTUAL_Z_INDEX,
+                                clip,
                             );
                         }
                         // Default missing row/col on the FIRST cell of a
@@ -911,6 +946,7 @@ impl Renderer {
                     cell_width,
                     cell_height,
                     VIRTUAL_Z_INDEX,
+                    clip,
                 );
             }
         }
@@ -934,6 +970,7 @@ impl Renderer {
             cell_width: f32,
             cell_height: f32,
             z_index: i32,
+            clip: (f32, f32, f32, f32),
         ) {
             let vp = rc
                 .kitty_virtual_placements
@@ -966,7 +1003,7 @@ impl Renderer {
                 None => return,
             };
 
-            overlays.push(rio_backend::sugarloaf::GraphicOverlay {
+            let mut overlay = rio_backend::sugarloaf::GraphicOverlay {
                 image_id: ImageKey::kitty(route_id, run.image_id),
                 x: geom.x,
                 y: geom.y,
@@ -974,278 +1011,16 @@ impl Renderer {
                 height: geom.height,
                 z_index,
                 source_rect: geom.source_rect,
-            });
-        }
-    }
-
-    /// Scan visible rows for cells carrying atlas graphics (sixel/iTerm2)
-    /// and push one `GraphicOverlay` per row-run. The backend writes a
-    /// `GraphicCell { texture, offset_x, offset_y }` into every covered
-    /// cell, so contiguous cells continuing the same texture at the
-    /// expected pixel offset coalesce into one overlay; erased or
-    /// overwritten cells break the run and that slice is not drawn.
-    fn push_atlas_graphic_overlays(
-        overlays: &mut Vec<rio_backend::sugarloaf::GraphicOverlay>,
-        rc: &RenderableContent,
-        route_id: usize,
-        origin_x: f32,
-        origin_y: f32,
-        cell_width: f32,
-        cell_height: f32,
-    ) {
-        // Below text, like virtual placements.
-        const ATLAS_Z_INDEX: i32 = -1;
-
-        struct Run {
-            id: u64,
-            tex_w: f32,
-            tex_h: f32,
-            /// Cell size when the graphic was inserted — the pixel stride
-            /// between covered cells. Differs from the live cell size
-            /// after a font resize (the image then scales with the font).
-            insert_cw: f32,
-            insert_ch: f32,
-            src_x0: f32,
-            src_y: f32,
-            start_col: usize,
-            cells: usize,
-        }
-
-        /// Push the run as one overlay: a `source_rect` slice of the
-        /// texture (normalized, resolution-independent) covering the
-        /// run's cells. Edge cells draw only the pixels the image
-        /// actually has.
-        #[allow(clippy::too_many_arguments)]
-        fn flush(
-            overlays: &mut Vec<rio_backend::sugarloaf::GraphicOverlay>,
-            r: Run,
-            route_id: usize,
-            line: usize,
-            origin_x: f32,
-            origin_y: f32,
-            cell_width: f32,
-            cell_height: f32,
-        ) {
-            let src_w = (r.cells as f32 * r.insert_cw).min(r.tex_w - r.src_x0);
-            let src_h = r.insert_ch.min(r.tex_h - r.src_y);
-            if src_w <= 0.0 || src_h <= 0.0 {
-                return;
+            };
+            if rio_backend::ansi::graphics::clip_overlay_to_rect(
+                &mut overlay,
+                clip.0,
+                clip.1,
+                clip.2,
+                clip.3,
+            ) {
+                overlays.push(overlay);
             }
-            overlays.push(rio_backend::sugarloaf::GraphicOverlay {
-                image_id: ImageKey::atlas(route_id, r.id),
-                x: origin_x + r.start_col as f32 * cell_width,
-                y: origin_y + line as f32 * cell_height,
-                width: src_w * (cell_width / r.insert_cw),
-                height: src_h * (cell_height / r.insert_ch),
-                z_index: ATLAS_Z_INDEX,
-                source_rect: [
-                    r.src_x0 / r.tex_w,
-                    r.src_y / r.tex_h,
-                    (r.src_x0 + src_w) / r.tex_w,
-                    (r.src_y + src_h) / r.tex_h,
-                ],
-            });
-        }
-
-        for (line_idx, row) in rc.visible_rows.iter().enumerate() {
-            if !row.has_extras {
-                continue;
-            }
-
-            let mut run: Option<Run> = None;
-
-            for (col_idx, square) in row.inner.iter().enumerate() {
-                // A bg-only cell can still carry the GRAPHICS flag (the
-                // flag survives set_bg_*), but its upper bits now hold the
-                // bg color, so extras_id() would be garbage. Skip it —
-                // matching the backend's is_bg_only guard elsewhere.
-                let graphic = if square.has_graphics() && !square.is_bg_only() {
-                    square
-                        .extras_id()
-                        .and_then(|eid| rc.extras.get(&eid))
-                        .and_then(|e| e.graphic.as_ref())
-                        .and_then(|g| g.first())
-                } else {
-                    None
-                };
-
-                let Some(cell) = graphic else {
-                    if let Some(r) = run.take() {
-                        flush(
-                            overlays,
-                            r,
-                            route_id,
-                            line_idx,
-                            origin_x,
-                            origin_y,
-                            cell_width,
-                            cell_height,
-                        );
-                    }
-                    continue;
-                };
-
-                // Covered cells of one image row share a single
-                // `GraphicCell`; the per-cell x offset is positional:
-                // offset_x + (col - anchor_col) * insert-time cell width.
-                match &mut run {
-                    Some(r)
-                        if r.id == cell.texture.id.get()
-                            && r.src_y == cell.offset_y as f32
-                            && col_idx == r.start_col + r.cells =>
-                    {
-                        r.cells += 1;
-                    }
-                    _ => {
-                        if let Some(r) = run.take() {
-                            flush(
-                                overlays,
-                                r,
-                                route_id,
-                                line_idx,
-                                origin_x,
-                                origin_y,
-                                cell_width,
-                                cell_height,
-                            );
-                        }
-                        let insert_cw = cell.texture.cell_width.max(1) as f32;
-                        // A cell shifted left of its anchor (DCH/reflow
-                        // moved it) would compute a negative source x and
-                        // sample outside the texture; clamp to the left
-                        // edge instead of emitting an out-of-range UV.
-                        let src_x0 = (cell.offset_x as f32
-                            + (col_idx as f32 - cell.anchor_col as f32) * insert_cw)
-                            .max(0.0);
-                        run = Some(Run {
-                            id: cell.texture.id.get(),
-                            tex_w: cell.texture.width as f32,
-                            tex_h: cell.texture.height as f32,
-                            insert_cw,
-                            insert_ch: cell.texture.cell_height.max(1) as f32,
-                            src_x0,
-                            src_y: cell.offset_y as f32,
-                            start_col: col_idx,
-                            cells: 1,
-                        });
-                    }
-                }
-            }
-
-            if let Some(r) = run {
-                flush(
-                    overlays,
-                    r,
-                    route_id,
-                    line_idx,
-                    origin_x,
-                    origin_y,
-                    cell_width,
-                    cell_height,
-                );
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod atlas_overlay_tests {
-    use super::Renderer;
-    use rio_backend::ansi::CursorShape;
-    use rio_backend::crosswords::{Crosswords, CrosswordsSize};
-    use rio_backend::event::{TerminalDamage, VoidListener};
-
-    /// Drive the renderer's real frame protocol (peek damage ->
-    /// snapshot_visible -> push_atlas_graphic_overlays) over two chafa
-    /// renders, the second starting from the bottom row, and assert the
-    /// second image's quads land on its final rows.
-    #[test]
-    fn second_sixel_render_quads_track_final_rows() {
-        let size = CrosswordsSize::new(20, 10);
-        let window_id = rio_backend::event::WindowId::from(0);
-        let mut term = Crosswords::new(
-            size,
-            CursorShape::Block,
-            VoidListener {},
-            window_id,
-            0,
-            10_000,
-        );
-        term.graphics.cell_width = 10.0;
-        term.graphics.cell_height = 10.0;
-        let mut processor = rio_backend::performer::handler::Processor::default();
-
-        let mut img = String::from("\x1b[?25l\x1b[?80l\x1b[?8452l");
-        img.push_str("\x1bP0;0;0q\"1;1;40;60#1;2;100;0;0");
-        for band in 0..10 {
-            if band > 0 {
-                img.push('-');
-            }
-            img.push_str("#1!40~");
-        }
-        img.push_str("\x1b\\\x1b[?25h");
-
-        let mut rc = crate::context::renderable::RenderableContent::new(
-            crate::context::renderable::Cursor::default(),
-        );
-
-        let frame = |term: &mut Crosswords<VoidListener>,
-                     rc: &mut crate::context::renderable::RenderableContent|
-         -> Vec<rio_backend::sugarloaf::GraphicOverlay> {
-            let damage = term.peek_damage_event().unwrap_or(TerminalDamage::Noop);
-            term.reset_damage();
-            let cols = term.columns();
-            term.snapshot_visible(
-                &damage,
-                cols,
-                &mut rc.visible_rows,
-                &mut rc.style_table,
-                &mut rc.extras,
-            );
-            let mut overlays = Vec::new();
-            Renderer::push_atlas_graphic_overlays(
-                &mut overlays,
-                rc,
-                0,
-                0.0,
-                0.0,
-                10.0,
-                10.0,
-            );
-            overlays
-        };
-
-        // Frame 1: first render near the top plus its prompt.
-        processor.advance(&mut term, img.as_bytes());
-        processor.advance(&mut term, b"\r\n$ ");
-        let f1 = frame(&mut term, &mut rc);
-        assert!(!f1.is_empty(), "first render should produce quads");
-        let min_y1 = f1.iter().map(|o| o.y as i32).min().unwrap();
-        assert_eq!(min_y1, 0, "first image starts at the top row");
-
-        // Frame 2: park the cursor on the bottom row, render again.
-        while term.grid.cursor.pos.row.0 < 9 {
-            processor.advance(&mut term, b"\n");
-        }
-        processor.advance(&mut term, img.as_bytes());
-        processor.advance(&mut term, b"\r\n$ ");
-        let f2 = frame(&mut term, &mut rc);
-
-        // The image is 6 rows tall and ends one scroll above the
-        // prompt: quads must sit exactly on rows 3..=8, each sourcing
-        // the band matching its row, and no quad may touch row 9.
-        let mut ys: Vec<i32> = f2.iter().map(|o| o.y as i32).collect();
-        ys.sort_unstable();
-        assert_eq!(ys, vec![30, 40, 50, 60, 70, 80], "quad rows wrong: {ys:?}");
-        for o in &f2 {
-            let row = (o.y / 10.0) as i32;
-            let band = (o.source_rect[1] * 60.0).round() as i32 / 10;
-            assert_eq!(
-                band,
-                row - 3,
-                "row {row} must source band {}, got {band}",
-                row - 3
-            );
         }
     }
 }

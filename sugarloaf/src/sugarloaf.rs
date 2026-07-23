@@ -60,6 +60,7 @@ pub struct Sugarloaf<'a> {
     text: crate::text::Text,
     /// Per-panel (rich_text_id) image overlays. Driven by the kitty
     /// graphics frontend path; read by the renderer's image pass.
+    /// Rebuilt by `Renderer::run` for dirty panels each frame.
     pub image_overlays:
         rustc_hash::FxHashMap<usize, Vec<crate::sugarloaf::graphics::GraphicOverlay>>,
     /// Owned context (device + swapchain + queue). Last so the device
@@ -914,6 +915,14 @@ impl Sugarloaf<'_> {
         // Drop this frame's UI text instances — overlays re-record
         // next frame (immediate mode).
         self.text.clear();
+    }
+
+    /// Remove an image's pixel data and its cached GPU texture.
+    /// `key` is an `ImageKey` (`ImageKey::kitty` / `ImageKey::atlas`).
+    #[inline]
+    pub fn remove_image(&mut self, key: ImageKey) {
+        self.image_data.remove(&key);
+        self.renderer.evict_image_texture(key);
     }
 
     /// Drop everything this frame's immediate-mode producers pushed
