@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 // pull them in explicitly.
 use fontconfig_sys as fc;
 use fontconfig_sys::constants::{
-    FC_CHARSET, FC_FAMILY, FC_FILE, FC_INDEX, FC_LANG, FC_MONO, FC_SLANT,
+    FC_CHARSET, FC_COLOR, FC_FAMILY, FC_FILE, FC_INDEX, FC_LANG, FC_MONO, FC_SLANT,
     FC_SLANT_ITALIC, FC_SPACING, FC_WEIGHT, FC_WEIGHT_BOLD,
 };
 
@@ -60,6 +60,7 @@ pub fn discover_fallback(
     want_mono: bool,
     want_bold: bool,
     want_italic: bool,
+    want_emoji: bool,
 ) -> Option<(PathBuf, u32)> {
     let cfg = fc_config();
     if cfg.is_null() {
@@ -86,16 +87,24 @@ pub fn discover_fallback(
         }
 
         // Family hint — fontconfig prefers fonts whose family name
-        // matches or that have a strong alias to the primary.
-        let family_c = match CString::new(primary_family) {
-            Ok(s) => s,
-            Err(_) => CString::new("monospace").unwrap(),
-        };
+        // matches or that have a strong alias to the primary. For
+        // emoji-presentation codepoints, hint the generic `emoji`
+        // family (aliased to the installed color font) and require a
+        // color-capable face, or the sort ranks monochrome symbol
+        // fonts first and every smiley comes out black-and-white.
+        let family_c =
+            match CString::new(if want_emoji { "emoji" } else { primary_family }) {
+                Ok(s) => s,
+                Err(_) => CString::new("monospace").unwrap(),
+            };
         fc::FcPatternAddString(
             pattern,
             FC_FAMILY.as_ptr(),
             family_c.as_ptr() as *const fc::FcChar8,
         );
+        if want_emoji {
+            fc::FcPatternAddBool(pattern, FC_COLOR.as_ptr(), 1);
+        }
 
         // Charset constraint — the killer feature. fontconfig's sort
         // gives heaviest weight to charset coverage, so the top

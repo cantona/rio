@@ -151,6 +151,60 @@ fn cluster_covered(
     }
 }
 
+/// True for codepoints whose default presentation is the colorful
+/// emoji glyph. Monochrome symbol fonts (Symbola, Noto Sans Symbols)
+/// cover most of these ranges and would win a plain first-covering
+/// walk, so the font match and the system cascade both use this to
+/// prefer a color-emoji font. Slightly over-inclusive on purpose:
+/// terminals render the pictographic blocks in color across the board.
+pub(crate) fn prefers_emoji_presentation(ch: char) -> bool {
+    matches!(u32::from(ch),
+        // Plane-1 pictographic blocks, emoji-default almost throughout
+        // (the few text-default weather glyphs there are still wide and
+        // near-universally meant as emoji in terminal output).
+        0x1F000..=0x1FAFF
+        // BMP codepoints with Emoji_Presentation=Yes — and only those:
+        // painting a text-default width-1 symbol (☀, ☂, ♻…) with a
+        // two-cell color glyph overdraws its neighbor.
+        | 0x231A..=0x231B           // watch, hourglass
+        | 0x23E9..=0x23EC | 0x23F0 | 0x23F3 // AV controls, alarm
+        | 0x25FD..=0x25FE           // small squares
+        | 0x2614..=0x2615           // umbrella w/ rain, hot beverage
+        | 0x2648..=0x2653 | 0x267F  // zodiac, wheelchair
+        | 0x2693 | 0x26A1 | 0x26AA..=0x26AB
+        | 0x26BD..=0x26BE | 0x26C4..=0x26C5
+        | 0x26CE | 0x26D4 | 0x26EA | 0x26F2..=0x26F3
+        | 0x26F5 | 0x26FA | 0x26FD
+        | 0x2705 | 0x270A..=0x270B | 0x2728
+        | 0x274C | 0x274E | 0x2753..=0x2755 | 0x2757
+        | 0x2795..=0x2797 | 0x27B0 | 0x27BF
+        | 0x2B1B..=0x2B1C | 0x2B50 | 0x2B55
+    )
+}
+
+#[test]
+fn emoji_presentation_split() {
+    // Emoji-default: the whole smiley/pictograph planes and the BMP
+    // Emoji_Presentation=Yes set.
+    for ch in [
+        '\u{1F600}',
+        '\u{1FAE0}',
+        '\u{2705}',
+        '\u{274C}',
+        '\u{2B50}',
+        '\u{26A1}',
+    ] {
+        assert!(prefers_emoji_presentation(ch), "{ch:?} should prefer emoji");
+    }
+    // Text-default width-1 symbols must NOT be painted as color emoji --
+    // a two-cell color glyph would overdraw the neighbor cell.
+    for ch in [
+        '\u{2600}', '\u{2602}', '\u{2122}', '\u{00A9}', '\u{2194}', 'A', '\u{4E2D}',
+    ] {
+        assert!(!prefers_emoji_presentation(ch), "{ch:?} must stay text");
+    }
+}
+
 pub fn lookup_for_font_match(
     cluster: &mut CharCluster,
     synth: &mut Synthesis,
@@ -161,6 +215,16 @@ pub fn lookup_for_font_match(
     // whenever it covers the cluster. Fonts routinely ship bold as
     // 600 or report styles the weight-based walk rejects, which used
     // to send bold/italic cells to the regular face (#1110).
+    // An emoji-presentation cluster must not settle for the first
+    // covering font: monochrome symbol fonts cover most emoji ranges
+    // and would shadow a color font registered later in the list. Keep
+    // the first monochrome hit as a fallback and keep walking for a
+    // color font.
+    let emoji_pref = cluster
+        .chars()
+        .first()
+        .is_some_and(|c| prefers_emoji_presentation(c.ch));
+
     if let Some(spec) = spec {
         let slot = match (spec.bold, spec.italic) {
             (false, true) => FONT_ID_ITALIC,
@@ -170,7 +234,7 @@ pub fn lookup_for_font_match(
         };
         let slot = library.resolve_id(slot);
         if let Some(FontEntry::Owned(font)) = library.inner.get(&slot) {
-            if cluster_covered(cluster, library, slot, font) {
+            if !emoji_pref && cluster_covered(cluster, library, slot, font) {
                 *synth = font.synth;
                 return Some((slot, font.is_emoji));
             }
@@ -178,6 +242,7 @@ pub fn lookup_for_font_match(
     }
 
     let mut search_result = None;
+    let mut mono_fallback: Option<(usize, Synthesis)> = None;
 
     let fonts_len: usize = library.inner.len();
     for font_id in 0..fonts_len {
@@ -200,9 +265,22 @@ pub fn lookup_for_font_match(
         }
 
         if cluster_covered(cluster, library, font_id, font) {
+            if emoji_pref && !is_emoji {
+                if mono_fallback.is_none() {
+                    mono_fallback = Some((font_id, font_synth));
+                }
+                continue;
+            }
             *synth = font_synth;
             search_result = Some((font_id, is_emoji));
             break;
+        }
+    }
+
+    if search_result.is_none() {
+        if let Some((font_id, font_synth)) = mono_fallback {
+            *synth = font_synth;
+            search_result = Some((font_id, false));
         }
     }
 
@@ -288,11 +366,23 @@ impl FontLibrary {
         // Fast path: codepoint is covered by an already-registered
         // font. No locks upgraded, no FFI call. Shared across all
         // platforms — only the cascade-discovery slow path differs.
-        if let Some(found) =
+        let registered =
             self.inner
                 .read()
-                .find_best_font_match_strict(ch, fragment_style, route_id)
-        {
+                .find_best_font_match_strict(ch, fragment_style, route_id);
+        if let Some(found) = registered {
+            // A monochrome hit for an emoji-presentation codepoint only
+            // means no color font is REGISTERED yet — ask the system
+            // cascade for one before settling (it registers what it
+            // finds, so this runs once per uncovered codepoint).
+            if found.1 || !prefers_emoji_presentation(ch) {
+                return found;
+            }
+            if let Some(discovered) = self.cascade_discover(ch, fragment_style) {
+                if discovered.1 {
+                    return discovered;
+                }
+            }
             return found;
         }
 
@@ -352,9 +442,12 @@ impl FontLibrary {
         let primary_family = self.primary_family_name()?;
         let want_bold = fragment_style.font_attrs.weight() == swash::Weight::BOLD;
         let want_italic = fragment_style.font_attrs.style() == swash::Style::Italic;
-        // Terminal — always bias toward monospace for consistent cell
-        // widths, even for fallback glyphs.
-        let want_mono = true;
+        // Terminal — bias toward monospace for consistent cell widths,
+        // except for emoji-presentation codepoints: color emoji fonts
+        // are never monospace, and the mono bias is what ranked
+        // monochrome symbol fonts above them.
+        let want_emoji = prefers_emoji_presentation(ch);
+        let want_mono = !want_emoji;
 
         #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
         let discovered = crate::font::linux::discover_fallback(
@@ -363,6 +456,7 @@ impl FontLibrary {
             want_mono,
             want_bold,
             want_italic,
+            want_emoji,
         )?;
 
         #[cfg(target_os = "windows")]

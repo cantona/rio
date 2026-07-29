@@ -2160,6 +2160,7 @@ pub fn build_row_fg(
                 glyph_id,
                 size_bucket,
                 size_u16,
+                cell_w,
                 cell_h,
                 ascent_px,
                 is_emoji,
@@ -2392,6 +2393,7 @@ fn ensure_glyph_by_id(
     glyph_id: u16,
     size_bucket: u16,
     size_u16: u16,
+    cell_w: f32,
     cell_h: f32,
     ascent_px: i16,
     is_emoji: bool,
@@ -2411,7 +2413,7 @@ fn ensure_glyph_by_id(
     }
 
     // Rasterize via the platform-native backend.
-    let raw = rasterize_glyph_native(
+    let mut raw = rasterize_glyph_native(
         rasterizer,
         font_id,
         glyph_id,
@@ -2420,6 +2422,54 @@ fn ensure_glyph_by_id(
         synthetic_bold,
         synthetic_italic,
     )?;
+
+    // Color emoji fill their authored em edge to edge (Noto's bitmaps
+    // carry no padding), so at font size adjacent emoji fuse into a
+    // solid wall — and the scaler's own bitmap downscaling collapses
+    // round faces into squares at terminal sizes. Render the strike at
+    // a size the scaler handles cleanly and area-downscale it here,
+    // fitted to ~85% of the cell height with a real horizontal gap
+    // inside the double-cell span (the proportion the GTK terminals
+    // render at).
+    let mut center_in_double_cell = false;
+    if raw.is_color {
+        let max_w = (2.0 * cell_w - 4.0).max(4.0);
+        let max_h = (cell_h * 0.85).max(4.0);
+        let ref_size = size_u16.clamp(64, 256);
+        if let Some(reference) = rasterize_glyph_native(
+            rasterizer,
+            font_id,
+            glyph_id,
+            ref_size,
+            is_emoji,
+            synthetic_bold,
+            synthetic_italic,
+        ) {
+            if reference.is_color && reference.width > 0 && reference.height > 0 {
+                let fit = (max_w / reference.width as f32)
+                    .min(max_h / reference.height as f32)
+                    .min(1.0);
+                let tw = ((reference.width as f32 * fit).round() as u32).max(1);
+                let th = ((reference.height as f32 * fit).round() as u32).max(1);
+                let bytes = downscale_rgba_area(
+                    &reference.bytes,
+                    reference.width,
+                    reference.height,
+                    tw,
+                    th,
+                );
+                raw = RawGlyph {
+                    width: tw,
+                    height: th,
+                    left: 0,
+                    top: th as i32,
+                    is_color: true,
+                    bytes,
+                };
+            }
+        }
+        center_in_double_cell = true;
+    }
     let is_color = raw.is_color;
 
     // Convert CG-convention `left`/`top` into grid-convention
@@ -2430,10 +2480,29 @@ fn ensure_glyph_by_id(
         let cell_h_i16 = cell_h.round().clamp(0.0, i16::MAX as f32) as i16;
         cell_h_i16.saturating_sub(ascent_px).saturating_add(top_i16)
     };
+    // Center a fitted emoji in its two-cell span (and vertically in
+    // the cell) instead of seating it on the text baseline, where the
+    // reduced glyph would sit high and left.
+    let (bearing_x, bearing_y) = if center_in_double_cell {
+        let span_w = (2.0 * cell_w).round() as i32;
+        let x = ((span_w - raw.width as i32) / 2).max(0);
+        let cell_h_i = cell_h.round() as i32;
+        let y_top = ((cell_h_i - raw.height as i32) / 2).max(0);
+        let y = (cell_h_i - y_top).clamp(i16::MIN as i32, i16::MAX as i32);
+        (
+            x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            (y - cell_h_i + cell_h_i).min(i16::MAX as i32) as i16,
+        )
+    } else {
+        (
+            raw.left.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            bearing_y,
+        )
+    };
     let raster = RasterizedGlyph {
         width: raw.width.min(u16::MAX as u32) as u16,
         height: raw.height.min(u16::MAX as u32) as u16,
-        bearing_x: raw.left.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+        bearing_x,
         bearing_y,
         bytes: &raw.bytes,
     };
@@ -2558,6 +2627,52 @@ struct RawGlyph {
     top: i32,
     is_color: bool,
     bytes: Vec<u8>,
+}
+
+/// Area-average downscale for premultiplied RGBA glyph bitmaps.
+/// Every output pixel integrates the exact (fractional) source
+/// rectangle it covers, so high-ratio reductions keep round shapes
+/// round instead of collapsing soft alpha edges the way point or
+/// small-kernel sampling does.
+fn downscale_rgba_area(src: &[u8], sw: u32, sh: u32, tw: u32, th: u32) -> Vec<u8> {
+    let (sw, sh, tw, th) = (sw as usize, sh as usize, tw as usize, th as usize);
+    let mut out = vec![0u8; tw * th * 4];
+    let x_ratio = sw as f32 / tw as f32;
+    let y_ratio = sh as f32 / th as f32;
+    for ty in 0..th {
+        let y0 = ty as f32 * y_ratio;
+        let y1 = (ty + 1) as f32 * y_ratio;
+        for tx in 0..tw {
+            let x0 = tx as f32 * x_ratio;
+            let x1 = (tx + 1) as f32 * x_ratio;
+            let mut acc = [0.0f32; 4];
+            let mut area = 0.0f32;
+            let mut sy = y0.floor() as usize;
+            while (sy as f32) < y1 && sy < sh {
+                let hy = (y1.min((sy + 1) as f32) - y0.max(sy as f32)).max(0.0);
+                let mut sx = x0.floor() as usize;
+                while (sx as f32) < x1 && sx < sw {
+                    let wx = (x1.min((sx + 1) as f32) - x0.max(sx as f32)).max(0.0);
+                    let w = hy * wx;
+                    let p = (sy * sw + sx) * 4;
+                    acc[0] += src[p] as f32 * w;
+                    acc[1] += src[p + 1] as f32 * w;
+                    acc[2] += src[p + 2] as f32 * w;
+                    acc[3] += src[p + 3] as f32 * w;
+                    area += w;
+                    sx += 1;
+                }
+                sy += 1;
+            }
+            let o = (ty * tw + tx) * 4;
+            if area > 0.0 {
+                for c in 0..4 {
+                    out[o + c] = (acc[c] / area).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(target_os = "macos")]
