@@ -659,7 +659,7 @@ fn nested_split_active_pane_capture() {
     use crate::context::{create_mock_context, ContextDimension};
     use crate::session::{LayoutNode, PaneState};
     use rio_backend::event::VoidListener;
-    use rio_window::window::WindowId;
+    use rio_backend::event::WindowId;
 
     let dims = TextDimensions {
         scale: 1.,

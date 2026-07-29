@@ -13,6 +13,7 @@ use rio_backend::clipboard::Clipboard;
 use rio_backend::config::Config as RioConfig;
 use rio_backend::error::{RioError, RioErrorLevel, RioErrorType};
 
+use rio_backend::event::WindowId;
 use rio_window::dpi::{PhysicalPosition, PhysicalSize};
 use rio_window::event_loop::ActiveEventLoop;
 use rio_window::keyboard::{Key, NamedKey};
@@ -20,7 +21,7 @@ use rio_window::keyboard::{Key, NamedKey};
 use rio_window::platform::startup_notify::{
     self, EventLoopExtStartupNotify, WindowAttributesExtStartupNotify,
 };
-use rio_window::window::{Window, WindowId};
+use rio_window::window::Window;
 use routes::{assistant, RoutePath};
 use rustc_hash::FxHashMap;
 use std::time::{Duration, Instant};
@@ -1086,7 +1087,7 @@ impl Router<'_> {
             None,
             false,
         );
-        let id = window.winit_window.id();
+        let id: WindowId = window.winit_window.id().into();
         let mut route = Route::new(Assistant::new(), RoutePath::Terminal, window);
         route.ephemeral = true;
         self.routes.insert(id, route);
@@ -1153,7 +1154,7 @@ impl Router<'_> {
             session_name.clone(),
             false,
         );
-        let id = window.winit_window.id();
+        let id: WindowId = window.winit_window.id().into();
 
         let mut route = Route {
             window,
@@ -1193,7 +1194,7 @@ impl Router<'_> {
             None,
             true,
         );
-        let id = window.winit_window.id();
+        let id: WindowId = window.winit_window.id().into();
         self.routes.insert(
             id,
             Route {
@@ -1234,7 +1235,7 @@ impl Router<'_> {
             false,
         );
         self.routes.insert(
-            window.winit_window.id(),
+            window.winit_window.id().into(),
             Route {
                 window,
                 path: RoutePath::Terminal,

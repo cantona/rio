@@ -14,6 +14,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use raw_window_handle::HasDisplayHandle;
 use rio_backend::clipboard::{Clipboard, ClipboardType};
 use rio_backend::config::colors::{ColorRgb, NamedColor};
+use rio_backend::event::WindowId;
 use rio_window::application::ApplicationHandler;
 use rio_window::event::{
     ElementState, Ime, MouseButton, MouseScrollDelta, StartCause, TouchPhase, WindowEvent,
@@ -25,7 +26,6 @@ use rio_window::event_loop::{DeviceEvents, EventLoop};
 use rio_window::platform::macos::ActiveEventLoopExtMacOS;
 #[cfg(target_os = "macos")]
 use rio_window::platform::macos::WindowExtMacOS;
-use rio_window::window::WindowId;
 use rio_window::window::{CursorIcon, Fullscreen};
 use std::error::Error;
 use std::time::{Duration, Instant};
@@ -732,7 +732,7 @@ impl Application<'_> {
     /// centered, sized by the configured percentages, then show it.
     fn show_quake_window(
         &mut self,
-        id: rio_window::window::WindowId,
+        id: rio_backend::event::WindowId,
         event_loop: &ActiveEventLoop,
     ) {
         #[cfg(target_os = "macos")]
@@ -755,9 +755,25 @@ impl Application<'_> {
                 * self.config.window.quake_height_percentage.clamp(0.1, 1.0))
                 as u32;
             let x = mpos.x + (msize.width.saturating_sub(width) / 2) as i32;
-            let _ = window
-                .request_inner_size(rio_window::dpi::PhysicalSize::new(width, height));
-            window.set_outer_position(rio_window::dpi::PhysicalPosition::new(x, mpos.y));
+            #[cfg(target_os = "macos")]
+            {
+                let scale = monitor.scale_factor();
+                let size: rio_window::dpi::LogicalSize<f64> =
+                    rio_window::dpi::PhysicalSize::new(width, height).to_logical(scale);
+                let pos: rio_window::dpi::LogicalPosition<f64> =
+                    rio_window::dpi::PhysicalPosition::new(x, mpos.y).to_logical(scale);
+                let _ = window.request_inner_size(size);
+                window.set_outer_position(pos);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = window.request_inner_size(rio_window::dpi::PhysicalSize::new(
+                    width, height,
+                ));
+                window.set_outer_position(rio_window::dpi::PhysicalPosition::new(
+                    x, mpos.y,
+                ));
+            }
         }
         window.set_visible(true);
         window.focus_window();
@@ -929,7 +945,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
         if !self.scheduler.scheduled(timer_id) {
             self.scheduler.schedule(
                 EventPayload::new(RioEventType::Rio(RioEvent::UpdateTitles), unsafe {
-                    rio_window::window::WindowId::dummy()
+                    rio_window::window::WindowId::dummy().into()
                 }),
                 Duration::from_secs(2),
                 true,
@@ -2217,13 +2233,17 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        window_id: WindowId,
+        window_id: rio_window::window::WindowId,
         event: WindowEvent,
     ) {
         // Ignore all events we do not care about.
         if Self::skip_window_event(&event) {
             return;
         }
+
+        // The event loop keys on rio-window's id; the router keys on the
+        // core's `WindowId`. Convert once at this boundary.
+        let window_id: rio_backend::event::WindowId = window_id.into();
 
         let route = match self.router.routes.get_mut(&window_id) {
             Some(window) => window,
