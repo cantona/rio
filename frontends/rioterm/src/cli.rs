@@ -49,8 +49,14 @@ pub struct TerminalOptions {
 
     /// Bind this instance to a named session: restores
     /// sessions/<NAME>.json on launch and saves back to it.
-    #[clap(long, value_name = "NAME")]
+    #[clap(long, value_name = "NAME", conflicts_with = "standalone")]
     pub session: Option<String>,
+
+    /// Run this instance with sessions off: nothing is restored or
+    /// saved, no prompts, and panes run as plain shells without
+    /// rio-ptyd daemons — regardless of the configured [session].
+    #[clap(long)]
+    pub standalone: bool,
 }
 
 impl TerminalOptions {

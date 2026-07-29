@@ -82,6 +82,9 @@ max-scrollback-lines = 2000
 - `ctrl+shift+s` saves on demand, with a "session saved" flash.
 - Named workspaces: `rio --session work`, or the command palette's session
   save/restore actions.
+- `rio --standalone` runs one instance with sessions fully off — nothing
+  restored or saved, no prompts, plain shells with no daemons — without
+  touching your config.
 - The launch resume prompt offers three choices: `r` resume the saved
   session, `n` start new and discard the old one (its persistent daemons, if
   any, are killed — not stranded), or `k` start new but keep the old session

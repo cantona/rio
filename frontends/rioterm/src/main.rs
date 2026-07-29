@@ -164,6 +164,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(err) => (rio_backend::config::Config::default(), Some(err)),
     };
 
+    // A standalone instance runs with sessions fully off: no restore,
+    // no saves or prompts (unnamed close disposition becomes Nothing),
+    // and uses_daemons() turns false so panes spawn as plain shells.
+    if args.window_options.terminal_options.standalone {
+        config.session.restore = rio_backend::config::session::SessionRestore::Never;
+        config.session.persistent = false;
+    }
+
     // Read platform property and overwrite values per OS
     //
     // [shell]
