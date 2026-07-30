@@ -192,10 +192,10 @@ release-debian-wayland:
 # Release and Install
 install-debian-x11:
 	cargo install cargo-deb
-	cargo deb -p rioterm --install -- --release --no-default-features --features=x11
+	cargo deb -p rioterm --install -- --no-default-features --features=x11
 install-debian-wayland:
 	cargo install cargo-deb
-	cargo deb -p rioterm --install -- --release --no-default-features --features=wayland
+	cargo deb -p rioterm --install -- --no-default-features --features=wayland
 
 # cargo install cargo-wix
 # https://github.com/volks73/cargo-wix
