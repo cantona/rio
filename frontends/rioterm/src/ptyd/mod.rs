@@ -540,7 +540,7 @@ impl EventedPty for RemotePty {
             );
         }
         (self.reader.exited.is_some() || self.reader.link_lost)
-            .then_some(ChildEvent::Exited)
+            .then_some(ChildEvent::Exited(self.reader.exited))
     }
 }
 
@@ -572,7 +572,7 @@ impl From<io::Error> for AttachError {
 impl RemotePty {
     fn finish_attach(
         transport: Transport,
-        ws: &WinsizeBuilder,
+        ws: &rio_backend::event::WindowSize,
         timeout: Duration,
     ) -> Result<(RemotePty, HelloInfo), AttachError> {
         // Hello exchange in blocking mode with a poll() deadline.
@@ -753,7 +753,7 @@ impl RemotePty {
 
     pub fn attach_unix(
         socket: &Path,
-        ws: &WinsizeBuilder,
+        ws: &rio_backend::event::WindowSize,
         timeout: Duration,
     ) -> Result<(RemotePty, HelloInfo), AttachError> {
         let stream = UnixStream::connect(socket)?;
@@ -763,7 +763,7 @@ impl RemotePty {
     pub fn attach_ssh(
         dest: &str,
         pane_id: &str,
-        ws: &WinsizeBuilder,
+        ws: &rio_backend::event::WindowSize,
         timeout: Duration,
     ) -> Result<(RemotePty, HelloInfo), AttachError> {
         if !rio_ptyd::sockdir::is_valid_pane_id(pane_id) {
@@ -804,13 +804,20 @@ impl RemotePty {
 
     /// Run `rio-ptyd spawn`, parse its handshake line, attach locally.
     pub fn spawn_local(
-        program: &str,
+        program: Option<&str>,
         args: &[String],
         cwd: &Option<String>,
         session: Option<&str>,
-        ws: &WinsizeBuilder,
+        ws: &rio_backend::event::WindowSize,
         ring_bytes: usize,
     ) -> Result<(RemotePty, HelloInfo, String, PathBuf), AttachError> {
+        // The daemon CLI needs a concrete program; `None` means the
+        // user's default shell, resolved the same way a login would.
+        let program = match program {
+            Some(p) => p.to_string(),
+            None => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+        };
+        let program = program.as_str();
         let mut cmd = Command::new(ptyd_binary());
         cmd.arg("spawn")
             .arg("--ring-size")

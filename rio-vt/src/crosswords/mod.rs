@@ -1211,8 +1211,6 @@ impl<U: EventListener> Crosswords<U> {
 
     #[inline]
     pub fn scroll_up_relative(&mut self, origin: Line, mut lines: usize) {
-        debug!("Scrolling up: origin={origin}, lines={lines}");
-
         lines = std::cmp::min(
             lines,
             (self.scroll_region.end - self.scroll_region.start).0 as usize,
@@ -1221,10 +1219,12 @@ impl<U: EventListener> Crosswords<U> {
         let region = origin..self.scroll_region.end;
 
         // Scroll selection.
-        self.selection = self
-            .selection
-            .take()
-            .and_then(|s| s.rotate(&self.grid, &region, lines as i32));
+        if self.selection.is_some() {
+            self.selection = self
+                .selection
+                .take()
+                .and_then(|s| s.rotate(&self.grid, &region, lines as i32));
+        }
 
         self.grid.scroll_up(&region, lines);
 
@@ -1239,9 +1239,14 @@ impl<U: EventListener> Crosswords<U> {
         if (top <= *line) && region.end > *line {
             *line = std::cmp::max(*line - lines, top);
         }
-        // Mark all lines in the scroll region as damaged (not full damage)
-        for line in region.start.0..region.end.0 {
-            self.damage.damage_line(line as usize);
+        // Mark the scroll region as damaged; a full-screen region
+        // coalesces into full damage, like scroll_down_relative.
+        if region.start.0 == 0 && region.end.0 as usize == self.grid.screen_lines() {
+            self.mark_fully_damaged();
+        } else {
+            for line in region.start.0..region.end.0 {
+                self.damage.damage_line(line as usize);
+            }
         }
         if !self.graphics.kitty_placements.is_empty() {
             // Placements whose rows all scrolled off the ring expire,
@@ -1499,6 +1504,206 @@ impl<U: EventListener> Crosswords<U> {
         if has_extras {
             let row = self.grid.cursor.pos.row;
             self.grid[row].has_extras = true;
+        }
+    }
+
+    /// Write one non-zero-width codepoint at the cursor with scalar wrap,
+    /// placeholder and wide-pair handling; fallback for the run writers.
+    fn write_codepoint_cell(&mut self, cp: u32, c: char, width: u8) {
+        if self.grid.cursor.should_wrap {
+            self.wrapline();
+        }
+
+        let columns = self.grid.columns();
+
+        // Kitty placeholder bookkeeping: cp can't be ASCII here (parser
+        // routes ASCII through `input_str`) but the placeholder lives at
+        // U+10EEEE, so the check is still needed.
+        if cp == crate::ansi::kitty_virtual::PLACEHOLDER as u32 {
+            let row = self.grid.cursor.pos.row;
+            self.grid[row].kitty_virtual_placeholder = true;
+        }
+
+        if width == 2 {
+            if self.grid.cursor.pos.col + 1 >= columns {
+                if self.mode.contains(Mode::LINE_WRAP) {
+                    self.write_at_cursor(' ');
+                    self.grid
+                        .cursor_cell()
+                        .set_wide(crate::crosswords::square::Wide::LeadingSpacer);
+                    self.wrapline();
+                } else {
+                    self.grid.cursor.should_wrap = true;
+                    return;
+                }
+            }
+
+            self.write_at_cursor(c);
+            self.grid
+                .cursor_cell()
+                .set_wide(crate::crosswords::square::Wide::Wide);
+            self.grid.cursor.pos.col += 1;
+            self.write_at_cursor(' ');
+            self.grid
+                .cursor_cell()
+                .set_wide(crate::crosswords::square::Wide::Spacer);
+        } else {
+            self.write_at_cursor(c);
+        }
+
+        let cursor_line = self.grid.cursor.pos.row.0 as usize;
+        self.damage.damage_line(cursor_line);
+
+        if self.grid.cursor.pos.col + 1 < columns {
+            self.grid.cursor.pos.col += 1;
+        } else {
+            self.grid.cursor.should_wrap = true;
+        }
+    }
+
+    /// Bulk-write a run of width-1 codepoints, mirroring the ASCII bulk
+    /// path in `input_ascii_str`: one destination scan, packed stores,
+    /// cursor and damage updated per row chunk instead of per codepoint.
+    fn write_narrow_run(
+        &mut self,
+        template: crate::crosswords::square::Square,
+        template_has_extras: bool,
+        cps: &[u32],
+    ) {
+        let mut idx = 0;
+        while idx < cps.len() {
+            if self.grid.cursor.should_wrap {
+                self.wrapline();
+            }
+
+            let columns = self.grid.columns();
+            let cursor_col = self.grid.cursor.pos.col.0;
+            let remaining = columns.saturating_sub(cursor_col);
+            if remaining == 0 {
+                for &cp in &cps[idx..] {
+                    let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
+                    self.write_codepoint_cell(cp, c, 1);
+                }
+                return;
+            }
+
+            let take = (cps.len() - idx).min(remaining);
+            let mut wrote_bulk = false;
+            {
+                let line = self.grid.cursor.pos.row;
+                let row = &mut self.grid[line];
+                let cells = &mut row[Column(cursor_col)..Column(cursor_col + take)];
+                let needs_cleanup = cells
+                    .iter()
+                    .fold(false, |acc, c| acc | c.needs_wide_cleanup());
+                if !needs_cleanup {
+                    for (cell, &cp) in cells.iter_mut().zip(&cps[idx..idx + take]) {
+                        let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
+                        *cell =
+                            crate::crosswords::square::Square::from_template(template, c);
+                    }
+                    if template_has_extras {
+                        row.has_extras = true;
+                    }
+                    wrote_bulk = true;
+                }
+            }
+
+            if wrote_bulk {
+                let end = cursor_col + take;
+                if end < columns {
+                    self.grid.cursor.pos.col = Column(end);
+                } else {
+                    self.grid.cursor.pos.col = Column(columns - 1);
+                    self.grid.cursor.should_wrap = true;
+                }
+                let row = self.grid.cursor.pos.row;
+                self.damage.damage_line(row.0 as usize);
+            } else {
+                for &cp in &cps[idx..idx + take] {
+                    let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
+                    self.write_codepoint_cell(cp, c, 1);
+                }
+            }
+            idx += take;
+        }
+    }
+
+    /// Bulk-write a run of width-2 codepoints as (wide, spacer) cell pairs.
+    /// Pairs never split across rows; the end-of-row leading-spacer case
+    /// defers to the scalar writer.
+    fn write_wide_run(
+        &mut self,
+        template: crate::crosswords::square::Square,
+        template_has_extras: bool,
+        cps: &[u32],
+    ) {
+        use crate::crosswords::square::{Square, Wide};
+
+        let mut spacer = Square::from_template(template, ' ');
+        spacer.set_wide(Wide::Spacer);
+
+        let mut idx = 0;
+        while idx < cps.len() {
+            if self.grid.cursor.should_wrap {
+                self.wrapline();
+            }
+
+            let columns = self.grid.columns();
+            let cursor_col = self.grid.cursor.pos.col.0;
+            let remaining = columns.saturating_sub(cursor_col);
+            if remaining < 2 {
+                let cp = cps[idx];
+                let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
+                self.write_codepoint_cell(cp, c, 2);
+                idx += 1;
+                continue;
+            }
+
+            let take = (cps.len() - idx).min(remaining / 2);
+            let mut wrote_bulk = false;
+            {
+                let line = self.grid.cursor.pos.row;
+                let row = &mut self.grid[line];
+                let cells = &mut row[Column(cursor_col)..Column(cursor_col + take * 2)];
+                let needs_cleanup = cells
+                    .iter()
+                    .fold(false, |acc, c| acc | c.needs_wide_cleanup());
+                if !needs_cleanup {
+                    for (pair, &cp) in
+                        cells.chunks_exact_mut(2).zip(&cps[idx..idx + take])
+                    {
+                        let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
+                        let mut wide = Square::from_template(template, c);
+                        wide.set_wide(Wide::Wide);
+                        pair[0] = wide;
+                        pair[1] = spacer;
+                    }
+                    if template_has_extras {
+                        row.has_extras = true;
+                    }
+                    wrote_bulk = true;
+                }
+            }
+
+            if wrote_bulk {
+                let end = cursor_col + take * 2;
+                if end < columns {
+                    self.grid.cursor.pos.col = Column(end);
+                } else {
+                    self.grid.cursor.pos.col = Column(columns - 1);
+                    self.grid.cursor.should_wrap = true;
+                }
+                let row = self.grid.cursor.pos.row;
+                self.damage.damage_line(row.0 as usize);
+                idx += take;
+            } else {
+                for &cp in &cps[idx..idx + take] {
+                    let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
+                    self.write_codepoint_cell(cp, c, 2);
+                }
+                idx += take;
+            }
         }
     }
 
@@ -3315,8 +3520,12 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
     fn input_codepoints(&mut self, codepoints: &[u32]) {
         // Insert mode falls back: cell-rotation is per-char and the cost of
-        // bulk-handling it correctly outweighs the win.
-        if self.mode.contains(Mode::INSERT) {
+        // bulk-handling it correctly outweighs the win. Non-ASCII charsets
+        // fall back too: decode runs can carry ASCII that needs mapping.
+        let active = self.grid.cursor.charsets[self.active_charset];
+        if self.mode.contains(Mode::INSERT)
+            || active != crate::crosswords::pos::StandardCharset::Ascii
+        {
             for &cp in codepoints {
                 let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
                 self.input(c);
@@ -3324,14 +3533,41 @@ impl<U: EventListener> Handler for Crosswords<U> {
             return;
         }
 
-        for &cp in codepoints {
-            let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
-            // Registered glyphs keep their system `wcwidth` here (see the
-            // note in `input`); the declared width is a render-time hint
-            // only, applied as pixel overflow in the renderer.
-            let width = match crate::codepoint_width::codepoint_width(cp) {
+        // Registered glyphs keep their system `wcwidth` here (see the
+        // note in `input`); the declared width is a render-time hint
+        // only, applied as pixel overflow in the renderer.
+        let table = crate::codepoint_width::width_table();
+
+        // Image placements can clip cells, which the scalar writer owns.
+        if !self.graphics.atlas_placements.is_empty() {
+            for &cp in codepoints {
+                let width = match crate::codepoint_width::width_in(table, cp) {
+                    Some(w) => w,
+                    None => continue,
+                };
+                let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
+                if width == 0 {
+                    self.input(c);
+                } else {
+                    self.write_codepoint_cell(cp, c, width);
+                }
+            }
+            return;
+        }
+
+        let template = self.cell_template();
+        let template_has_extras = template.extras_id().is_some();
+
+        let mut i = 0;
+        let n = codepoints.len();
+        while i < n {
+            let cp = codepoints[i];
+            let width = match crate::codepoint_width::width_in(table, cp) {
                 Some(w) => w,
-                None => continue,
+                None => {
+                    i += 1;
+                    continue;
+                }
             };
 
             if width == 0 {
@@ -3339,71 +3575,60 @@ impl<U: EventListener> Handler for Crosswords<U> {
                 // owns the emoji-presentation flip and grapheme-extension
                 // logic (attaches to preceding cell rather than writing a
                 // new one).
+                let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
                 self.input(c);
+                i += 1;
                 continue;
             }
 
-            if self.grid.cursor.should_wrap {
-                self.wrapline();
-            }
-
-            let columns = self.grid.columns();
-
-            // Kitty placeholder bookkeeping: cp can't be ASCII here (parser
-            // routes ASCII through `input_str`) but the placeholder lives at
-            // U+10EEEE, so the check is still needed.
             if cp == crate::ansi::kitty_virtual::PLACEHOLDER as u32 {
-                let row = self.grid.cursor.pos.row;
-                self.grid[row].kitty_virtual_placeholder = true;
+                let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
+                self.write_codepoint_cell(cp, c, width);
+                i += 1;
+                continue;
             }
 
-            if width == 2 {
-                if self.grid.cursor.pos.col + 1 >= columns {
-                    if self.mode.contains(Mode::LINE_WRAP) {
-                        self.write_at_cursor(' ');
-                        self.grid
-                            .cursor_cell()
-                            .set_wide(crate::crosswords::square::Wide::LeadingSpacer);
-                        self.wrapline();
-                    } else {
-                        self.grid.cursor.should_wrap = true;
-                        continue;
-                    }
+            // Maximal run of same-width codepoints, written in bulk.
+            let mut j = i + 1;
+            while j < n {
+                let next = codepoints[j];
+                if next == crate::ansi::kitty_virtual::PLACEHOLDER as u32
+                    || crate::codepoint_width::width_in(table, next) != Some(width)
+                {
+                    break;
                 }
-
-                self.write_at_cursor(c);
-                self.grid
-                    .cursor_cell()
-                    .set_wide(crate::crosswords::square::Wide::Wide);
-                self.grid.cursor.pos.col += 1;
-                self.write_at_cursor(' ');
-                self.grid
-                    .cursor_cell()
-                    .set_wide(crate::crosswords::square::Wide::Spacer);
-            } else {
-                // width == 1
-                self.write_at_cursor(c);
+                j += 1;
             }
 
-            let cursor_line = self.grid.cursor.pos.row.0 as usize;
-            self.damage.damage_line(cursor_line);
-
-            if self.grid.cursor.pos.col + 1 < columns {
-                self.grid.cursor.pos.col += 1;
+            if width == 1 {
+                self.write_narrow_run(template, template_has_extras, &codepoints[i..j]);
             } else {
-                self.grid.cursor.should_wrap = true;
+                self.write_wide_run(template, template_has_extras, &codepoints[i..j]);
             }
+            i = j;
         }
     }
 
     fn input_str(&mut self, s: &str) {
+        if !s.is_ascii() {
+            for c in s.chars() {
+                self.input(c);
+            }
+            return;
+        }
+        self.input_ascii_str(s);
+    }
+
+    fn input_ascii_str(&mut self, s: &str) {
         // Fast path: ASCII printable runs are the common case (vim redraws,
         // log tails, prompt rendering). Side-step the per-char `input()`
         // dispatch which does width lookup, wide-char/zero-width checks,
         // kitty placeholder bookkeeping, and per-byte wrap branching.
+        // The caller guarantees `s` is ASCII; charset mapping and insert
+        // mode still defer to the scalar path.
+        debug_assert!(s.is_ascii());
         let active = self.grid.cursor.charsets[self.active_charset];
-        if !s.is_ascii()
-            || active != crate::crosswords::pos::StandardCharset::Ascii
+        if active != crate::crosswords::pos::StandardCharset::Ascii
             || self.mode.contains(Mode::INSERT)
         {
             for c in s.chars() {
@@ -3459,7 +3684,11 @@ impl<U: EventListener> Handler for Crosswords<U> {
                 let line = self.grid.cursor.pos.row;
                 let row = &mut self.grid[line];
                 let cells = &mut row[Column(cursor_col)..Column(cursor_col + take)];
-                if !cells.iter().any(|c| c.needs_wide_cleanup()) {
+                // Branchless fold; an early-exit any() does not vectorize.
+                let needs_cleanup = cells
+                    .iter()
+                    .fold(false, |acc, c| acc | c.needs_wide_cleanup());
+                if !needs_cleanup {
                     let src = &bytes[idx..idx + take];
                     for (cell, &b) in cells.iter_mut().zip(src) {
                         *cell = crate::crosswords::square::Square::from_template(
@@ -3914,7 +4143,6 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
     #[inline]
     fn carriage_return(&mut self) {
-        trace!("Carriage return");
         let new_col = 0;
         let row = self.grid.cursor.pos.row.0 as usize;
         self.damage.damage_line(row);
@@ -4225,6 +4453,12 @@ impl<U: EventListener> Handler for Crosswords<U> {
         );
         let cell_width = self.graphics.cell_width as usize;
         let cell_height = self.graphics.cell_height as usize;
+
+        // Headless embedders never report cell dimensions; without this
+        // guard the row-fill loop below would `step_by(0)` and panic.
+        if cell_width == 0 || cell_height == 0 {
+            return;
+        }
 
         // Store last palette if we receive a new one, and it is shared.
         if let Some(palette) = palette {
@@ -7323,6 +7557,43 @@ mod tests {
         assert_eq!(cw.graphics.atlas_placements.len(), 1);
         assert_eq!(cw.graphics.atlas_key_refs.len(), 1);
     }
+
+    /// Headless embedders never set `graphics.cell_width`/`cell_height`;
+    /// inserting a graphic then must be a no-op instead of panicking in the
+    /// row-fill loop (`step_by(0)`).
+    #[test]
+    fn insert_graphic_without_cell_dimensions_is_noop() {
+        let size = CrosswordsSize::new(20, 10);
+        let window_id = crate::event::WindowId::from(0);
+        let mut cw = Crosswords::new(
+            size,
+            CursorShape::Block,
+            VoidListener {},
+            window_id,
+            0,
+            10_000,
+        );
+
+        let graphic = GraphicData {
+            id: rio_graphics::GraphicId::new(0),
+            width: 10,
+            height: 10,
+            pixels: vec![0u8; 10 * 10 * 4],
+            color_type: rio_graphics::ColorType::Rgba,
+            is_opaque: true,
+            display_width: None,
+            display_height: None,
+            resize: None,
+            transmit_time: std::time::Instant::now(),
+        };
+        cw.insert_graphic(graphic, None, Some(1));
+        assert!(cw.graphics.atlas_placements.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Emoji presentation variation selectors (VS15 / VS16).
+    // See `input()` + `apply_emoji_vs16` / `apply_emoji_vs15`.
+    // ------------------------------------------------------------------
 
     fn new_term(cols: usize, rows: usize) -> Crosswords<VoidListener> {
         let size = CrosswordsSize::new(cols, rows);

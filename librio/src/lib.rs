@@ -15,6 +15,7 @@ use rio_vt::ansi::CursorShape;
 use rio_vt::crosswords::pos::{Column as PosColumn, Line, Pos, Side};
 use rio_vt::crosswords::{Crosswords, Mode};
 use rio_vt::event::sync::FairMutex;
+use rio_vt::event::WindowSize;
 use rio_vt::event::{EventListener, Msg, RioEvent, WindowId};
 use rio_vt::performer::Machine;
 use rio_vt::selection::{Selection, SelectionType};
@@ -26,7 +27,6 @@ use std::sync::{Arc, Mutex};
 use teletypewriter::create_pty;
 #[cfg(not(target_os = "windows"))]
 use teletypewriter::create_pty_with_spawn;
-use teletypewriter::WinsizeBuilder;
 
 pub type SurfaceId = usize;
 
@@ -248,21 +248,16 @@ impl Surface {
         );
         let terminal = Arc::new(FairMutex::new(terminal));
 
-        #[cfg(not(target_os = "windows"))]
-        let fallback_shell = "/bin/sh";
-        #[cfg(target_os = "windows")]
-        let fallback_shell = "cmd.exe";
-        let shell = desc
-            .shell
-            .clone()
-            .or_else(|| std::env::var("SHELL").ok())
-            .unwrap_or_else(|| String::from(fallback_shell));
+        // No shell in the descriptor means "whatever the user's default is",
+        // which teletypewriter resolves (and starts as a login shell).
+        let shell = desc.shell.as_deref();
 
         #[cfg(not(target_os = "windows"))]
         let pty = create_pty_with_spawn(
-            &Cow::Borrowed(shell.as_str()),
+            shell,
             desc.args.clone(),
             &desc.working_dir,
+            None,
             desc.cols,
             desc.rows,
             desc.pixel_width,
@@ -272,9 +267,10 @@ impl Surface {
 
         #[cfg(target_os = "windows")]
         let pty = create_pty(
-            shell.as_str(),
+            shell,
             desc.args.clone(),
             &desc.working_dir,
+            None,
             desc.cols,
             desc.rows,
         )
@@ -333,7 +329,7 @@ impl Surface {
             rows: rows as usize,
             cols: cols as usize,
         });
-        let _ = self.channel.send(Msg::Resize(WinsizeBuilder {
+        let _ = self.channel.send(Msg::Resize(WindowSize {
             rows,
             cols,
             width: pixel_width,
