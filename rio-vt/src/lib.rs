@@ -20,13 +20,17 @@ pub mod config;
 pub mod crosswords;
 pub mod error;
 pub mod event;
+pub mod grapheme_lut;
 pub mod performer;
 pub mod selection;
 pub mod simd_base64;
 pub mod simd_utf8;
+pub mod time;
 
 // avoid double dep requirement
+#[cfg(feature = "pty")]
 pub use corcovado;
+#[cfg(feature = "pty")]
 pub use teletypewriter;
 
 // The app-level `RioErrorType::FontsNotFound` variant references a

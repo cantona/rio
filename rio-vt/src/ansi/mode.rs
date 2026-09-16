@@ -56,6 +56,7 @@ impl PrivateMode {
             3 => Self::Named(NamedPrivateMode::ColumnMode),
             6 => Self::Named(NamedPrivateMode::Origin),
             7 => Self::Named(NamedPrivateMode::LineWrap),
+            9 => Self::Named(NamedPrivateMode::ReportX10MouseClicks),
             12 => Self::Named(NamedPrivateMode::BlinkingCursor),
             25 => Self::Named(NamedPrivateMode::ShowCursor),
             1000 => Self::Named(NamedPrivateMode::ReportMouseClicks),
@@ -69,6 +70,7 @@ impl PrivateMode {
             1049 => Self::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor),
             2004 => Self::Named(NamedPrivateMode::BracketedPaste),
             2026 => Self::Named(NamedPrivateMode::SyncUpdate),
+            2027 => Self::Named(NamedPrivateMode::GraphemeCluster),
             _ => Self::Unknown(mode),
         }
     }
@@ -106,6 +108,12 @@ pub enum NamedPrivateMode {
     ColumnMode = 3,
     Origin = 6,
     LineWrap = 7,
+    /// X10 mouse reporting.
+    ///
+    /// Reports button presses only: no releases, no motion, and no modifier
+    /// bits. Superseded by [`Self::ReportMouseClicks`], and mutually exclusive
+    /// with it.
+    ReportX10MouseClicks = 9,
     BlinkingCursor = 12,
     ShowCursor = 25,
     ReportMouseClicks = 1000,
@@ -120,6 +128,14 @@ pub enum NamedPrivateMode {
     BracketedPaste = 2004,
     /// The mode is handled automatically by [`Processor`].
     SyncUpdate = 2026,
+    /// Grapheme cluster processing (contour's terminal-unicode-core).
+    ///
+    /// When set, incoming text is segmented into UAX #29 extended
+    /// grapheme clusters: a multi-codepoint cluster (a ZWJ emoji, a
+    /// conjunct) occupies one cell slot instead of one slot per
+    /// width-bearing codepoint. Queryable via DECRQM, which is how
+    /// applications detect support. Default: reset.
+    GraphemeCluster = 2027,
 }
 
 /// Mode for clearing line.

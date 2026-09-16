@@ -21,6 +21,16 @@ use std::cmp;
 #[cfg(feature = "glyph")]
 pub mod glyph;
 
+/// `Instant` for every target. std's panics on wasm32-unknown-unknown, so
+/// wasm builds use `web-time`, same API backed by `performance.now()`.
+pub mod time {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub use std::time::Instant;
+
+    #[cfg(target_arch = "wasm32")]
+    pub use web_time::Instant;
+}
+
 /// RGBA color in linear-light 0..1 space. Mirrors `wgpu::Color`'s
 /// shape so callers don't have to depend on `wgpu`. Sugarloaf's public
 /// API takes/returns this type; the wgpu render path converts at the
@@ -106,58 +116,36 @@ pub fn atlas_image_key(graphic_id: u64) -> u64 {
     (1u64 << 32) + graphic_id
 }
 
-/// Which protocol id space an `ImageKey`'s id lives in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum ImageSource {
-    /// Sixel/iTerm2 atlas graphic (`GraphicId` space, u64).
-    Atlas,
-    /// Kitty graphics image (protocol `image_id` space, u32).
-    Kitty,
+/// Bits of an image key below the terminal namespace: the kitty u32
+/// id space plus the atlas range above it.
+const IMAGE_KEY_ROUTE_SHIFT: u32 = 33;
+
+/// Namespace an image key by the terminal (route) it belongs to. The
+/// texture store is shared by every terminal drawn in a window while
+/// kitty ids are chosen by each terminal's client and atlas ids are a
+/// per-terminal counter, so without this two tabs or splits using the
+/// same id would overwrite each other's pixels. Route 0 is the
+/// identity, which keeps single-terminal embedders on plain keys.
+#[inline]
+pub fn route_image_key(route_id: usize, key: u64) -> u64 {
+    debug_assert!(key < (1u64 << IMAGE_KEY_ROUTE_SHIFT));
+    debug_assert!((route_id as u64) < (1u64 << (64 - IMAGE_KEY_ROUTE_SHIFT)));
+    ((route_id as u64) << IMAGE_KEY_ROUTE_SHIFT)
+        | (key & ((1u64 << IMAGE_KEY_ROUTE_SHIFT) - 1))
 }
 
-/// Key for the window-level image stores (`Sugarloaf::image_data` and the
-/// renderer's per-image GPU texture map). One window hosts many terminals
-/// (tabs/splits), and both protocol id spaces restart per terminal, so a
-/// bare numeric id cannot address the shared store: one terminal's image
-/// would clobber another's, and a kitty id could land on a sixel's entry.
-/// The key carries all three coordinates so live images never collide.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ImageKey {
-    /// Opaque per-terminal namespace supplied by the frontend (rioterm
-    /// passes the route id).
-    pub owner: usize,
-    pub source: ImageSource,
-    /// Protocol-level id, widened to u64: kitty ids may use the full
-    /// u32 range and `GraphicId` is u64 — neither can be shrunk.
-    pub id: u64,
-}
-
-impl ImageKey {
-    #[inline]
-    pub const fn atlas(owner: usize, id: u64) -> Self {
-        Self {
-            owner,
-            source: ImageSource::Atlas,
-            id,
-        }
-    }
-
-    #[inline]
-    pub const fn kitty(owner: usize, id: u32) -> Self {
-        Self {
-            owner,
-            source: ImageSource::Kitty,
-            id: id as u64,
-        }
-    }
+/// The route a namespaced image key belongs to.
+#[inline]
+pub fn image_key_route(key: u64) -> usize {
+    (key >> IMAGE_KEY_ROUTE_SHIFT) as usize
 }
 
 /// An overlay image placement.
 /// Used by the renderer to draw images on top of (or behind) terminal content.
 #[derive(Debug, Clone)]
 pub struct GraphicOverlay {
-    /// Key of the image in the window-level image store.
-    pub image_id: ImageKey,
+    /// Image texture key ([`kitty_image_key`] or [`atlas_image_key`]).
+    pub image_id: u64,
     /// Screen position (physical pixels).
     pub x: f32,
     pub y: f32,
@@ -242,7 +230,7 @@ pub struct GraphicData {
 
     /// Generation counter for cache invalidation.
     /// Incremented when image data changes (re-transmission with same ID).
-    pub transmit_time: std::time::Instant,
+    pub transmit_time: crate::time::Instant,
 }
 
 impl GraphicData {
@@ -326,7 +314,7 @@ impl GraphicData {
             resize: None,
             display_width: None,
             display_height: None,
-            transmit_time: std::time::Instant::now(),
+            transmit_time: crate::time::Instant::now(),
         }
     }
 
@@ -526,7 +514,7 @@ fn check_opaque_region() {
         resize: None,
         display_width: None,
         display_height: None,
-        transmit_time: std::time::Instant::now(),
+        transmit_time: crate::time::Instant::now(),
     };
 
     assert!(graphic.is_filled(1, 1, 3, 3));
@@ -552,9 +540,44 @@ fn check_opaque_region() {
         resize: None,
         display_width: None,
         display_height: None,
-        transmit_time: std::time::Instant::now(),
+        transmit_time: crate::time::Instant::now(),
     };
 
     assert!(graphic.is_filled(0, 0, 3, 3));
     assert!(!graphic.is_filled(1, 1, 4, 4));
+}
+
+#[cfg(test)]
+mod route_key_tests {
+    use super::*;
+
+    #[test]
+    fn route_zero_is_identity() {
+        assert_eq!(route_image_key(0, kitty_image_key(7)), kitty_image_key(7));
+        assert_eq!(route_image_key(0, atlas_image_key(7)), atlas_image_key(7));
+        assert_eq!(image_key_route(kitty_image_key(u32::MAX)), 0);
+        assert_eq!(image_key_route(atlas_image_key(u32::MAX as u64)), 0);
+    }
+
+    #[test]
+    fn routes_never_collide() {
+        let a = route_image_key(1, kitty_image_key(7));
+        let b = route_image_key(2, kitty_image_key(7));
+        assert_ne!(a, b);
+        assert_ne!(
+            route_image_key(1, atlas_image_key(7)),
+            route_image_key(2, atlas_image_key(7))
+        );
+        assert_ne!(
+            route_image_key(1, kitty_image_key(u32::MAX)),
+            route_image_key(2, kitty_image_key(0))
+        );
+        assert_ne!(
+            route_image_key(1, atlas_image_key(0)),
+            route_image_key(2, kitty_image_key(0))
+        );
+        assert_eq!(image_key_route(a), 1);
+        assert_eq!(image_key_route(b), 2);
+        assert_eq!(image_key_route(route_image_key(3, atlas_image_key(9))), 3);
+    }
 }

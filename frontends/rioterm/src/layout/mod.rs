@@ -1525,6 +1525,33 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         }
     }
 
+    /// Remove the panel owning `route_id`, wherever it sits in the
+    /// grid. The grid's focused panel is preserved unless it is the
+    /// one being removed, in which case `remove_current`'s sibling
+    /// selection applies. Returns whether a panel was removed.
+    pub fn remove_by_route(
+        &mut self,
+        route_id: usize,
+        sugarloaf: &mut Sugarloaf,
+    ) -> bool {
+        let Some(key) = self
+            .inner
+            .iter()
+            .find(|(_, item)| item.val.route_id == route_id)
+            .map(|(key, _)| *key)
+        else {
+            return false;
+        };
+
+        let previous = self.current;
+        self.current = key;
+        self.remove_current(sugarloaf);
+        if previous != key && self.inner.contains_key(&previous) {
+            self.current = previous;
+        }
+        true
+    }
+
     pub fn remove_current(&mut self, sugarloaf: &mut Sugarloaf) {
         if self.inner.is_empty() {
             tracing::error!("Attempted to remove from empty grid");
@@ -1544,11 +1571,9 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             return;
         }
 
-        // Capture ids before removing — needed for sugarloaf cleanup below
-        let removed_ids = self
-            .inner
-            .get(&to_remove)
-            .map(|item| (item.val.rich_text_id, item.val.route_id));
+        // Get rich text ID before removing
+        let rich_text_id = self.inner.get(&to_remove).map(|item| item.val.rich_text_id);
+        let route_id = self.inner.get(&to_remove).map(|item| item.val.route_id);
 
         // Select next panel before removing (use visual ordering)
         let ordered_keys = self.get_ordered_keys();
@@ -1586,9 +1611,11 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         // ever removes a closed pane's kitty images (atlas graphics at
         // least queue removals when their cells drop), so without this
         // the pixels outlive the terminal for the life of the window.
-        if let Some((rich_text_id, route_id)) = removed_ids {
-            sugarloaf.clear_image_overlays_for(rich_text_id);
-            sugarloaf.remove_images_for(route_id);
+        if let Some(id) = rich_text_id {
+            sugarloaf.clear_image_overlays_for(id);
+        }
+        if let Some(route_id) = route_id {
+            sugarloaf.remove_route_images(route_id);
         }
 
         // Update root if necessary
@@ -1661,10 +1688,12 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
     /// the `ContextManager`; only the graphics state living on
     /// sugarloaf needs an explicit cleanup signal.
     #[inline]
-    pub fn remove_all_rich_text(&self, sugarloaf: &mut Sugarloaf) {
+    /// Release everything this grid's panels hold in sugarloaf: image
+    /// overlays and the images they drew.
+    pub fn remove_from_sugarloaf(&self, sugarloaf: &mut Sugarloaf) {
         for item in self.inner.values() {
             sugarloaf.clear_image_overlays_for(item.val.rich_text_id);
-            sugarloaf.remove_images_for(item.val.route_id);
+            sugarloaf.remove_route_images(item.val.route_id);
         }
     }
 }

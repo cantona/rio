@@ -33,6 +33,27 @@ use std::time::{Duration, Instant};
 // #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 const RIO_TITLE: &str = "▲";
 
+/// The modal overlays that can own keyboard/IME input, in dispatch
+/// priority order (see [`Route::active_modal`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Modal {
+    /// The island tab-rename input (a text sink).
+    IslandRename,
+    /// The command palette (a text sink).
+    CommandPalette,
+    /// The quit confirmation dialog.
+    ConfirmQuit,
+    /// The close-confirmation prompt for a tab, split or window.
+    ConfirmClose,
+    /// The session save / resume prompt.
+    SessionPrompt,
+    /// The error assistant; `report_error` can activate it WITHOUT
+    /// leaving `RoutePath::Terminal`.
+    Assistant,
+    /// A non-terminal route (the welcome / config screens).
+    Route,
+}
+
 pub struct Route<'a> {
     pub assistant: assistant::Assistant,
     pub path: RoutePath,
@@ -470,6 +491,97 @@ impl Route<'_> {
         restored_any
     }
 
+    /// The modal overlay currently owning keyboard/IME input, in
+    /// dispatch priority order. THE roster for KEYBOARD AND IME
+    /// dispatch: `has_key_wait`, `modal_owns_input`, and
+    /// `overlay_commit_text` all derive from this, so a new overlay
+    /// added here is key/IME-gated at once. Mouse paths (hint
+    /// hover/click, the application.rs pointer handlers) still walk
+    /// their own overlay checks and need separate wiring.
+    pub fn active_modal(&self) -> Option<Modal> {
+        if self
+            .window
+            .screen
+            .renderer
+            .island
+            .as_ref()
+            .is_some_and(|island| island.is_color_picker_open())
+        {
+            return Some(Modal::IslandRename);
+        }
+        if self.window.screen.renderer.command_palette.is_enabled() {
+            return Some(Modal::CommandPalette);
+        }
+        if self.window.screen.renderer.confirm_quit.is_active() {
+            return Some(Modal::ConfirmQuit);
+        }
+        if self
+            .window
+            .screen
+            .renderer
+            .confirm_close
+            .pending()
+            .is_some()
+        {
+            return Some(Modal::ConfirmClose);
+        }
+        if self.window.screen.renderer.session_prompt.kind().is_some() {
+            return Some(Modal::SessionPrompt);
+        }
+        // Only hard errors are modal: a warning toast (font not
+        // found on live reload, say) renders over a WORKING terminal
+        // and must never swallow typing or Ctrl+C.
+        if self.window.screen.renderer.assistant.is_error() {
+            return Some(Modal::Assistant);
+        }
+        if self.path != RoutePath::Terminal {
+            return Some(Modal::Route);
+        }
+        None
+    }
+
+    /// Route committed IME text (dead keys, CJK) into the overlay that
+    /// owns input, when it is a text sink. Composed characters arrive
+    /// ONLY as commits, never as key text, so without this the
+    /// overlays would be ASCII-only. Returns whether the text was
+    /// consumed (an open text sink swallows even rejected text, the
+    /// way `has_key_wait` blocks all keys for it).
+    pub fn overlay_commit_text(&mut self, text: &str) -> bool {
+        match self.active_modal() {
+            Some(Modal::IslandRename) => {
+                if let Some(ref mut island) = self.window.screen.renderer.island {
+                    if island.append_rename_text(text) {
+                        self.request_overlay_redraw();
+                    }
+                }
+                true
+            }
+            Some(Modal::CommandPalette) => {
+                if self
+                    .window
+                    .screen
+                    .renderer
+                    .command_palette
+                    .append_query(text)
+                {
+                    self.request_overlay_redraw();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a modal overlay currently owns keyboard input, so IME
+    /// composition must not reach the terminal behind it. Derived from
+    /// the same roster as `has_key_wait`, so keys and IME are gated
+    /// identically (the welcome screen blocks both: its PTY is live
+    /// but invisible).
+    #[inline]
+    pub fn modal_owns_input(&self) -> bool {
+        self.active_modal().is_some()
+    }
+
     #[inline]
     pub fn has_key_wait(
         &mut self,
@@ -478,504 +590,562 @@ impl Route<'_> {
     ) -> bool {
         use rio_window::event::ElementState;
 
-        // Handle island color picker / rename input
-        if let Some(ref mut island) = self.window.screen.renderer.island {
-            if island.is_color_picker_open() {
-                let consumed = island.handle_rename_input(
-                    key_event,
-                    &mut self.window.screen.context_manager,
-                );
-                if consumed {
-                    self.request_overlay_redraw();
-                    return true;
+        // One dispatch on THE modal roster; each arm keeps its
+        // existing handling. `active_modal` already checked each
+        // overlay's open state.
+        let Some(modal) = self.active_modal() else {
+            return false;
+        };
+        match modal {
+            Modal::IslandRename => {
+                if let Some(ref mut island) = self.window.screen.renderer.island {
+                    island.handle_rename_input(
+                        key_event,
+                        &mut self.window.screen.context_manager,
+                    );
                 }
+                self.request_overlay_redraw();
+                true
             }
-        }
 
-        // Handle command palette input first (works in all routes)
-        if self.window.screen.renderer.command_palette.is_enabled() {
-            if key_event.state == ElementState::Pressed {
-                match &key_event.logical_key {
-                    Key::Named(NamedKey::Escape) => {
-                        self.window
-                            .screen
-                            .renderer
-                            .command_palette
-                            .set_enabled(false);
-                        self.request_overlay_redraw();
-                    }
-                    Key::Named(NamedKey::ArrowUp) => {
-                        self.window
-                            .screen
-                            .renderer
-                            .command_palette
-                            .move_selection_up();
-                        self.request_overlay_redraw();
-                    }
-                    Key::Named(NamedKey::ArrowDown) => {
-                        self.window
-                            .screen
-                            .renderer
-                            .command_palette
-                            .move_selection_down();
-                        self.request_overlay_redraw();
-                    }
-                    Key::Named(NamedKey::Tab) => {
-                        self.window
-                            .screen
-                            .renderer
-                            .command_palette
-                            .move_selection_down();
-                        self.request_overlay_redraw();
-                    }
-                    Key::Named(NamedKey::Enter) => {
-                        // Snapshot what the palette wants to do FIRST,
-                        // before taking a mut-borrow on it, so we can
-                        // freely call other `self.window.screen.*`
-                        // methods in the match arms without tripping
-                        // the borrow checker on nested disjoint borrows.
-                        let selected_font = self
-                            .window
-                            .screen
-                            .renderer
-                            .command_palette
-                            .get_selected_font();
-                        let selected_action = self
-                            .window
-                            .screen
-                            .renderer
-                            .command_palette
-                            .get_selected_action();
-                        use crate::renderer::command_palette::PaletteAction;
-
-                        // Remote-attach Enter, phase 1: a typed ssh
-                        // destination. Kick off the pane listing on a
-                        // worker thread; the palette stays open in its
-                        // loading phase until RemotePanesListed lands.
-                        #[cfg(unix)]
-                        if let Some(host) = self
-                            .window
-                            .screen
-                            .renderer
-                            .command_palette
-                            .get_remote_connect()
-                        {
-                            self.window
-                                .screen
-                                .context_manager
-                                .request_remote_pane_list(host.clone());
-                            self.window
-                                .screen
-                                .renderer
-                                .command_palette
-                                .set_remote_loading(host);
-                            self.request_overlay_redraw();
-                            return true;
-                        }
-
-                        // Remote-attach Enter, phase 2: a picked pane.
-                        // Close the palette, attach as a new tab, and
-                        // on failure reopen the palette showing why.
-                        #[cfg(unix)]
-                        if let Some((host, pane_id)) = self
-                            .window
-                            .screen
-                            .renderer
-                            .command_palette
-                            .get_selected_remote_pane()
-                        {
-                            self.window
-                                .screen
-                                .renderer
-                                .command_palette
-                                .set_enabled(false);
-                            if let Err(e) = self.attach_remote_pane(&host, &pane_id) {
-                                let palette =
-                                    &mut self.window.screen.renderer.command_palette;
-                                palette.set_enabled(true);
-                                palette.show_remote_error(host, e);
-                            }
-                            self.request_overlay_redraw();
-                            return true;
-                        }
-
-                        // Sessions-mode Enter: save-as or restore the
-                        // picked name, then close the palette.
-                        if let Some((name, saving)) = self
-                            .window
-                            .screen
-                            .renderer
-                            .command_palette
-                            .get_selected_session()
-                        {
-                            self.window
-                                .screen
-                                .renderer
-                                .command_palette
-                                .set_enabled(false);
-                            if saving {
-                                self.window
-                                    .screen
-                                    .context_manager
-                                    .request_save_session_as(name);
-                            } else {
-                                self.window
-                                    .screen
-                                    .context_manager
-                                    .request_restore_session_named(name);
-                            }
-                            self.request_overlay_redraw();
-                            return true;
-                        }
-
-                        // Fonts-mode Enter: copy the family name to
-                        // the system clipboard and close. The copy
-                        // icon on each row advertises this.
-                        if let Some(font) = selected_font {
-                            clipboard.set(
-                                rio_backend::clipboard::ClipboardType::Clipboard,
-                                font,
-                            );
+            Modal::CommandPalette => {
+                if key_event.state == ElementState::Pressed {
+                    match &key_event.logical_key {
+                        Key::Named(NamedKey::Escape) => {
                             self.window
                                 .screen
                                 .renderer
                                 .command_palette
                                 .set_enabled(false);
                             self.request_overlay_redraw();
-                            return true;
                         }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            self.window
+                                .screen
+                                .renderer
+                                .command_palette
+                                .move_selection_up();
+                            self.request_overlay_redraw();
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            self.window
+                                .screen
+                                .renderer
+                                .command_palette
+                                .move_selection_down();
+                            self.request_overlay_redraw();
+                        }
+                        Key::Named(NamedKey::Tab) => {
+                            self.window
+                                .screen
+                                .renderer
+                                .command_palette
+                                .move_selection_down();
+                            self.request_overlay_redraw();
+                        }
+                        Key::Named(NamedKey::Enter) => {
+                            // Snapshot what the palette wants to do FIRST,
+                            // before taking a mut-borrow on it, so we can
+                            // freely call other `self.window.screen.*`
+                            // methods in the match arms without tripping
+                            // the borrow checker on nested disjoint borrows.
+                            let selected_font = self
+                                .window
+                                .screen
+                                .renderer
+                                .command_palette
+                                .get_selected_font();
+                            let selected_action = self
+                                .window
+                                .screen
+                                .renderer
+                                .command_palette
+                                .get_selected_action();
+                            use crate::renderer::command_palette::PaletteAction;
 
-                        match selected_action {
-                            // `ListFonts` stays inside the palette —
-                            // swap the palette's contents from the
-                            // command list to the registered font
-                            // family names and keep it open.
-                            Some(PaletteAction::ListFonts) => {
-                                let fonts =
-                                    self.window.screen.sugarloaf.font_family_names();
-                                self.window
-                                    .screen
-                                    .renderer
-                                    .command_palette
-                                    .enter_fonts_mode(fonts);
-                            }
-                            // Sessions pickers stay inside the palette,
-                            // swapping to the saved-session list.
-                            Some(
-                                action @ (PaletteAction::SaveSessionAs
-                                | PaletteAction::RestoreSessionPicker),
-                            ) => {
-                                let names = crate::session::list_sessions();
-                                self.window
-                                    .screen
-                                    .renderer
-                                    .command_palette
-                                    .enter_sessions_mode(
-                                        names,
-                                        action == PaletteAction::SaveSessionAs,
-                                    );
-                            }
-                            // Remote attach opens the ssh-host input;
-                            // the flow continues inside the palette.
+                            // Remote-attach Enter, phase 1: a typed ssh
+                            // destination. Kick off the pane listing on a
+                            // worker thread; the palette stays open in its
+                            // loading phase until RemotePanesListed lands.
                             #[cfg(unix)]
-                            Some(PaletteAction::AttachRemotePane) => {
-                                self.window
-                                    .screen
-                                    .renderer
-                                    .command_palette
-                                    .enter_remote_host_mode();
-                            }
-                            // Any other command is a one-shot: close
-                            // the palette first, then dispatch.
-                            Some(action) => {
-                                self.window
-                                    .screen
-                                    .renderer
-                                    .command_palette
-                                    .set_enabled(false);
-                                self.window
-                                    .screen
-                                    .execute_palette_action(action, clipboard);
-                            }
-                            // No match at all — Enter just closes.
-                            None => {
-                                self.window
-                                    .screen
-                                    .renderer
-                                    .command_palette
-                                    .set_enabled(false);
-                            }
-                        }
-                        self.request_overlay_redraw();
-                    }
-                    Key::Named(NamedKey::Backspace) => {
-                        let current_query =
-                            self.window.screen.renderer.command_palette.query.clone();
-                        if !current_query.is_empty() {
-                            let mut chars = current_query.chars().collect::<Vec<_>>();
-                            chars.pop();
-                            self.window
+                            if let Some(host) = self
+                                .window
                                 .screen
                                 .renderer
                                 .command_palette
-                                .set_query(chars.into_iter().collect());
+                                .get_remote_connect()
+                            {
+                                self.window
+                                    .screen
+                                    .context_manager
+                                    .request_remote_pane_list(host.clone());
+                                self.window
+                                    .screen
+                                    .renderer
+                                    .command_palette
+                                    .set_remote_loading(host);
+                                self.request_overlay_redraw();
+                                return true;
+                            }
+
+                            // Remote-attach Enter, phase 2: a picked pane.
+                            // Close the palette, attach as a new tab, and
+                            // on failure reopen the palette showing why.
+                            #[cfg(unix)]
+                            if let Some((host, pane_id)) = self
+                                .window
+                                .screen
+                                .renderer
+                                .command_palette
+                                .get_selected_remote_pane()
+                            {
+                                self.window
+                                    .screen
+                                    .renderer
+                                    .command_palette
+                                    .set_enabled(false);
+                                if let Err(e) = self.attach_remote_pane(&host, &pane_id) {
+                                    let palette =
+                                        &mut self.window.screen.renderer.command_palette;
+                                    palette.set_enabled(true);
+                                    palette.show_remote_error(host, e);
+                                }
+                                self.request_overlay_redraw();
+                                return true;
+                            }
+
+                            // Sessions-mode Enter: save-as or restore the
+                            // picked name, then close the palette.
+                            if let Some((name, saving)) = self
+                                .window
+                                .screen
+                                .renderer
+                                .command_palette
+                                .get_selected_session()
+                            {
+                                self.window
+                                    .screen
+                                    .renderer
+                                    .command_palette
+                                    .set_enabled(false);
+                                if saving {
+                                    self.window
+                                        .screen
+                                        .context_manager
+                                        .request_save_session_as(name);
+                                } else {
+                                    self.window
+                                        .screen
+                                        .context_manager
+                                        .request_restore_session_named(name);
+                                }
+                                self.request_overlay_redraw();
+                                return true;
+                            }
+
+                            // Fonts-mode Enter: copy the family name to
+                            // the system clipboard and close. The copy
+                            // icon on each row advertises this.
+                            if let Some(font) = selected_font {
+                                clipboard.set(
+                                    rio_backend::clipboard::ClipboardType::Clipboard,
+                                    font,
+                                );
+                                self.window
+                                    .screen
+                                    .renderer
+                                    .command_palette
+                                    .set_enabled(false);
+                                self.request_overlay_redraw();
+                                return true;
+                            }
+
+                            match selected_action {
+                                // `ListFonts` stays inside the palette:
+                                // swap the palette's contents from the
+                                // command list to the registered font
+                                // family names and keep it open.
+                                Some(PaletteAction::ListFonts) => {
+                                    let fonts =
+                                        self.window.screen.sugarloaf.font_family_names();
+                                    self.window
+                                        .screen
+                                        .renderer
+                                        .command_palette
+                                        .enter_fonts_mode(fonts);
+                                }
+                                // Sessions pickers stay inside the palette,
+                                // swapping to the saved-session list.
+                                Some(
+                                    action @ (PaletteAction::SaveSessionAs
+                                    | PaletteAction::RestoreSessionPicker),
+                                ) => {
+                                    let names = crate::session::list_sessions();
+                                    self.window
+                                        .screen
+                                        .renderer
+                                        .command_palette
+                                        .enter_sessions_mode(
+                                            names,
+                                            action == PaletteAction::SaveSessionAs,
+                                        );
+                                }
+                                // Remote attach opens the ssh-host input;
+                                // the flow continues inside the palette.
+                                #[cfg(unix)]
+                                Some(PaletteAction::AttachRemotePane) => {
+                                    self.window
+                                        .screen
+                                        .renderer
+                                        .command_palette
+                                        .enter_remote_host_mode();
+                                }
+                                // Any other command is a one-shot: close
+                                // the palette first, then dispatch.
+                                Some(action) => {
+                                    self.window
+                                        .screen
+                                        .renderer
+                                        .command_palette
+                                        .set_enabled(false);
+                                    self.window
+                                        .screen
+                                        .execute_palette_action(action, clipboard);
+                                }
+                                // No match at all: Enter just closes.
+                                None => {
+                                    self.window
+                                        .screen
+                                        .renderer
+                                        .command_palette
+                                        .set_enabled(false);
+                                }
+                            }
                             self.request_overlay_redraw();
                         }
-                    }
-                    _ => {
-                        if let Some(text) = key_event.text.as_ref() {
-                            // Filter out control characters
-                            let text_str = text.as_str();
-                            if !text_str.is_empty()
-                                && text_str.chars().all(|c| !c.is_control())
-                            {
-                                let current_query = self
+                        Key::Named(NamedKey::Backspace) => {
+                            let current_query =
+                                self.window.screen.renderer.command_palette.query.clone();
+                            if !current_query.is_empty() {
+                                let mut chars = current_query.chars().collect::<Vec<_>>();
+                                chars.pop();
+                                self.window
+                                    .screen
+                                    .renderer
+                                    .command_palette
+                                    .set_query(chars.into_iter().collect());
+                                self.request_overlay_redraw();
+                            }
+                        }
+                        _ => {
+                            if let Some(text) = key_event.text.as_ref() {
+                                if self
                                     .window
                                     .screen
                                     .renderer
                                     .command_palette
-                                    .query
-                                    .clone();
-                                self.window
-                                    .screen
-                                    .renderer
-                                    .command_palette
-                                    .set_query(format!("{}{}", current_query, text_str));
-                                self.request_overlay_redraw();
+                                    .append_query(text.as_str())
+                                {
+                                    self.request_overlay_redraw();
+                                }
                             }
                         }
                     }
                 }
+                true // Block all input when command palette is active
             }
-            return true; // Block all input when command palette is active
-        }
 
-        if self.window.screen.renderer.confirm_quit.is_active() {
-            if key_event.state == rio_window::event::ElementState::Pressed {
-                match &key_event.logical_key {
-                    Key::Character(c) if c.as_str() == "n" || c.as_str() == "N" => {
-                        self.window.screen.renderer.confirm_quit.set_active(false);
-                        self.request_overlay_redraw();
-                    }
-                    Key::Named(NamedKey::Escape) => {
-                        self.window.screen.renderer.confirm_quit.set_active(false);
-                        self.request_overlay_redraw();
-                    }
-                    Key::Character(c) if c.as_str() == "y" || c.as_str() == "Y" => {
-                        // Answer accepted: dismiss the overlay and run the
-                        // real quit via QuitConfirmed — only the app-side
-                        // handler can see every window, save each per its
-                        // disposition and exit the process.
-                        self.window.screen.renderer.confirm_quit.set_active(false);
-                        let ctx = self.window.screen.ctx();
-                        ctx.event_proxy().send_event(
-                            rio_backend::event::RioEventType::Rio(
-                                rio_backend::event::RioEvent::QuitConfirmed,
-                            ),
-                            ctx.window_id(),
-                        );
-                        return true;
-                    }
-                    _ => {}
-                }
-            }
-            return true;
-        }
-
-        if let Some(pending) = self.window.screen.renderer.confirm_close.pending() {
-            if key_event.state == rio_window::event::ElementState::Pressed {
-                use crate::renderer::confirm_close::PendingClose;
-                match &key_event.logical_key {
-                    Key::Character(c) if c.as_str() == "y" || c.as_str() == "Y" => {
-                        self.window.screen.renderer.confirm_close.set_pending(None);
-                        match pending {
-                            PendingClose::Tab(tab) => {
-                                self.window.screen.close_tab_at(tab, clipboard);
-                            }
-                            // The prompt said "close this window?" — honor
-                            // it by closing the whole window (every split),
-                            // not just the current split.
-                            PendingClose::Window => {
-                                self.window.screen.close_window_confirmed(clipboard);
-                            }
-                            PendingClose::Current => {
-                                self.window
-                                    .screen
-                                    .close_split_or_tab_confirmed(clipboard);
-                            }
+            Modal::ConfirmQuit => {
+                if key_event.state == rio_window::event::ElementState::Pressed {
+                    match &key_event.logical_key {
+                        Key::Character(c) if c.as_str() == "n" || c.as_str() == "N" => {
+                            self.window.screen.renderer.confirm_quit.set_active(false);
+                            self.request_overlay_redraw();
                         }
-                        self.request_overlay_redraw();
-                    }
-                    Key::Character(c) if c.as_str() == "n" || c.as_str() == "N" => {
-                        self.window.screen.renderer.confirm_close.set_pending(None);
-                        self.request_overlay_redraw();
-                    }
-                    Key::Named(NamedKey::Escape) => {
-                        self.window.screen.renderer.confirm_close.set_pending(None);
-                        self.request_overlay_redraw();
-                    }
-                    _ => {}
-                }
-            }
-            return true;
-        }
-
-        if let Some(kind) = self.window.screen.renderer.session_prompt.kind() {
-            if key_event.state == rio_window::event::ElementState::Pressed {
-                match (&key_event.logical_key, kind) {
-                    (Key::Character(c), SessionPromptKind::SaveOnExit)
-                        if c.as_str() == "y" || c.as_str() == "Y" =>
-                    {
-                        // Consent given. The app-side handler does the
-                        // all-windows save (this overlay can't reach the
-                        // other routes) and closes just this window. The
-                        // kill-vs-detach choice belongs to that handler
-                        // (it knows how the close started); setting the
-                        // detach flag here would pre-empt it and leave a
-                        // kill-close's daemons alive.
-                        self.window.screen.renderer.session_prompt.set_active(None);
-                        let ctx = self.window.screen.ctx();
-                        ctx.event_proxy().send_event(
-                            rio_backend::event::RioEventType::Rio(
-                                rio_backend::event::RioEvent::CloseWindowConfirmed(true),
-                            ),
-                            ctx.window_id(),
-                        );
-                    }
-                    (Key::Character(c), SessionPromptKind::SaveOnExit)
-                        if c.as_str() == "n" || c.as_str() == "N" =>
-                    {
-                        // Declining discards the whole saved slot — its
-                        // file may hold the only references to daemons of
-                        // windows closed earlier this run, which a single
-                        // route can't see. The app-side handler reaps them
-                        // all, then closes just this window.
-                        self.window.screen.renderer.session_prompt.set_active(None);
-                        let ctx = self.window.screen.ctx();
-                        ctx.event_proxy().send_event(
-                            rio_backend::event::RioEventType::Rio(
-                                rio_backend::event::RioEvent::CloseWindowConfirmed(false),
-                            ),
-                            ctx.window_id(),
-                        );
-                    }
-                    // Quit-scoped prompt: the answer settles every
-                    // Prompt-disposition session in the process, then the
-                    // app exits — closing only this window would silently
-                    // drop the quit for the remaining ones.
-                    (Key::Character(c), SessionPromptKind::SaveOnQuit)
-                        if c.as_str() == "y"
-                            || c.as_str() == "Y"
-                            || c.as_str() == "n"
-                            || c.as_str() == "N" =>
-                    {
-                        let save = c.as_str() == "y" || c.as_str() == "Y";
-                        self.window.screen.renderer.session_prompt.set_active(None);
-                        let ctx = self.window.screen.ctx();
-                        ctx.event_proxy().send_event(
-                            rio_backend::event::RioEventType::Rio(
-                                rio_backend::event::RioEvent::QuitSaveAnswered(save),
-                            ),
-                            ctx.window_id(),
-                        );
-                    }
-                    // Resume: reattach the saved daemons.
-                    (Key::Character(c), SessionPromptKind::ResumeOnLaunch)
-                        if c.as_str() == "r"
-                            || c.as_str() == "R"
-                            || c.as_str() == "y"
-                            || c.as_str() == "Y" =>
-                    {
-                        self.window.screen.renderer.session_prompt.set_active(None);
-                        // The overlay has no event loop, so it cannot
-                        // reopen the session's other windows; hand the
-                        // restore to the application, which runs the
-                        // same multi-window path always mode uses.
-                        // `pending_session` stays stashed for it.
-                        if self.pending_session.is_some() {
+                        Key::Named(NamedKey::Escape) => {
+                            self.window.screen.renderer.confirm_quit.set_active(false);
+                            self.request_overlay_redraw();
+                        }
+                        Key::Character(c) if c.as_str() == "y" || c.as_str() == "Y" => {
+                            // Answer accepted: dismiss the overlay and run the
+                            // real quit via QuitConfirmed — only the app-side
+                            // handler can see every window, save each per its
+                            // disposition and exit the process.
+                            self.window.screen.renderer.confirm_quit.set_active(false);
                             let ctx = self.window.screen.ctx();
                             ctx.event_proxy().send_event(
                                 rio_backend::event::RioEventType::Rio(
-                                    rio_backend::event::RioEvent::ResumeSessionAnswered,
+                                    rio_backend::event::RioEvent::QuitConfirmed,
                                 ),
                                 ctx.window_id(),
                             );
+                            return true;
                         }
-                        self.request_overlay_redraw();
+                        _ => {}
                     }
-                    // Start new + discard old: kill the saved session's
-                    // daemons (they were never restored, so the file is
-                    // the only handle on them) THEN delete the file.
-                    // Skipping the kill would strand those daemons
-                    // forever — no file, no context, nothing to reclaim.
-                    (Key::Character(c), SessionPromptKind::ResumeOnLaunch)
-                        if c.as_str() == "n" || c.as_str() == "N" =>
-                    {
-                        self.window.screen.renderer.session_prompt.set_active(None);
-                        if let Some(state) = self.pending_session.take() {
-                            // Accepted race: another instance may have
-                            // resumed these daemons between our load and
-                            // this keypress. A bare socket connect can't
-                            // tell "idle" from "already attached", so we
-                            // kill by socket regardless. Widening this
-                            // needs a protocol probe on the daemon side.
-                            // Nothing to spare: the default tab's daemon
-                            // is never part of the saved file.
-                            #[cfg(unix)]
-                            crate::session::kill_saved_session_daemons(
-                                &state,
-                                &std::collections::HashSet::new(),
-                            );
-                        }
-                        crate::session::SessionState::discard(&self.session_path());
-                        self.request_overlay_redraw();
-                    }
-                    // Start new + keep old: leave the saved daemons alive
-                    // and the file on disk so a later launch can still
-                    // resume them; just don't attach now.
-                    (Key::Character(c), SessionPromptKind::ResumeOnLaunch)
-                        if c.as_str() == "k" || c.as_str() == "K" =>
-                    {
-                        self.window.screen.renderer.session_prompt.set_active(None);
-                        self.pending_session = None;
-                        self.request_overlay_redraw();
-                    }
-                    // Esc cancels: on exit it aborts the quit, on launch
-                    // it keeps the file and daemons for next time (same
-                    // as "new + keep old").
-                    (Key::Named(NamedKey::Escape), _) => {
-                        self.window.screen.renderer.session_prompt.set_active(None);
-                        self.pending_session = None;
-                        self.request_overlay_redraw();
-                    }
-                    _ => {}
                 }
+                true
             }
-            return true;
-        }
 
-        if self.path == RoutePath::Terminal {
-            return false;
-        }
-
-        let is_enter = key_event.logical_key == Key::Named(NamedKey::Enter);
-
-        // Handle assistant overlay dismiss
-        if self.window.screen.renderer.assistant.is_active() {
-            if is_enter {
-                self.assistant.clear();
-                self.window.screen.renderer.assistant.clear();
-                self.request_overlay_redraw();
+            Modal::ConfirmClose => {
+                if let Some(pending) = self.window.screen.renderer.confirm_close.pending()
+                {
+                    if key_event.state == rio_window::event::ElementState::Pressed {
+                        use crate::renderer::confirm_close::PendingClose;
+                        match &key_event.logical_key {
+                            Key::Character(c)
+                                if c.as_str() == "y" || c.as_str() == "Y" =>
+                            {
+                                self.window
+                                    .screen
+                                    .renderer
+                                    .confirm_close
+                                    .set_pending(None);
+                                match pending {
+                                    PendingClose::Tab(tab) => {
+                                        self.window.screen.close_tab_at(tab, clipboard);
+                                    }
+                                    // The prompt said "close this window?" — honor
+                                    // it by closing the whole window (every split),
+                                    // not just the current split.
+                                    PendingClose::Window => {
+                                        self.window
+                                            .screen
+                                            .close_window_confirmed(clipboard);
+                                    }
+                                    PendingClose::Current => {
+                                        self.window
+                                            .screen
+                                            .close_split_or_tab_confirmed(clipboard);
+                                    }
+                                }
+                                self.request_overlay_redraw();
+                            }
+                            Key::Character(c)
+                                if c.as_str() == "n" || c.as_str() == "N" =>
+                            {
+                                self.window
+                                    .screen
+                                    .renderer
+                                    .confirm_close
+                                    .set_pending(None);
+                                self.request_overlay_redraw();
+                            }
+                            Key::Named(NamedKey::Escape) => {
+                                self.window
+                                    .screen
+                                    .renderer
+                                    .confirm_close
+                                    .set_pending(None);
+                                self.request_overlay_redraw();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                true
             }
-            return true;
-        }
 
-        if self.path == RoutePath::Welcome && is_enter {
-            rio_backend::config::create_config_file(None);
-            self.path = RoutePath::Terminal;
-        }
+            Modal::SessionPrompt => {
+                if let Some(kind) = self.window.screen.renderer.session_prompt.kind() {
+                    if key_event.state == rio_window::event::ElementState::Pressed {
+                        match (&key_event.logical_key, kind) {
+                            (Key::Character(c), SessionPromptKind::SaveOnExit)
+                                if c.as_str() == "y" || c.as_str() == "Y" =>
+                            {
+                                // Consent given. The app-side handler does the
+                                // all-windows save (this overlay can't reach the
+                                // other routes) and closes just this window. The
+                                // kill-vs-detach choice belongs to that handler
+                                // (it knows how the close started); setting the
+                                // detach flag here would pre-empt it and leave a
+                                // kill-close's daemons alive.
+                                self.window
+                                    .screen
+                                    .renderer
+                                    .session_prompt
+                                    .set_active(None);
+                                let ctx = self.window.screen.ctx();
+                                ctx.event_proxy().send_event(
+                                    rio_backend::event::RioEventType::Rio(
+                                        rio_backend::event::RioEvent::CloseWindowConfirmed(true),
+                                    ),
+                                    ctx.window_id(),
+                                );
+                            }
+                            (Key::Character(c), SessionPromptKind::SaveOnExit)
+                                if c.as_str() == "n" || c.as_str() == "N" =>
+                            {
+                                // Declining discards the whole saved slot — its
+                                // file may hold the only references to daemons of
+                                // windows closed earlier this run, which a single
+                                // route can't see. The app-side handler reaps them
+                                // all, then closes just this window.
+                                self.window
+                                    .screen
+                                    .renderer
+                                    .session_prompt
+                                    .set_active(None);
+                                let ctx = self.window.screen.ctx();
+                                ctx.event_proxy().send_event(
+                                    rio_backend::event::RioEventType::Rio(
+                                        rio_backend::event::RioEvent::CloseWindowConfirmed(false),
+                                    ),
+                                    ctx.window_id(),
+                                );
+                            }
+                            // Quit-scoped prompt: the answer settles every
+                            // Prompt-disposition session in the process, then the
+                            // app exits — closing only this window would silently
+                            // drop the quit for the remaining ones.
+                            (Key::Character(c), SessionPromptKind::SaveOnQuit)
+                                if c.as_str() == "y"
+                                    || c.as_str() == "Y"
+                                    || c.as_str() == "n"
+                                    || c.as_str() == "N" =>
+                            {
+                                let save = c.as_str() == "y" || c.as_str() == "Y";
+                                self.window
+                                    .screen
+                                    .renderer
+                                    .session_prompt
+                                    .set_active(None);
+                                let ctx = self.window.screen.ctx();
+                                ctx.event_proxy().send_event(
+                                    rio_backend::event::RioEventType::Rio(
+                                        rio_backend::event::RioEvent::QuitSaveAnswered(
+                                            save,
+                                        ),
+                                    ),
+                                    ctx.window_id(),
+                                );
+                            }
+                            // Resume: reattach the saved daemons.
+                            (Key::Character(c), SessionPromptKind::ResumeOnLaunch)
+                                if c.as_str() == "r"
+                                    || c.as_str() == "R"
+                                    || c.as_str() == "y"
+                                    || c.as_str() == "Y" =>
+                            {
+                                self.window
+                                    .screen
+                                    .renderer
+                                    .session_prompt
+                                    .set_active(None);
+                                // The overlay has no event loop, so it cannot
+                                // reopen the session's other windows; hand the
+                                // restore to the application, which runs the
+                                // same multi-window path always mode uses.
+                                // `pending_session` stays stashed for it.
+                                if self.pending_session.is_some() {
+                                    let ctx = self.window.screen.ctx();
+                                    ctx.event_proxy().send_event(
+                                        rio_backend::event::RioEventType::Rio(
+                                            rio_backend::event::RioEvent::ResumeSessionAnswered,
+                                        ),
+                                        ctx.window_id(),
+                                    );
+                                }
+                                self.request_overlay_redraw();
+                            }
+                            // Start new + discard old: kill the saved session's
+                            // daemons (they were never restored, so the file is
+                            // the only handle on them) THEN delete the file.
+                            // Skipping the kill would strand those daemons
+                            // forever — no file, no context, nothing to reclaim.
+                            (Key::Character(c), SessionPromptKind::ResumeOnLaunch)
+                                if c.as_str() == "n" || c.as_str() == "N" =>
+                            {
+                                self.window
+                                    .screen
+                                    .renderer
+                                    .session_prompt
+                                    .set_active(None);
+                                if let Some(state) = self.pending_session.take() {
+                                    // Accepted race: another instance may have
+                                    // resumed these daemons between our load and
+                                    // this keypress. A bare socket connect can't
+                                    // tell "idle" from "already attached", so we
+                                    // kill by socket regardless. Widening this
+                                    // needs a protocol probe on the daemon side.
+                                    // Nothing to spare: the default tab's daemon
+                                    // is never part of the saved file.
+                                    #[cfg(unix)]
+                                    crate::session::kill_saved_session_daemons(
+                                        &state,
+                                        &std::collections::HashSet::new(),
+                                    );
+                                }
+                                crate::session::SessionState::discard(
+                                    &self.session_path(),
+                                );
+                                self.request_overlay_redraw();
+                            }
+                            // Start new + keep old: leave the saved daemons alive
+                            // and the file on disk so a later launch can still
+                            // resume them; just don't attach now.
+                            (Key::Character(c), SessionPromptKind::ResumeOnLaunch)
+                                if c.as_str() == "k" || c.as_str() == "K" =>
+                            {
+                                self.window
+                                    .screen
+                                    .renderer
+                                    .session_prompt
+                                    .set_active(None);
+                                self.pending_session = None;
+                                self.request_overlay_redraw();
+                            }
+                            // Esc cancels: on exit it aborts the quit, on launch
+                            // it keeps the file and daemons for next time (same
+                            // as "new + keep old").
+                            (Key::Named(NamedKey::Escape), _) => {
+                                self.window
+                                    .screen
+                                    .renderer
+                                    .session_prompt
+                                    .set_active(None);
+                                self.pending_session = None;
+                                self.request_overlay_redraw();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                true
+            }
 
-        false
+            // Path-independent, so a `report_error` toast raised at
+            // `RoutePath::Terminal` blocks keys symmetrically with the
+            // IME gate and Enter can dismiss it (previously only a mouse
+            // click could, while plain keys leaked to the shell). Only
+            // the press dismisses: acting on the release would let a
+            // toast appearing mid-keystroke vanish unseen, and would
+            // send the orphaned release to the PTY under kitty's
+            // report-event-types mode.
+            Modal::Assistant => {
+                if key_event.state == ElementState::Pressed
+                    && key_event.logical_key == Key::Named(NamedKey::Enter)
+                {
+                    self.assistant.clear();
+                    self.window.screen.renderer.assistant.clear();
+                    self.request_overlay_redraw();
+                }
+                true
+            }
+
+            Modal::Route => {
+                let is_enter = key_event.state == ElementState::Pressed
+                    && key_event.logical_key == Key::Named(NamedKey::Enter);
+                if self.path == RoutePath::Welcome && is_enter {
+                    rio_backend::config::create_config_file(None);
+                    self.path = RoutePath::Terminal;
+                }
+                // Block everything else: the PTY behind the welcome
+                // screen is live, and keys reaching it would execute
+                // invisibly once the terminal appears.
+                true
+            }
+        }
     }
 }
 
@@ -1252,6 +1422,8 @@ pub struct RouteWindow<'a> {
     pub is_focused: bool,
     pub is_occluded: bool,
     pub needs_render_after_occlusion: bool,
+    #[cfg(target_os = "windows")]
+    pub initial_frame_rendered: bool,
     pub render_timestamp: Instant,
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub vblank_interval: Duration,
@@ -1416,14 +1588,6 @@ impl<'a> RouteWindow<'a> {
             }
         }
 
-        #[cfg(target_os = "windows")]
-        {
-            // On windows cloak (hide) the window initially, we later reveal it after the first draw.
-            // This is a workaround to hide the "white flash" that occurs during application startup.
-            use rio_window::platform::windows::WindowExtWindows;
-            winit_window.set_cloaked(false);
-        }
-
         // Get the display refresh rate and convert to frame interval
         // On macOS, CVDisplayLink handles VSync synchronization automatically,
         // so we don't need to calculate vblank intervals
@@ -1449,6 +1613,8 @@ impl<'a> RouteWindow<'a> {
             is_focused: true,
             is_occluded: false,
             needs_render_after_occlusion: false,
+            #[cfg(target_os = "windows")]
+            initial_frame_rendered: false,
             winit_window,
             screen,
         }

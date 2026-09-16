@@ -15,8 +15,9 @@ use crate::sugarloaf::Handle;
 use rustc_hash::FxHashMap;
 
 pub use rio_graphics::{
-    ColorType, Graphic, GraphicData, GraphicId, GraphicOverlay, ImageKey, ImageSource,
-    ResizeCommand, ResizeParameter, MAX_GRAPHIC_DIMENSIONS,
+    atlas_image_key, image_key_route, kitty_image_key, route_image_key, ColorType,
+    Graphic, GraphicData, GraphicId, GraphicOverlay, ResizeCommand, ResizeParameter,
+    MAX_GRAPHIC_DIMENSIONS,
 };
 
 pub struct GraphicDataEntry {
@@ -85,71 +86,4 @@ impl Graphics {
     pub fn remove(&mut self, graphic_id: &GraphicId) {
         self.inner.remove(graphic_id);
     }
-}
-
-#[test]
-fn image_keys_discriminate_source_and_owner() {
-    // Implicit kitty ids allocate from 0x80000000 while the first sixel's
-    // GraphicId is 1 — under the old flag-packed u32 key both mapped to
-    // 0x80000001 and the kitty transmit clobbered the sixel's entry.
-    assert_ne!(ImageKey::kitty(7, 0x8000_0001), ImageKey::atlas(7, 1));
-    // A client-supplied kitty i= may occupy any u32 value, including ones
-    // numerically equal to an atlas GraphicId.
-    assert_ne!(ImageKey::kitty(7, 1), ImageKey::atlas(7, 1));
-    // Per-terminal id counters restart at 1 (atlas) / 0x80000000 (kitty),
-    // so the same protocol id from two tabs sharing a window must map to
-    // distinct entries.
-    assert_ne!(ImageKey::atlas(1, 1), ImageKey::atlas(2, 1));
-    assert_ne!(
-        ImageKey::kitty(1, 0x8000_0000),
-        ImageKey::kitty(2, 0x8000_0000)
-    );
-    // Identity still holds within one terminal + source.
-    assert_eq!(ImageKey::kitty(3, 42), ImageKey::kitty(3, 42));
-    assert_eq!(ImageKey::atlas(3, 42), ImageKey::atlas(3, 42));
-}
-
-#[test]
-fn check_opaque_region() {
-    let graphic = GraphicData {
-        id: GraphicId::new(1),
-        width: 10,
-        height: 10,
-        color_type: ColorType::Rgb,
-        pixels: vec![255; 10 * 10 * 3],
-        is_opaque: true,
-        resize: None,
-        display_width: None,
-        display_height: None,
-        transmit_time: std::time::Instant::now(),
-    };
-
-    assert!(graphic.is_filled(1, 1, 3, 3));
-    assert!(!graphic.is_filled(8, 8, 10, 10));
-
-    let pixels = {
-        // Put a transparent 3x3 box inside the picture.
-        let mut data = vec![255; 10 * 10 * 4];
-        for y in 3..6 {
-            let offset = y * 10 * 4;
-            data[offset..offset + 3 * 4].fill(0);
-        }
-        data
-    };
-
-    let graphic = GraphicData {
-        id: GraphicId::new(1),
-        pixels,
-        width: 10,
-        height: 10,
-        color_type: ColorType::Rgba,
-        is_opaque: false,
-        resize: None,
-        display_width: None,
-        display_height: None,
-        transmit_time: std::time::Instant::now(),
-    };
-
-    assert!(graphic.is_filled(0, 0, 3, 3));
-    assert!(!graphic.is_filled(1, 1, 4, 4));
 }

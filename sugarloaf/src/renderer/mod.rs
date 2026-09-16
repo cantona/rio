@@ -403,7 +403,7 @@ impl MetalRenderer {
             .unwrap();
         // Must match the drawable format in `context/metal.rs` — HW will
         // reject the pipeline otherwise. Plain `BGRA8Unorm` → gamma-space
-        // alpha blending (ghostty `alpha-blending = native`).
+        // alpha blending.
         color_attachment.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
         color_attachment.set_blending_enabled(true);
         // Match WGSL BLEND settings exactly:
@@ -759,16 +759,16 @@ const IMAGE_TEXTURE_BUDGET_BYTES: usize = 256 << 20;
 /// Pick which textures to evict to get `total_bytes` back under
 /// `budget`. Never evicts entries referenced by the current frame.
 /// Returns the chosen keys; pure so the policy is unit-testable.
-fn select_texture_evictions<K: Copy>(
-    entries: impl Iterator<Item = (K, u64, usize)>,
+fn select_texture_evictions(
+    entries: impl Iterator<Item = (u64, u64, usize)>,
     total_bytes: usize,
     budget: usize,
     current_frame: u64,
-) -> Vec<K> {
+) -> Vec<u64> {
     if total_bytes <= budget {
         return Vec::new();
     }
-    let mut candidates: Vec<(K, u64, usize)> = entries
+    let mut candidates: Vec<(u64, u64, usize)> = entries
         .filter(|&(_, last_used, _)| last_used < current_frame)
         .collect();
     candidates.sort_by_key(|&(_, last_used, _)| last_used);
@@ -803,9 +803,7 @@ pub struct ImageInstance {
     pub source_rect: [f32; 4],
 }
 
-/// Which layer to render the image in. Mirrors ghostty's
-/// three-bucket split (`renderer/image.zig:94-97`,
-/// `renderer/generic.zig:1647-1695`):
+/// Which layer to render the image in. Three buckets:
 ///
 /// - `BelowBg`   — `z < BG_LIMIT`. Drawn before the cell-bg pass; sits
 ///   underneath everything terminal-related.
@@ -820,14 +818,12 @@ enum ImageLayer {
     AboveText,
 }
 
-/// Threshold separating `BelowBg` from `BelowText`. Matches ghostty's
-/// `bg_limit = std.math.minInt(i32) / 2` at
-/// `renderer/image.zig:377`.
+/// Threshold separating `BelowBg` from `BelowText`: `i32::MIN / 2`.
 pub(crate) const IMAGE_BG_LIMIT: i32 = i32::MIN / 2;
 
 /// A single image draw command for the image pipeline.
 struct ImageDraw {
-    image_id: crate::sugarloaf::graphics::ImageKey,
+    image_id: u64,
     instance: ImageInstance,
     layer: ImageLayer,
 }
@@ -851,7 +847,7 @@ pub struct Renderer {
     draw_cmds: Vec<batch::DrawCmd>,
     images: ImageCache,
     /// Per-image GPU textures (one map, any backend).
-    image_textures: FxHashMap<crate::sugarloaf::graphics::ImageKey, ImageTextureEntry>,
+    image_textures: FxHashMap<u64, ImageTextureEntry>,
     /// Sum of `bytes` across `image_textures`; compared against
     /// `IMAGE_TEXTURE_BUDGET_BYTES` after uploads.
     image_texture_bytes: usize,
@@ -866,8 +862,7 @@ pub struct Renderer {
     background_image_texture: Option<ImageTextureEntry>,
     /// Metal swap-chain state. One semaphore + one frame index for
     /// the whole renderer regardless of how many split-pane grids
-    /// exist — mirrors ghostty's `SwapChain` at
-    /// `renderer/generic.zig:247`. Each render acquires one permit,
+    /// exist. Each render acquires one permit,
     /// advances the index, hands the index to every grid's
     /// `render_bg_metal` / `render_text_metal`, and releases the
     /// permit from the command-buffer completion handler.
@@ -955,10 +950,9 @@ fn upload_background_image_texture(
             // image sampler, the HW interpolates between texels in the
             // texture's native space. With a non-sRGB format the texels
             // are gamma-encoded, so interpolation happens in gamma space
-            // and midtones at scaled edges come out visibly darker than
-            // ghostty's. With `_sRGB` the HW decodes each texel to linear
+            // and midtones at scaled edges come out visibly darker.
+            // With `_sRGB` the HW decodes each texel to linear
             // before mixing, producing the correct linear-light blend
-            // (matches ghostty's `bgra8unorm_srgb` in `Metal.zig:374`).
             // The fragment shader then `unlinearize`s the sampled value
             // back to gamma-encoded sRGB before writing to the gamma
             // framebuffer.
@@ -1078,7 +1072,7 @@ impl Renderer {
         _state: &crate::sugarloaf::state::SugarState,
         _graphics: &mut Graphics,
         image_data: &mut rustc_hash::FxHashMap<
-            crate::sugarloaf::graphics::ImageKey,
+            u64,
             crate::sugarloaf::graphics::GraphicDataEntry,
         >,
         image_overlays: &rustc_hash::FxHashMap<
@@ -1111,20 +1105,6 @@ impl Renderer {
             // so images can be re-rendered when scrolling back.
             self.image_draws.clear();
         }
-
-        // Evict GPU textures whose CPU-side pixels are gone. `image_data`
-        // is the source of truth: a texture is only ever inserted for a
-        // key that exists in `image_data`, and rio drops that entry when
-        // the graphic is freed (atlas graphic's last cell dropped, kitty
-        // image deleted). A texture with no matching `image_data` key can
-        // never be drawn again and would otherwise leak forever (upstream
-        // #1591 — atlas ids are monotonic, so every image was a fresh
-        // texture kept for the life of the window). An off-screen-but-
-        // scrollable image keeps its `image_data` entry and so keeps its
-        // texture. The sweep is O(live GPU textures) — a set this eviction
-        // itself keeps small — so it adds no meaningful per-frame cost.
-        self.image_textures
-            .retain(|id, _| image_data.contains_key(id));
 
         // Upload pending background image (if any) before the render pass
         // begins. The texture stays cached until a new image arrives or
@@ -1216,15 +1196,14 @@ impl Renderer {
         &mut self,
         context: &mut crate::context::Context,
         image_data: &mut rustc_hash::FxHashMap<
-            crate::sugarloaf::graphics::ImageKey,
+            u64,
             crate::sugarloaf::graphics::GraphicDataEntry,
         >,
         overlays: &[&crate::sugarloaf::graphics::GraphicOverlay],
     ) {
         // Off-screen textures are kept until the byte budget below
         // forces the least-recently-drawn ones out; they re-upload
-        // from `image_data` when scrolled back into view. Genuinely-freed
-        // textures (no `image_data` entry) are swept in `prepare`.
+        // from `image_data` when scrolled back into view.
         self.image_frame_counter += 1;
         let current_frame = self.image_frame_counter;
 
@@ -1458,10 +1437,7 @@ impl Renderer {
     #[allow(clippy::too_many_arguments)]
     fn draw_images_metal(
         image_draws: &[ImageDraw],
-        image_textures: &FxHashMap<
-            crate::sugarloaf::graphics::ImageKey,
-            ImageTextureEntry,
-        >,
+        image_textures: &FxHashMap<u64, ImageTextureEntry>,
         brush: &MetalRenderer,
         render_encoder: &metal::RenderCommandEncoderRef,
         layer: ImageLayer,
@@ -1680,10 +1656,22 @@ impl Renderer {
     /// kitty eviction); without this, sequential atlas ids from e.g.
     /// sixel animations would grow the texture cache without bound.
     #[inline]
-    pub fn evict_image_texture(&mut self, key: crate::sugarloaf::graphics::ImageKey) {
+    pub fn evict_image_texture(&mut self, key: u64) {
         if let Some(old) = self.image_textures.remove(&key) {
             self.image_texture_bytes -= old.bytes;
         }
+    }
+
+    pub fn evict_route_textures(&mut self, route_id: usize) {
+        let mut freed = 0;
+        self.image_textures.retain(|key, entry| {
+            let keep = crate::sugarloaf::graphics::image_key_route(*key) != route_id;
+            if !keep {
+                freed += entry.bytes;
+            }
+            keep
+        });
+        self.image_texture_bytes -= freed;
     }
 
     #[inline]
@@ -2207,9 +2195,8 @@ impl Renderer {
 
         // Acquire one swap-chain permit for the whole renderer.
         // Blocks if 3 frames are already in flight — backpressure
-        // that keeps the CPU from outrunning the GPU. Mirrors
-        // ghostty's `SwapChain.nextFrame` at
-        // `renderer/generic.zig:295`. Single Arc, single permit, no
+        // that keeps the CPU from outrunning the GPU. Single Arc,
+        // single permit, no
         // matter how many split-pane grids the renderer is driving.
         crate::grid::metal::acquire_frame_permit(&self.metal_frame_permits);
         self.metal_frame_index =
@@ -2286,8 +2273,7 @@ impl Renderer {
                 }
                 true
             })();
-            // Three-bucket image z-ordering — mirrors ghostty's
-            // `renderer/generic.zig:1640-1695`:
+            // Three-bucket image z-ordering:
             //
             //   bg fill / image (already drawn above)
             //   ↓

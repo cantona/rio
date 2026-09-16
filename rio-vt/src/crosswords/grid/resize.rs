@@ -60,8 +60,13 @@ impl Grid<Square> {
         self.saved_cursor.pos.row += from_history;
         self.cursor.pos.row += from_history;
 
-        self.display_offset = self.display_offset.saturating_sub(lines_added);
+        // The viewport absorbed exactly the rows pulled out of history,
+        // not the full growth (history may have had fewer). Clamp like
+        // the reflow paths do: an offset past the remaining history makes
+        // `visible_line_bounds` request rows the storage doesn't have.
+        self.display_offset = self.display_offset.saturating_sub(from_history);
         self.decrease_scroll_limit(lines_added);
+        self.display_offset = min(self.display_offset, self.history_size());
     }
 
     /// Remove lines from the visible area.
@@ -89,6 +94,9 @@ impl Grid<Square> {
         self.raw.rotate((self.lines - target) as isize);
         self.raw.shrink_visible_lines(target);
         self.lines = target;
+        // Rows moved into history above; same defensive clamp as
+        // `grow_lines` and the column reflows.
+        self.display_offset = min(self.display_offset, self.history_size());
     }
 
     /// Grow number of columns in each row, reflowing if necessary.
@@ -405,12 +413,30 @@ impl Grid<Square> {
                 if row.len() >= columns
                     && matches!(row[Column(columns - 1)].wide(), Wide::Wide)
                 {
-                    let mut spacer = Square::default();
-                    spacer.set_wide(Wide::LeadingSpacer);
+                    if columns < 2 {
+                        // Displacing the char into the next row would never
+                        // terminate here: column 0 is also the last column,
+                        // so it would be displaced again every iteration
+                        // while `new_raw` grew without bound. Destroy the
+                        // wide char and leave a blank narrow cell, and drop the
+                        // Spacer that followed it so it cannot claim a row
+                        // of its own.
+                        row[Column(columns - 1)] = Square::default();
+                        while matches!(
+                            wrapped.first().map(|cell| cell.wide()),
+                            Some(Wide::Spacer)
+                        ) {
+                            wrapped.remove(0);
+                        }
+                    } else {
+                        let mut spacer = Square::default();
+                        spacer.set_wide(Wide::LeadingSpacer);
 
-                    let wide_char = mem::replace(&mut row[Column(columns - 1)], spacer);
-                    wrapped.insert(0, wide_char);
-                    displaced = 1;
+                        let wide_char =
+                            mem::replace(&mut row[Column(columns - 1)], spacer);
+                        wrapped.insert(0, wide_char);
+                        displaced = 1;
+                    }
                 }
 
                 // Remove wide char spacer before shrinking.

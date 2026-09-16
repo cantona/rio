@@ -375,6 +375,23 @@ pub fn create_termp(utf8: bool) -> libc::termios {
         term.c_cc[libc::VSTATUS] = 20;
     }
 
+    // The BSD/XNU tty layer sizes the output-queue water marks from the
+    // baud rate (`ttsetwater`: cps = ospeed / 10). A zero speed clamps
+    // the queue to its ~100-byte floor, so every slave write hands the
+    // reader a ~150-byte sliver through a read+poll round trip each,
+    // capping PTY drain throughput at a fraction of what the kernel can
+    // move. B230400 saturates the clamp and yields the maximum queue.
+    // Linux ptys size their buffers independently of baud; there the
+    // speed is report-only (stty, ncurses baudrate()), and a zero would
+    // read as "0 baud", so it is set everywhere.
+    unsafe {
+        if libc::cfsetspeed(&mut term, libc::B230400) != 0 {
+            tracing::warn!(
+                "cfsetspeed(B230400) failed; pty output queue stays at the minimum"
+            );
+        }
+    }
+
     term
 }
 
@@ -509,7 +526,7 @@ pub fn create_pty_with_spawn(
     };
     let term = create_termp(true);
 
-    let res = unsafe {
+    let mut open = || unsafe {
         openpty(
             &mut main as *mut _,
             &mut child as *mut _,
@@ -519,8 +536,23 @@ pub fn create_pty_with_spawn(
         )
     };
 
+    // openpty fails transiently when many PTYs open concurrently (seen
+    // on macOS under parallel spawns, with garbage errno); a brief retry
+    // absorbs it instead of surfacing a dead surface to the embedder.
+    let mut res = open();
+    for _ in 0..3 {
+        if res >= 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        res = open();
+    }
+
     if res < 0 {
-        return Err(Error::other("openpty failed"));
+        return Err(Error::other(format!(
+            "openpty failed: {}",
+            Error::last_os_error()
+        )));
     }
 
     let user = match ShellUser::from_env() {
@@ -1128,5 +1160,21 @@ mod login_argv_tests {
     fn quotes_in_shell_path_are_escaped() {
         let argv = login_argv(false, "rapha", "/tmp/it's a shell", &[]);
         assert_eq!(argv.last().unwrap(), "exec -l '/tmp/it'\\''s a shell'");
+    }
+}
+
+#[cfg(test)]
+mod termp_tests {
+    use super::*;
+
+    // The pty output-queue watermark is derived from the baud rate on
+    // BSD/XNU; a zero speed clamps it to a ~100-byte floor and caps
+    // drain throughput.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn create_termp_sets_pty_speed() {
+        let term = create_termp(true);
+        assert_eq!(term.c_ospeed, libc::B230400);
+        assert_eq!(term.c_ispeed, libc::B230400);
     }
 }
