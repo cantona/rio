@@ -170,7 +170,7 @@ impl Listener {
             | RioEvent::RenderRoute(_) => {
                 self.delegate.wakeup(self.surface_id);
             }
-            RioEvent::Title(title) => {
+            RioEvent::Title(_, title) => {
                 self.delegate.action(
                     self.surface_id,
                     Action::SetTitle {
@@ -188,7 +188,7 @@ impl Listener {
                     },
                 );
             }
-            RioEvent::Bell => {
+            RioEvent::Bell(_) => {
                 self.delegate.action(self.surface_id, Action::RingBell);
             }
             RioEvent::CursorBlinkingChange | RioEvent::CursorBlinkingChangeOnRoute(_) => {
@@ -356,10 +356,13 @@ pub struct Surface {
     shell_pid: u32,
     #[cfg(all(feature = "pty", not(target_os = "windows")))]
     main_fd: std::os::fd::RawFd,
-    // Machine::spawn detaches its state; the handle only pins the io
-    // thread's lifetime to the surface.
+    #[cfg(all(feature = "pty", not(target_os = "windows")))]
+    child_terminator: teletypewriter::ChildTerminator,
     #[cfg(feature = "pty")]
-    _io_thread: std::thread::JoinHandle<()>,
+    _io_thread: std::thread::JoinHandle<(
+        Machine<teletypewriter::Pty, Listener>,
+        rio_vt::performer::State,
+    )>,
 }
 
 /// Encode one mouse report. SGR (`CSI < b ; x ; y M`) when the program
@@ -510,6 +513,8 @@ impl Surface {
             let shell_pid = pty.child_watcher().pid().map(|pid| pid.get()).unwrap_or(0);
             #[cfg(not(target_os = "windows"))]
             let main_fd = *pty.child.id;
+            #[cfg(not(target_os = "windows"))]
+            let child_terminator = pty.child.terminator();
 
             let machine = Machine::new(
                 Arc::clone(&terminal),
@@ -534,6 +539,8 @@ impl Surface {
                 shell_pid,
                 #[cfg(not(target_os = "windows"))]
                 main_fd,
+                #[cfg(not(target_os = "windows"))]
+                child_terminator,
                 _io_thread: io_thread,
             })
         }
@@ -1023,14 +1030,26 @@ impl Surface {
     }
 
     /// The pid of the program this surface spawned (the shell, or the
-    /// configured `shell` program). On unix it is a session leader, so a
-    /// host that must take the whole process tree down on teardown can
-    /// `killpg` it: dropping the surface only hangs up the pty and signals
-    /// this pid. On Windows it is the conpty child's process id (terminate
-    /// it with `TerminateProcess`/taskkill); 0 if the pid was unavailable.
+    /// configured `shell` program), for identity and diagnostics. Do not
+    /// signal it on teardown: dropping the surface already hangs up the
+    /// process group, and the reader thread escalates to SIGKILL and
+    /// reaps, so a host-side killpg would race that escalation and can
+    /// hit a recycled pid; a host that wants an extra signal must use
+    /// [`Surface::hangup_child`], which goes through the lifecycle
+    /// guard. On Windows it is the conpty child's process id; 0 if the
+    /// pid was unavailable.
     #[cfg(feature = "pty")]
     pub fn child_pid(&self) -> u32 {
         self.shell_pid
+    }
+
+    /// Hang up the child's process group through the lifecycle guard:
+    /// a no-op once the child was reaped, so a host can signal on its
+    /// own teardown without racing the reader thread's escalation or
+    /// hitting a recycled pid. Returns false when delivery failed.
+    #[cfg(all(feature = "pty", not(target_os = "windows")))]
+    pub fn hangup_child(&self) -> bool {
+        self.child_terminator.hangup().is_ok()
     }
 
     /// The foreground process's name (the program the user is running
@@ -1185,8 +1204,12 @@ impl Surface {
 impl Drop for Surface {
     fn drop(&mut self) {
         let _ = self.channel.send(Msg::Shutdown);
+        // Also hang up synchronously: an embedder may exit the process
+        // right after dropping the surface, before the reader thread can
+        // run its shutdown escalation. The handle is a no-op once the
+        // child was reaped, so no stale PID is ever signaled.
         #[cfg(not(target_os = "windows"))]
-        teletypewriter::kill_pid(self.shell_pid as i32);
+        let _ = self.child_terminator.hangup();
     }
 }
 

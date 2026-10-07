@@ -278,10 +278,8 @@ impl Screen<'_> {
             session_name,
             #[cfg(not(target_os = "windows"))]
             use_fork: config.use_fork,
+            shell_integration: config.shell_integration,
             is_native,
-            // When navigation does not contain any color rule
-            // does not make sense fetch for foreground process names/path
-            should_update_title_extra: !config.navigation.color_automation.is_empty(),
             split_color: config.colors.split,
             split_active_color: config.colors.split_active,
             panel: config.panel,
@@ -648,6 +646,7 @@ impl Screen<'_> {
 
         // Update keyboard config in context manager
         self.context_manager.config.keyboard = config.keyboard.clone();
+        self.context_manager.config.title = config.title.clone();
 
         // Session mode can change on reload: recompute autosave (only
         // `always` writes without a prompt) and the daemon persistence
@@ -690,6 +689,16 @@ impl Screen<'_> {
     }
 
     #[inline]
+    /// Re-render titles after a grid reflow (window resize, font-size
+    /// or scale change, split open/close): `{{columns}}`/`{{lines}}`
+    /// have no PTY event, so the reflow itself is their trigger. Panes
+    /// the walk skips are marked dirty and re-render on surfacing.
+    pub fn refresh_titles(&mut self) -> bool {
+        let only_current = self.renderer.island.is_none();
+        self.context_manager.mark_all_titles_dirty();
+        self.context_manager.update_titles(only_current)
+    }
+
     pub fn change_font_size(&mut self, action: FontSizeAction) {
         let dim = &mut self.context_manager.current_mut().dimension;
         let changed = match action {
@@ -707,6 +716,7 @@ impl Screen<'_> {
 
         self.mark_dirty();
         self.resize_all_contexts();
+        self.refresh_titles();
         // Reflowed cursor displacement is layout, not travel.
         self.renderer.trail_cursor.snap();
     }
@@ -801,6 +811,7 @@ impl Screen<'_> {
 
         self.context_manager
             .resize_all_grids(width, height, &mut self.sugarloaf);
+        self.refresh_titles();
         self.mark_dirty();
         // Rescaled cursor displacement is layout, not travel.
         self.renderer.trail_cursor.snap();
@@ -1686,6 +1697,7 @@ impl Screen<'_> {
             &mut self.sugarloaf,
         );
 
+        self.refresh_titles();
         self.mark_dirty();
         self.context_manager.autosave_on_change();
     }
@@ -1695,6 +1707,7 @@ impl Screen<'_> {
         self.context_manager
             .split(rich_text_id, false, &mut self.sugarloaf);
 
+        self.refresh_titles();
         self.mark_dirty();
         self.context_manager.autosave_on_change();
     }
@@ -1704,6 +1717,7 @@ impl Screen<'_> {
         self.context_manager
             .split(rich_text_id, true, &mut self.sugarloaf);
 
+        self.refresh_titles();
         self.mark_dirty();
         self.context_manager.autosave_on_change();
     }
@@ -1827,6 +1841,7 @@ impl Screen<'_> {
             self.clear_selection();
             self.context_manager
                 .remove_current_grid(&mut self.sugarloaf);
+            self.refresh_titles();
             self.mark_dirty();
             self.context_manager.autosave_on_change();
         } else {
@@ -3266,23 +3281,7 @@ impl Screen<'_> {
         // Right-click or Control + left-click → toggle color picker for that tab
         if is_right_click || self.modifiers.state().control_key() {
             // Get current displayed title for the rename input
-            let current_title = self
-                .context_manager
-                .title(clicked_tab)
-                .and_then(|t| {
-                    if !t.content.is_empty() {
-                        Some(t.content.clone())
-                    } else {
-                        t.extra.as_ref().and_then(|e| {
-                            if !e.program.is_empty() {
-                                Some(e.program.clone())
-                            } else {
-                                None
-                            }
-                        })
-                    }
-                })
-                .unwrap_or_else(|| String::from("~"));
+            let current_title = self.context_manager.displayed_title_for_tab(clicked_tab);
             if let Some(ref mut island) = self.renderer.island {
                 island.toggle_color_picker(
                     clicked_tab,
@@ -4227,6 +4226,9 @@ impl Screen<'_> {
     pub(crate) fn render(&mut self) -> Option<crate::context::renderable::WindowUpdate> {
         self.update_close_button_hover(self.mouse.x, self.mouse.y);
         self.run_triggers();
+        if self.renderer.is_window_focused {
+            self.context_manager.clear_current_bell();
+        }
 
         let is_search_active = self.search_active();
         if is_search_active {

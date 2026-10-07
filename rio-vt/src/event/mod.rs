@@ -232,8 +232,20 @@ pub enum RioEvent {
     /// Grid has changed possibly requiring a mouse cursor shape change.
     MouseCursorDirty,
 
-    /// Window title change.
-    Title(String),
+    /// Terminal title change from the PTY identified by `route_id`.
+    Title(usize, String),
+
+    /// Working directory change (OSC 7) from the PTY identified by
+    /// `route_id`. Payload-less: the handler re-reads the terminal's
+    /// stored directory, which the emitter already committed.
+    CurrentDirectoryChanged(usize),
+
+    /// Ask the event loop to refresh the native titlebar from the
+    /// currently displayed pane. Payload-less on purpose: the handler
+    /// re-reads the displayed title at handling time, so a queued poke
+    /// can never overwrite a newer title with a stale snapshot, and
+    /// redundant pokes dedupe at the sink.
+    SyncWindowTitle,
 
     /// Window title change.
     TitleWithSubtitle(String, String),
@@ -289,8 +301,8 @@ pub enum RioEvent {
     /// Progress bar report from OSC 9;4 sequence
     ProgressReport(ProgressReport),
 
-    /// Terminal bell ring.
-    Bell,
+    /// Terminal bell ring, from the PTY identified by `route_id`.
+    Bell(usize),
 
     /// Desktop notification from OSC 9 or OSC 777.
     DesktopNotification {
@@ -368,9 +380,6 @@ pub enum RioEvent {
     /// Selection scroll tick — auto-scroll while dragging outside viewport.
     SelectionScrollTick,
 
-    /// Update window titles.
-    UpdateTitles,
-
     /// Update terminal screen colors.
     ///
     /// The first usize is the route_id, the second is the color index to change.
@@ -399,7 +408,13 @@ impl Debug for RioEvent {
             RioEvent::PtyWrite(route_id, text) => {
                 write!(f, "PtyWrite(route={route_id}, {text})")
             }
-            RioEvent::Title(title) => write!(f, "Title({title})"),
+            RioEvent::Title(route_id, title) => {
+                write!(f, "Title route {route_id} ({title})")
+            }
+            RioEvent::CurrentDirectoryChanged(route_id) => {
+                write!(f, "CurrentDirectoryChanged route {route_id}")
+            }
+            RioEvent::SyncWindowTitle => write!(f, "SyncWindowTitle"),
             RioEvent::TitleWithSubtitle(title, subtitle) => {
                 write!(f, "TitleWithSubtitle({title}, {subtitle})")
             }
@@ -433,7 +448,7 @@ impl Debug for RioEvent {
                 write!(f, "GlyphProtocolQuery route {route_id} cp {cp:#x}")
             }
             RioEvent::Scroll(scroll) => write!(f, "Scroll {scroll:?}"),
-            RioEvent::Bell => write!(f, "Bell"),
+            RioEvent::Bell(route_id) => write!(f, "Bell route {route_id}"),
             RioEvent::TriggerFired { route_id, .. } => {
                 write!(f, "TriggerFired(route {route_id})")
             }
@@ -479,7 +494,6 @@ impl Debug for RioEvent {
                 write!(f, "BlinkCursor {timeout} {route_id}")
             }
             RioEvent::SelectionScrollTick => write!(f, "SelectionScrollTick"),
-            RioEvent::UpdateTitles => write!(f, "UpdateTitles"),
             RioEvent::Noop => write!(f, "Noop"),
             RioEvent::Copy(_) => write!(f, "Copy"),
             RioEvent::Paste => write!(f, "Paste"),

@@ -69,6 +69,10 @@ pub struct Route<'a> {
     /// never saves or prompts — otherwise an `always` save would
     /// restore it next launch as a junk plain-shell window.
     pub ephemeral: bool,
+    /// Set by `quit`; the application polls it in `about_to_wait` and
+    /// answers with an event loop exit so `exiting` drops every route
+    /// (hanging up each PTY child) before the process exits.
+    pub quit_requested: bool,
 }
 
 impl Route<'_> {
@@ -86,6 +90,7 @@ impl Route<'_> {
             pending_session: None,
             session_name: None,
             ephemeral: false,
+            quit_requested: false,
         }
     }
 }
@@ -139,9 +144,29 @@ impl Route<'_> {
         self.window.winit_window.set_subtitle(subtitle);
     }
 
+    /// Set the native window title, deduplicating against the last
+    /// value: every upstream producer may poke redundantly (the whole
+    /// design converges instead of change-detecting), so the OS call
+    /// happens only when the text really changed.
     #[inline]
     pub fn set_window_title(&mut self, title: &str) {
+        if self.window.last_window_title == title {
+            return;
+        }
+        self.window.last_window_title = title.to_string();
         self.window.winit_window.set_title(title);
+    }
+
+    /// Refresh the native titlebar from the displayed pane, through the
+    /// same fallback chain the tab strip renders.
+    #[inline]
+    pub fn sync_window_title(&mut self) {
+        let title = self
+            .window
+            .screen
+            .context_manager
+            .displayed_title_for_current_tab();
+        self.set_window_title(&title);
     }
 
     #[inline]
@@ -1193,10 +1218,13 @@ impl Router<'_> {
     }
 
     #[inline]
+    /// Full title re-render across every window, used on config reload
+    /// (the template may have changed). Panes the walk skips are marked
+    /// dirty and re-render when they surface.
     pub fn update_titles(&mut self) {
         for route in self.routes.values_mut() {
-            if route.window.is_focused {
-                route.window.screen.context_manager.update_titles();
+            if route.window.screen.refresh_titles() {
+                route.request_overlay_redraw();
             }
         }
     }
@@ -1333,6 +1361,7 @@ impl Router<'_> {
             pending_session: None,
             session_name,
             ephemeral: false,
+            quit_requested: false,
         };
 
         if let Some(err) = &self.propagated_report {
@@ -1377,6 +1406,7 @@ impl Router<'_> {
                 // the saved workspace — same treatment as the settings
                 // window, so session capture skips it.
                 ephemeral: true,
+                quit_requested: false,
             },
         );
         self.quake_window_id = Some(id);
@@ -1413,6 +1443,7 @@ impl Router<'_> {
                 pending_session: None,
                 session_name: None,
                 ephemeral: false,
+                quit_requested: false,
             },
         );
     }
@@ -1420,6 +1451,13 @@ impl Router<'_> {
 
 pub struct RouteWindow<'a> {
     pub is_focused: bool,
+    /// Whether a real Focused event has ever arrived. A window created
+    /// in the background starts `is_focused: false` and may never get
+    /// a correcting event; render gating must not freeze it before its
+    /// first focus.
+    pub focus_seen: bool,
+    /// Last title pushed to the OS, for `set_window_title` dedup.
+    pub last_window_title: String,
     pub is_occluded: bool,
     pub needs_render_after_occlusion: bool,
     #[cfg(target_os = "windows")]
@@ -1558,7 +1596,7 @@ impl<'a> RouteWindow<'a> {
             window_id: winit_window.id(),
         };
 
-        let screen = Screen::new(
+        let mut screen = Screen::new(
             properties,
             config,
             event_proxy,
@@ -1607,10 +1645,20 @@ impl<'a> RouteWindow<'a> {
             Duration::from_micros(frame_time_us)
         };
 
+        // A window can be created without focus (`open -g`, spawned
+        // behind another app) and may never receive a Focused(false)
+        // correcting a hardcoded `true`; a stale-true default makes
+        // focus-gated paths (the bell mark, its clear) treat an
+        // invisible window as watched.
+        let is_focused = winit_window.has_focus();
+        screen.renderer.is_window_focused = is_focused;
+
         Self {
             vblank_interval: monitor_vblank_interval,
             render_timestamp: Instant::now(),
-            is_focused: true,
+            is_focused,
+            focus_seen: false,
+            last_window_title: String::new(),
             is_occluded: false,
             needs_render_after_occlusion: false,
             #[cfg(target_os = "windows")]
