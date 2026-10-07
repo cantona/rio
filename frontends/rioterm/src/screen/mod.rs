@@ -4160,8 +4160,8 @@ impl Screen<'_> {
             // Previous highlights let a Partial frame rescan only damaged
             // rows and carry the rest over.
             let prev = ctx.renderable_content.trigger_highlights.as_deref();
-            let terminal = ctx.terminal.lock();
-            let actions = self.triggers.scan(route_id, &terminal);
+            let mut terminal = ctx.terminal.lock();
+            let actions = self.triggers.scan(route_id, &mut terminal);
             let highlights = self.triggers.highlights(&terminal, prev);
             (actions, highlights)
         };

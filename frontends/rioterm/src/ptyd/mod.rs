@@ -1497,6 +1497,10 @@ mod daemon_tests {
             self.bells.0.load(Ordering::SeqCst)
         }
 
+        fn history_replayed(&self) -> bool {
+            self.terminal.lock().take_history_replayed().is_some()
+        }
+
         /// Stops the io thread and drops the pty: the socket closes, the
         /// daemon keeps the pane.
         fn detach(mut self) {
@@ -1546,6 +1550,10 @@ mod daemon_tests {
         client.type_line(r#"printf '\007env=%s\n' "$RIO_PTYD_TEST""#);
         client.wait_for("env=hello");
         assert_eq!(client.bells(), 1, "a live bell rings");
+        assert!(
+            !client.history_replayed(),
+            "a fresh spawn's replay is not history"
+        );
         client.detach();
 
         // Resume: the ring is replayed as history, bell included.
@@ -1555,12 +1563,17 @@ mod daemon_tests {
         let client = Client::attach(pty, &ws);
         client.wait_for("env=hello");
         assert_eq!(client.bells(), 0, "the replayed bell stays silent");
+        assert!(
+            client.history_replayed(),
+            "the repaint is flagged as history"
+        );
 
         // Output after the replay is live again. The marker is split in
         // the command so the echoed line cannot satisfy the wait.
         client.type_line(r#"printf '\007%s\n' "li""ve""#);
         client.wait_for("live");
         assert_eq!(client.bells(), 1, "a bell after the replay rings");
+        assert!(!client.history_replayed());
         client.detach();
     }
 }

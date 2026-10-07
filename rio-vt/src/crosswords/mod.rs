@@ -465,6 +465,11 @@ where
     /// re-answering injects stale bytes into the shell as input
     /// (minicom reads them as command keys, tmux as keystrokes).
     pub suppress_replies: bool,
+    /// Per screen (primary, alt): the absolute line (scroll epoch + row)
+    /// through which replayed history has repainted the grid, until a
+    /// screen-walking consumer (terminal triggers) takes it. Lines after
+    /// it are live output that arrived since.
+    pub replayed_through: [Option<i64>; 2],
     /// Shell state from `OSC 1337 ; SetUserVar` (iTerm2 style).
     pub user_vars: rustc_hash::FxHashMap<String, String>,
 
@@ -538,6 +543,7 @@ impl<U: EventListener> Crosswords<U> {
             title_stack: Default::default(),
             current_directory: None,
             suppress_replies: false,
+            replayed_through: [None; 2],
             user_vars: rustc_hash::FxHashMap::default(),
             damage_event_in_flight: false,
             modify_other_keys: 0,
@@ -647,6 +653,30 @@ impl<U: EventListener> Crosswords<U> {
     #[inline]
     pub fn peek_line_damaged(&self, line: usize) -> bool {
         self.damage.full || self.damage.lines.get(line).is_none_or(|l| l.is_damaged())
+    }
+
+    /// Record that replayed history has repainted the active screen down
+    /// to its lowest row holding content (a replay can leave the cursor
+    /// above what it painted; blank rows below stay live).
+    pub fn mark_history_replayed(&mut self) {
+        let alt = self.mode.contains(Mode::ALT_SCREEN);
+        let epoch = self.grid.scroll_epoch();
+        let lowest = (0..self.grid.screen_lines())
+            .rev()
+            .find(|&row| !self.grid[Line(row as i32)].is_clear());
+        let through = match lowest {
+            Some(row) => epoch + row as i64,
+            None => epoch - 1,
+        };
+        let slot = &mut self.replayed_through[alt as usize];
+        *slot = Some(slot.map_or(through, |t| t.max(through)));
+    }
+
+    /// The active screen's replayed-through line, cleared on take.
+    #[inline]
+    pub fn take_history_replayed(&mut self) -> Option<i64> {
+        let alt = self.mode.contains(Mode::ALT_SCREEN);
+        self.replayed_through[alt as usize].take()
     }
 
     #[inline]
@@ -2401,7 +2431,15 @@ impl<U: EventListener> Crosswords<U> {
     }
 
     pub fn swap_alt(&mut self) {
+        // A replay that switches screens leaves the one it painted first.
+        if self.suppress_replies {
+            self.mark_history_replayed();
+        }
         if !self.mode.contains(Mode::ALT_SCREEN) {
+            // Entering the alt screen wipes it: a mark left on it by a
+            // replayed app that already quit would silence the next one.
+            self.replayed_through[1] = None;
+
             // Set alt screen cursor to the current primary screen cursor.
             self.inactive_grid.cursor = self.grid.cursor.clone();
 

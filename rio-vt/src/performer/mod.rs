@@ -293,6 +293,7 @@ where
             // replay bytes back until they parse as live ones.
             if terminal.suppress_replies {
                 state.parser.stop_sync(&mut **terminal);
+                terminal.mark_history_replayed();
             }
 
             processed += unprocessed;

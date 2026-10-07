@@ -338,8 +338,9 @@ first-class requirement, not an afterthought:
   saved dump inject replies back into a live shell.
 - Persistent panes are never silently orphaned or leaked — closing, quitting
   and `gc` all have well-defined, tested ownership rules.
-- Triggers can't feed back into themselves in a loop, and coprocesses are
-  reaped, not left running.
+- Triggers can't feed back into themselves in a loop, never re-fire on the
+  screen a resumed pane replays, and coprocesses are reaped, not left
+  running.
 - Graphics evict GPU memory instead of accumulating it across a long
   session.
 

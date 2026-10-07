@@ -258,15 +258,22 @@ impl Triggers {
     /// actions. Scans the live (non-scrolled) screen and dedups by
     /// (line, content) so each line fires once: lines above the cursor are
     /// "finalized" (non-instant rules); the cursor line fires instant rules.
+    /// A screen repainted from a session daemon's history is recorded
+    /// without firing, like a reflow.
     pub fn scan<T: EventListener>(
         &mut self,
         route_id: usize,
-        term: &Crosswords<T>,
+        term: &mut Crosswords<T>,
     ) -> Vec<ResolvedAction> {
         if self.rules.is_empty() {
             return Vec::new();
         }
 
+        // Taken only by a pass that walks the screen: the mark has to
+        // outlive frames this route is not scanned on (an unfocused
+        // split still gets its damage reset by the renderer).
+        let replayed_through = term.take_history_replayed();
+        let term = &*term;
         let grid = &term.grid;
         // Never-clamped physical-line identity base. `history_size` stops
         // at the scrollback limit (and is 0 in the alt screen), which made
@@ -298,6 +305,9 @@ impl Triggers {
         let full_damage = match term.peek_damage_event() {
             Some(TerminalDamage::Full) => true,
             Some(TerminalDamage::Partial) => false,
+            // The replayed rows may already have been painted: the
+            // silent pass below walks every row regardless of damage.
+            _ if replayed_through.is_some() => false,
             _ => return Vec::new(),
         };
 
@@ -324,6 +334,12 @@ impl Triggers {
         }
         // Re-seed pass: record keys, fire nothing.
         let reseed = reflowed || purged;
+        // A screen repainted from a session daemon's history is output
+        // the previous run already acted on: rows through the replay's
+        // end are recorded like a re-seed, rows after it are live.
+        let replayed_row =
+            |abs: i64| replayed_through.is_some_and(|through| abs <= through);
+        let silent_pass = reseed || replayed_through.is_some();
 
         // Reset the cursor line's fire set when the cursor moved to a new
         // absolute line, so a fresh prompt fires while an echo/growth on
@@ -331,10 +347,15 @@ impl Triggers {
         // the bottom SCREEN row forever, so the epoch-based line is the
         // only identity that both advances with new prompts and stays put
         // for an echo). A scrolled-back view (offset != 0) is not the live
-        // prompt, so leave the fire set untouched.
+        // prompt, so leave the fire set untouched - unless the row was
+        // replayed, which must be recorded like the rest, or the view
+        // returning to the bottom would fire it.
         let live = grid.display_offset() == 0;
-        if live {
-            let cursor_abs = epoch + cursor_row;
+        let cursor_abs = epoch + cursor_row;
+        let cursor_replayed = replayed_row(cursor_abs);
+        let cursor_silent = reseed || cursor_replayed;
+        let cursor_walk = live || cursor_replayed;
+        if cursor_walk {
             let cf = self.cursor_fired.entry(route_id).or_default();
             if cf.row != cursor_abs {
                 cf.row = cursor_abs;
@@ -350,17 +371,22 @@ impl Triggers {
             // matching it now would fire non-instant rules on a half-drawn
             // line (truncated captures) and again once it finalizes. Skip
             // it; it is evaluated when the view returns to the bottom.
-            if !live && (i as i64) == cursor_row {
+            if !cursor_walk && (i as i64) == cursor_row {
                 continue;
             }
             // On a Partial frame only damaged rows can have changed; the
             // rest keep both their content and their (epoch-based) keys.
-            // Re-seed passes must walk everything to rebuild the keys.
-            if !full_damage && !reseed && !term.peek_line_damaged(i) {
+            // Silent passes must walk everything to rebuild the keys.
+            if !full_damage && !silent_pass && !term.peek_line_damaged(i) {
                 continue;
             }
             let abs = epoch + i as i64;
-            let is_cursor = live && (i as i64) == cursor_row;
+            let is_cursor = cursor_walk && (i as i64) == cursor_row;
+            let silent = if is_cursor {
+                cursor_silent
+            } else {
+                reseed || replayed_row(abs)
+            };
             let finalized = (i as i64) < cursor_row;
             extract_match_line(term, Line(i as i32), &mut text, &mut cells);
             if text.is_empty() {
@@ -378,11 +404,12 @@ impl Triggers {
             // The cursor (live prompt) line is handled per-match below so an
             // echo of an action's own output doesn't re-fire it (findings on
             // send_text/coprocess feedback and growing instant matches). Other
-            // lines fire once each, keyed on (line, content, phase). When
-            // re-seeding (reflow / cap purge), record the key but don't fire.
+            // lines fire once each, keyed on (line, content, phase). A
+            // silent row (reflow / cap purge / replay) records the key
+            // but doesn't fire.
             if !is_cursor {
                 let fresh = seen.insert((is_alt, abs, hash_text(text), finalized));
-                if !fresh || reseed {
+                if !fresh || silent {
                     continue;
                 }
             }
@@ -418,7 +445,7 @@ impl Triggers {
                         {
                             continue;
                         }
-                        if reseed {
+                        if silent {
                             continue;
                         }
                     }
@@ -736,6 +763,231 @@ mod tests {
         // A different regex or a different action -> different id.
         assert_ne!(rule_id("done", &a), rule_id("finished", &a));
         assert_ne!(rule_id("done", &a), rule_id("done", &b));
+    }
+
+    use rio_backend::ansi::CursorShape;
+    use rio_backend::config::triggers::Trigger;
+    use rio_backend::crosswords::CrosswordsSize;
+    use rio_backend::event::{VoidListener, WindowId};
+    use rio_backend::performer::handler::Processor;
+
+    const ROUTE: usize = 7;
+
+    fn error_rule() -> Triggers {
+        Triggers::new(&TriggersConfig {
+            rules: vec![Trigger {
+                regex: "ERROR".into(),
+                instant: false,
+                once: false,
+                action: TriggerAction::TabColor {
+                    color: [1.0, 0.0, 0.0, 1.0],
+                },
+            }],
+        })
+    }
+
+    fn seeded_term(triggers: &mut Triggers) -> Crosswords<VoidListener> {
+        let mut term = Crosswords::new(
+            CrosswordsSize::new(40, 6),
+            CursorShape::Block,
+            VoidListener {},
+            WindowId::from(0),
+            ROUTE,
+            100,
+        );
+        feed(&mut term, b"boot\r\n");
+        // A route's first scan always re-seeds; get it out of the way so
+        // the assertions below see the steady state.
+        assert!(triggers.scan(ROUTE, &mut term).is_empty());
+        term.reset_damage();
+        term
+    }
+
+    fn feed(term: &mut Crosswords<VoidListener>, bytes: &[u8]) {
+        Processor::default().advance(term, bytes);
+    }
+
+    #[test]
+    fn live_output_fires_once() {
+        let mut triggers = error_rule();
+        let mut term = seeded_term(&mut triggers);
+        feed(&mut term, b"ERROR one\r\n");
+        assert_eq!(triggers.scan(ROUTE, &mut term).len(), 1);
+        term.reset_damage();
+        term.mark_fully_damaged();
+        assert!(triggers.scan(ROUTE, &mut term).is_empty());
+    }
+
+    /// The io thread parses the replay under `suppress_replies` and marks
+    /// the terminal, as the performer does.
+    fn replay(term: &mut Crosswords<VoidListener>, bytes: &[u8]) {
+        term.suppress_replies = true;
+        feed(term, bytes);
+        term.suppress_replies = false;
+        term.mark_history_replayed();
+    }
+
+    #[test]
+    fn replayed_history_is_recorded_without_firing() {
+        let mut triggers = error_rule();
+        let mut term = seeded_term(&mut triggers);
+        replay(&mut term, b"ERROR replayed\r\n");
+        assert!(triggers.scan(ROUTE, &mut term).is_empty());
+        assert_eq!(term.replayed_through, [None; 2], "the pass took the mark");
+        term.reset_damage();
+        // Same screen, scanned live: already recorded, still silent.
+        term.mark_fully_damaged();
+        assert!(triggers.scan(ROUTE, &mut term).is_empty());
+        term.reset_damage();
+        // Output after the replay is live and fires.
+        feed(&mut term, b"ERROR live\r\n");
+        let actions = triggers.scan(ROUTE, &mut term);
+        assert!(matches!(actions.as_slice(), [ResolvedAction::TabColor(_)]));
+    }
+
+    #[test]
+    fn replayed_history_is_recorded_after_its_damage_was_painted() {
+        let mut triggers = error_rule();
+        let mut term = seeded_term(&mut triggers);
+        replay(&mut term, b"ERROR replayed\r\n");
+        // The renderer painted the split while another pane was
+        // focused: no damage is left when this route is first scanned.
+        term.reset_damage();
+        assert!(triggers.scan(ROUTE, &mut term).is_empty());
+        // A later full repaint (a scroll) must not fire the replayed line.
+        term.mark_fully_damaged();
+        assert!(triggers.scan(ROUTE, &mut term).is_empty());
+    }
+
+    #[test]
+    fn live_output_parsed_after_the_replay_fires_in_the_same_pass() {
+        let mut triggers = error_rule();
+        let mut term = seeded_term(&mut triggers);
+        replay(&mut term, b"ERROR replayed\r\n");
+        // The route was not scanned (background tab) before live output
+        // arrived; only the live line fires.
+        feed(&mut term, b"ERROR live\r\n");
+        let actions = triggers.scan(ROUTE, &mut term);
+        assert!(matches!(actions.as_slice(), [ResolvedAction::TabColor(_)]));
+        term.reset_damage();
+        term.mark_fully_damaged();
+        assert!(triggers.scan(ROUTE, &mut term).is_empty());
+    }
+
+    #[test]
+    fn replay_ending_in_the_alt_screen_covers_the_primary_screen_too() {
+        let mut triggers = error_rule();
+        let mut term = seeded_term(&mut triggers);
+        // One replay chunk: primary output, then the app's alt screen.
+        replay(&mut term, b"ERROR replayed\r\n\x1b[?1049h\x1b[Hinside app");
+        assert!(term.mode().contains(Mode::ALT_SCREEN));
+        assert!(triggers.scan(ROUTE, &mut term).is_empty());
+        term.reset_damage();
+        // The app quits: the restored primary screen is replayed output.
+        feed(&mut term, b"\x1b[?1049l");
+        assert!(!term.mode().contains(Mode::ALT_SCREEN));
+        assert!(triggers.scan(ROUTE, &mut term).is_empty());
+        term.reset_damage();
+        feed(&mut term, b"ERROR live\r\n");
+        assert_eq!(triggers.scan(ROUTE, &mut term).len(), 1);
+    }
+
+    #[test]
+    fn replayed_prompt_seen_while_scrolled_back_does_not_fire_on_return() {
+        use rio_backend::crosswords::grid::Scroll;
+        let mut triggers = Triggers::new(&TriggersConfig {
+            rules: vec![Trigger {
+                regex: "^login:".into(),
+                instant: true,
+                once: false,
+                action: TriggerAction::TabColor {
+                    color: [0.0, 1.0, 0.0, 1.0],
+                },
+            }],
+        });
+        let mut term = seeded_term(&mut triggers);
+        // Enough history to scroll back into.
+        for _ in 0..10 {
+            feed(&mut term, b"line\r\n");
+        }
+        replay(&mut term, b"login: ");
+        term.scroll_display(Scroll::Delta(2));
+        assert!(triggers.scan(ROUTE, &mut term).is_empty());
+        term.reset_damage();
+        term.scroll_display(Scroll::Bottom);
+        term.mark_fully_damaged();
+        assert!(triggers.scan(ROUTE, &mut term).is_empty());
+        term.reset_damage();
+        // A new live prompt fires.
+        feed(&mut term, b"\r\nlogin: ");
+        assert_eq!(triggers.scan(ROUTE, &mut term).len(), 1);
+    }
+
+    #[test]
+    fn stale_alt_mark_from_a_replayed_pager_does_not_silence_a_live_one() {
+        let mut triggers = error_rule();
+        let mut term = seeded_term(&mut triggers);
+        // The ring holds a pager session that already quit.
+        replay(&mut term, b"\x1b[?1049h\x1b[Hpaged\x1b[?1049l$ ");
+        assert!(triggers.scan(ROUTE, &mut term).is_empty());
+        term.reset_damage();
+        // A live pager later: its first page must fire.
+        feed(&mut term, b"\x1b[?1049h\x1b[HERROR live page\r\n");
+        assert_eq!(triggers.scan(ROUTE, &mut term).len(), 1);
+    }
+
+    #[test]
+    fn live_alt_screen_output_after_the_replay_fires() {
+        let mut triggers = error_rule();
+        let mut term = seeded_term(&mut triggers);
+        // The ring ends inside a follow-mode pager; a background tab gets
+        // live lines before its route is scanned again.
+        replay(&mut term, b"\x1b[?1049h\x1b[Hfollowing\r\n");
+        feed(&mut term, b"ERROR live\r\n");
+        assert_eq!(triggers.scan(ROUTE, &mut term).len(), 1);
+    }
+
+    #[test]
+    fn replayed_rows_below_the_cursor_are_covered() {
+        let mut triggers = error_rule();
+        let mut term = seeded_term(&mut triggers);
+        // A redraw loop's ring ends with the cursor parked at the top.
+        replay(&mut term, b"ERROR replayed\r\n\x1b[H");
+        assert!(triggers.scan(ROUTE, &mut term).is_empty());
+        term.reset_damage();
+        term.mark_fully_damaged();
+        assert!(triggers.scan(ROUTE, &mut term).is_empty());
+    }
+
+    #[test]
+    fn reflow_while_scrolled_back_leaves_a_live_prompt_to_fire_on_return() {
+        use rio_backend::crosswords::grid::Scroll;
+        let mut triggers = Triggers::new(&TriggersConfig {
+            rules: vec![Trigger {
+                regex: "^login:".into(),
+                instant: true,
+                once: false,
+                action: TriggerAction::TabColor {
+                    color: [0.0, 1.0, 0.0, 1.0],
+                },
+            }],
+        });
+        let mut term = seeded_term(&mut triggers);
+        for _ in 0..10 {
+            feed(&mut term, b"line\r\n");
+        }
+        feed(&mut term, b"login: ");
+        term.scroll_display(Scroll::Delta(2));
+        term.resize(CrosswordsSize::new(40, 7));
+        term.scroll_display(Scroll::Delta(2));
+        assert_ne!(term.grid.display_offset(), 0);
+        // The reflow pass skips the live prompt, as any scrolled-back
+        // pass does; it fires once the view is back at the bottom.
+        assert!(triggers.scan(ROUTE, &mut term).is_empty());
+        term.reset_damage();
+        term.scroll_display(Scroll::Bottom);
+        term.mark_fully_damaged();
+        assert_eq!(triggers.scan(ROUTE, &mut term).len(), 1);
     }
 
     #[test]
