@@ -342,10 +342,101 @@ fn spawned_program_name(config: &ContextManagerConfig) -> String {
             }
         }
     };
-    std::path::Path::new(&program)
+    program_display_name(&program)
+}
+
+/// The daemon knows what it runs; the configured shell is only the
+/// fallback, since it describes the wrong one on a remote host and a
+/// stale one after a config edit.
+#[cfg(unix)]
+fn ptyd_program_name(reported: Option<&str>, configured: String) -> String {
+    reported
+        .filter(|p| !p.is_empty())
+        .map(program_display_name)
+        .unwrap_or(configured)
+}
+
+/// The shell a persistent pane is asked to run: the configured program,
+/// else $SHELL. `None` leaves the choice to spawn_local's resolver, the
+/// same one the shell integration uses, so the two agree.
+#[cfg(unix)]
+fn ptyd_shell(configured: Option<&str>, env_shell: Option<&str>) -> Option<String> {
+    configured
+        .filter(|s| !s.is_empty())
+        .or_else(|| env_shell.filter(|s| !s.is_empty()))
+        .map(str::to_string)
+}
+
+/// What the daemon execs: the integration's rewritten command when it
+/// has one (PowerShell), else the shell and arguments as configured.
+#[cfg(unix)]
+fn ptyd_command<'a>(
+    integration: &'a crate::shell_integration::SpawnIntegration,
+    shell: Option<&'a str>,
+    args: &'a [String],
+) -> (Option<&'a str>, &'a [String]) {
+    match &integration.command {
+        Some((program, args)) => (program.as_deref(), args.as_slice()),
+        None => (shell, args),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod ptyd_spawn_tests {
+    use super::{ptyd_command, ptyd_program_name, ptyd_shell};
+    use crate::shell_integration::SpawnIntegration;
+
+    #[test]
+    fn daemon_program_wins_over_the_configured_shell() {
+        assert_eq!(ptyd_program_name(Some("/bin/bash"), "zsh".into()), "bash");
+        assert_eq!(ptyd_program_name(Some(""), "zsh".into()), "zsh");
+        assert_eq!(ptyd_program_name(None, "zsh".into()), "zsh");
+    }
+
+    #[test]
+    fn configured_shell_then_env_then_the_resolver() {
+        assert_eq!(
+            ptyd_shell(Some("/bin/fish"), Some("/bin/zsh")).as_deref(),
+            Some("/bin/fish")
+        );
+        assert_eq!(
+            ptyd_shell(Some(""), Some("/bin/zsh")).as_deref(),
+            Some("/bin/zsh")
+        );
+        assert_eq!(
+            ptyd_shell(None, Some("")),
+            None,
+            "an empty $SHELL is not a program"
+        );
+        assert_eq!(ptyd_shell(None, None), None);
+    }
+
+    #[test]
+    fn integration_command_replaces_the_configured_one() {
+        let args = vec!["-l".to_string()];
+        let rewritten = SpawnIntegration {
+            env: Vec::new(),
+            command: Some((
+                Some("pwsh".to_string()),
+                vec!["-NoExit".to_string(), "-EncodedCommand".to_string()],
+            )),
+        };
+        let (program, got) = ptyd_command(&rewritten, Some("/bin/zsh"), &args);
+        assert_eq!(program, Some("pwsh"));
+        assert_eq!(got, ["-NoExit", "-EncodedCommand"]);
+
+        let plain = SpawnIntegration::default();
+        let (program, got) = ptyd_command(&plain, Some("/bin/zsh"), &args);
+        assert_eq!(program, Some("/bin/zsh"));
+        assert_eq!(got, ["-l"]);
+    }
+}
+
+fn program_display_name(program: &str) -> String {
+    std::path::Path::new(program)
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or(program)
+        .unwrap_or_else(|| program.to_string())
 }
 
 pub fn create_dead_context<T: rio_backend::event::EventListener>(
@@ -695,13 +786,34 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 )
             }
             None => {
-                let (pty, hello, pane_id, socket) = crate::ptyd::RemotePty::spawn_local(
+                // Same integration as a local pane, carried to the daemon
+                // as env + command. The shell is resolved once here so the
+                // env is prepared for the program the daemon execs.
+                let shell_program = ptyd_shell(
                     config.shell.program.as_deref(),
+                    std::env::var("SHELL").ok().as_deref(),
+                );
+                let integration = if config.shell_integration {
+                    crate::shell_integration::prepare(
+                        shell_program.as_deref(),
+                        &config.shell.args,
+                    )
+                } else {
+                    crate::shell_integration::SpawnIntegration::default()
+                };
+                let (program, args) = ptyd_command(
+                    &integration,
+                    shell_program.as_deref(),
                     &config.shell.args,
+                );
+                let (pty, hello, pane_id, socket) = crate::ptyd::RemotePty::spawn_local(
+                    program,
+                    args,
                     &config.working_dir,
                     config.session_name.as_deref(),
                     &winsize,
                     ring_bytes,
+                    &integration.env,
                 )?;
                 (pty, hello, pane_id, socket, None)
             }
@@ -748,7 +860,10 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 replayed: attach.is_some(),
             },
             title_dirty: false,
-            spawned_program: spawned_program_name(config),
+            spawned_program: ptyd_program_name(
+                hello.program.as_deref(),
+                spawned_program_name(config),
+            ),
             child_terminator: teletypewriter::ChildTerminator::retired(),
             _io_thread: io_thread,
         };

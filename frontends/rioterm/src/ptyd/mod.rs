@@ -106,6 +106,8 @@ pub struct HelloInfo {
     /// Live cwd the daemon reported (from /proc/<shell>/cwd), used to
     /// cache the pane's directory for the dead-daemon fallback.
     pub cwd: Option<String>,
+    /// The program the daemon spawned, as it was given.
+    pub program: Option<String>,
 }
 
 enum ReadState {
@@ -696,7 +698,8 @@ impl RemotePty {
                 ShellState::Running
             },
             exit_status: hello.exit_status,
-            cwd: parse_hello_cwd(&hello.meta_json),
+            cwd: parse_hello_meta(&hello.meta_json, "cwd"),
+            program: parse_hello_meta(&hello.meta_json, "program"),
         };
         if info.shell_state == ShellState::Exited {
             return Err(AttachError::ShellExited(info.exit_status));
@@ -810,21 +813,17 @@ impl RemotePty {
         session: Option<&str>,
         ws: &rio_backend::event::WindowSize,
         ring_bytes: usize,
+        env: &[(String, String)],
     ) -> Result<(RemotePty, HelloInfo, String, PathBuf), AttachError> {
-        // The daemon CLI needs a concrete program; `None` means the
-        // user's default shell, resolved the same way a login would.
+        // The daemon CLI needs a concrete program; `None` resolves to the
+        // user's shell the same way shell integration resolves it.
         let program = match program {
             Some(p) => p.to_string(),
-            None => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+            None => match teletypewriter::default_shell_program() {
+                shell if shell.is_empty() => "/bin/sh".to_string(),
+                shell => shell,
+            },
         };
-        let program = program.as_str();
-        let mut cmd = Command::new(ptyd_binary());
-        cmd.arg("spawn")
-            .arg("--ring-size")
-            .arg(ring_bytes.to_string());
-        if let Some(name) = session {
-            cmd.arg("--session").arg(name);
-        }
         // Resolve the working directory explicitly. The daemon
         // chdir("/")s itself when it daemonizes, so unlike a plain
         // local pty (which inherits rio's cwd for free) a persistent
@@ -837,11 +836,16 @@ impl RemotePty {
                 .ok()
                 .map(|p| p.to_string_lossy().into_owned())
         });
-        if let Some(dir) = &resolved_cwd {
-            cmd.arg("--cwd").arg(dir);
-        }
-        cmd.arg("--").arg(program).args(args);
-        let out = cmd.output()?;
+        let out = Command::new(ptyd_binary())
+            .args(spawn_argv(
+                &program,
+                args,
+                session,
+                resolved_cwd.as_deref(),
+                ring_bytes,
+                env,
+            ))
+            .output()?;
         if !out.status.success() {
             return Err(AttachError::Io(io::Error::other(format!(
                 "rio-ptyd spawn failed: {}",
@@ -863,11 +867,44 @@ impl RemotePty {
     }
 }
 
-/// Pull "cwd" out of the ServerHello meta json. Returns None for
-/// null/absent/malformed meta.
-fn parse_hello_cwd(meta: &str) -> Option<String> {
+/// Arguments for `rio-ptyd spawn`: every option, then `--`, then the
+/// program and its arguments.
+fn spawn_argv(
+    program: &str,
+    args: &[String],
+    session: Option<&str>,
+    cwd: Option<&str>,
+    ring_bytes: usize,
+    env: &[(String, String)],
+) -> Vec<String> {
+    let mut argv = vec![
+        "spawn".to_string(),
+        "--ring-size".to_string(),
+        ring_bytes.to_string(),
+    ];
+    if let Some(name) = session {
+        argv.push("--session".to_string());
+        argv.push(name.to_string());
+    }
+    if let Some(dir) = cwd {
+        argv.push("--cwd".to_string());
+        argv.push(dir.to_string());
+    }
+    for (key, value) in env {
+        argv.push("--env".to_string());
+        argv.push(format!("{key}={value}"));
+    }
+    argv.push("--".to_string());
+    argv.push(program.to_string());
+    argv.extend(args.iter().cloned());
+    argv
+}
+
+/// Pull a string field out of the ServerHello meta json. Returns None
+/// for null/absent/malformed meta.
+fn parse_hello_meta(meta: &str, key: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(meta).ok()?;
-    Some(v.get("cwd")?.as_str()?.to_string())
+    Some(v.get(key)?.as_str()?.to_string())
 }
 
 pub fn ptyd_binary() -> PathBuf {
@@ -1026,31 +1063,94 @@ fn parse_remote_pane_list(json: &str) -> Result<Vec<(String, String)>, String> {
 }
 
 #[cfg(test)]
+mod spawn_argv_tests {
+    use super::spawn_argv;
+
+    #[test]
+    fn integration_env_reaches_the_daemon_before_the_program() {
+        let env = vec![
+            ("ZDOTDIR".to_string(), "/tmp/rio/zsh".to_string()),
+            ("A".to_string(), "x=y z".to_string()),
+        ];
+        let argv = spawn_argv(
+            "/bin/zsh",
+            &["-l".to_string()],
+            Some("work"),
+            Some("/home/u"),
+            1024,
+            &env,
+        );
+        assert_eq!(
+            argv,
+            [
+                "spawn",
+                "--ring-size",
+                "1024",
+                "--session",
+                "work",
+                "--cwd",
+                "/home/u",
+                "--env",
+                "ZDOTDIR=/tmp/rio/zsh",
+                "--env",
+                "A=x=y z",
+                "--",
+                "/bin/zsh",
+                "-l",
+            ]
+        );
+    }
+
+    #[test]
+    fn nothing_optional_still_separates_the_program() {
+        assert_eq!(
+            spawn_argv("/bin/sh", &[], None, None, 8, &[]),
+            ["spawn", "--ring-size", "8", "--", "/bin/sh"]
+        );
+    }
+}
+
+#[cfg(test)]
 mod hello_meta_tests {
-    use super::parse_hello_cwd;
+    use super::parse_hello_meta;
 
     #[test]
     fn cwd_honors_json_string_escapes() {
         assert_eq!(
-            parse_hello_cwd(r#"{"pane_id":"x","program":"sh","cwd":"/tmp/a\"b"}"#)
-                .as_deref(),
+            parse_hello_meta(
+                r#"{"pane_id":"x","program":"sh","cwd":"/tmp/a\"b"}"#,
+                "cwd"
+            )
+            .as_deref(),
             Some("/tmp/a\"b")
         );
         assert_eq!(
-            parse_hello_cwd(r#"{"cwd":"/tmp/a\\b"}"#).as_deref(),
+            parse_hello_meta(r#"{"cwd":"/tmp/a\\b"}"#, "cwd").as_deref(),
             Some("/tmp/a\\b")
         );
         assert_eq!(
-            parse_hello_cwd(r#"{"cwd":"/plain"}"#).as_deref(),
+            parse_hello_meta(r#"{"cwd":"/plain"}"#, "cwd").as_deref(),
             Some("/plain")
         );
     }
 
     #[test]
+    fn program_is_read_from_the_same_meta() {
+        assert_eq!(
+            parse_hello_meta(
+                r#"{"pane_id":"x","program":"/bin/zsh","cwd":"/"}"#,
+                "program"
+            )
+            .as_deref(),
+            Some("/bin/zsh")
+        );
+    }
+
+    #[test]
     fn cwd_null_absent_or_garbage_is_none() {
-        assert_eq!(parse_hello_cwd(r#"{"cwd":null}"#), None);
-        assert_eq!(parse_hello_cwd(r#"{"pane_id":"x"}"#), None);
-        assert_eq!(parse_hello_cwd("not json"), None);
+        assert_eq!(parse_hello_meta(r#"{"cwd":null}"#, "cwd"), None);
+        assert_eq!(parse_hello_meta(r#"{"pane_id":"x"}"#, "cwd"), None);
+        assert_eq!(parse_hello_meta("not json", "cwd"), None);
     }
 }
 
