@@ -18,6 +18,7 @@ struct TestPty {
     shutdown_calls: usize,
     deregister_calls: usize,
     raw_error: Option<i32>,
+    replay_pending: bool,
 }
 
 impl Read for TestPty {
@@ -53,6 +54,9 @@ impl ProcessReadWrite for TestPty {
     }
     fn write_token(&self) -> corcovado::Token {
         1.into()
+    }
+    fn take_replay_pending(&mut self) -> bool {
+        std::mem::take(&mut self.replay_pending)
     }
     fn set_winsize(&mut self, _: WinsizeBuilder) -> io::Result<()> {
         Ok(())
@@ -113,10 +117,18 @@ impl EventedPty for TestPty {
 }
 
 fn machine(bytes: Vec<u8>, ending: Option<ErrorKind>) -> Machine<TestPty, VoidListener> {
+    machine_with(bytes, ending, VoidListener)
+}
+
+fn machine_with<L: EventListener + Clone + Send + 'static>(
+    bytes: Vec<u8>,
+    ending: Option<ErrorKind>,
+    listener: L,
+) -> Machine<TestPty, L> {
     let terminal = Crosswords::new(
         CrosswordsSize::new(80, 24),
         CursorShape::Block,
-        VoidListener,
+        listener.clone(),
         WindowId::from(0),
         0,
         0,
@@ -134,15 +146,16 @@ fn machine(bytes: Vec<u8>, ending: Option<ErrorKind>) -> Machine<TestPty, VoidLi
             shutdown_calls: 0,
             deregister_calls: 0,
             raw_error: None,
+            replay_pending: false,
         },
-        VoidListener,
+        listener,
         WindowId::from(0),
         0,
     )
     .unwrap()
 }
 
-fn first_line(machine: &Machine<TestPty, VoidListener>, len: usize) -> String {
+fn first_line<L: EventListener>(machine: &Machine<TestPty, L>, len: usize) -> String {
     let terminal = machine.terminal.lock();
     (0..len)
         .map(|col| terminal.grid[Line(0)][Column(col)].c())
@@ -339,4 +352,42 @@ fn explicit_shutdown_finalizes_once() {
     let (machine, _) = machine.spawn().join().unwrap();
     assert_eq!(machine.pty.shutdown_calls, 1);
     assert_eq!(machine.pty.deregister_calls, 1);
+}
+
+#[derive(Clone)]
+struct BellSpy(Arc<std::sync::atomic::AtomicBool>);
+
+impl EventListener for BellSpy {
+    fn send_event(&self, event: RioEvent, _id: WindowId) {
+        if matches!(event, RioEvent::Bell(_)) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+// A replay that ends inside a synchronized update: the parser holds
+// everything after the BSU that arrives in a LATER advance, so the tail
+// comes in a second read. It must be flushed while the replay flag still
+// covers it, not later under a live parse.
+#[test]
+fn replay_tail_held_by_a_synchronized_update_stays_replay() {
+    let rang = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut machine = machine_with(
+        b"\x1b[?2026h".to_vec(),
+        Some(ErrorKind::WouldBlock),
+        BellSpy(rang.clone()),
+    );
+    let mut state = State::default();
+    let mut buf = vec![0; READ_BUFFER_SIZE];
+    for chunk in [&b"\x1b[?2026h"[..], &b"replayed\x07"[..]] {
+        machine.pty.bytes = io::Cursor::new(chunk.to_vec());
+        machine.pty.replay_pending = true;
+        machine.pty_read(&mut state, &mut buf).unwrap();
+    }
+    assert_eq!(state.parser.sync_bytes_count(), 0, "sync buffer flushed");
+    assert_eq!(first_line(&machine, 8), "replayed");
+    assert!(
+        !rang.load(std::sync::atomic::Ordering::SeqCst),
+        "a BEL from the replay must not ring"
+    );
 }

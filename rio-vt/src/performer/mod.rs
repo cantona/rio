@@ -289,6 +289,11 @@ where
             // generate query replies (stale answers become input).
             terminal.suppress_replies = self.pty.take_replay_pending();
             state.parser.advance(&mut **terminal, &buf[..unprocessed]);
+            // A synchronized update left open by the replay must not hold
+            // replay bytes back until they parse as live ones.
+            if terminal.suppress_replies {
+                state.parser.stop_sync(&mut **terminal);
+            }
 
             processed += unprocessed;
             unprocessed = 0;

@@ -136,6 +136,15 @@ pub struct RemoteReader {
 const HEADER_LEN: usize = protocol::HEADER_LEN;
 
 impl RemoteReader {
+    /// Whether the bytes read since the last call came from a replay:
+    /// true inside the ReplayBegin..ReplayEnd window and for the chunk
+    /// that closed it, never for the live frame after it.
+    fn take_replay_pending(&mut self) -> bool {
+        let pending = self.in_replay || self.replay_dirty;
+        self.replay_dirty = false;
+        pending
+    }
+
     fn signal_exit(&mut self) {
         if !self.exit_signaled {
             self.exit_signaled = true;
@@ -219,10 +228,18 @@ impl Read for RemoteReader {
                         if self.exited.is_some() || self.link_lost {
                             return Ok(0);
                         }
-                        ReadState::Header {
+                        self.state = ReadState::Header {
                             have: 0,
                             hdr: [0; HEADER_LEN],
+                        };
+                        // Replay bytes the caller still holds must be parsed
+                        // before a live frame can share their buffer.
+                        if FrameType::from_u8(typ) == Some(FrameType::ReplayEnd)
+                            && self.replay_dirty
+                        {
+                            return Err(io::ErrorKind::WouldBlock.into());
                         }
+                        continue;
                     } else {
                         ReadState::Control {
                             typ,
@@ -391,6 +408,10 @@ pub struct RemotePty {
     exit_pipe_r: OwnedFd,
     token: corcovado::Token,
     exit_token: corcovado::Token,
+    /// The replay repaints output from a previous run, whose replies and
+    /// bells are stale. A freshly spawned pane is replayed too - whatever
+    /// its program wrote before the attach - and that output is live.
+    replay_is_history: bool,
 }
 
 impl ProcessReadWrite for RemotePty {
@@ -469,13 +490,8 @@ impl ProcessReadWrite for RemotePty {
     }
 
     fn take_replay_pending(&mut self) -> bool {
-        // Sticky across the replay window plus a buffer that straddles
-        // ReplayEnd: over-suppressing a few first live bytes is
-        // harmless (apps re-query); under-suppressing injects stale
-        // query replies into the app as input.
-        let pending = self.reader.in_replay || self.reader.replay_dirty;
-        self.reader.replay_dirty = self.reader.in_replay;
-        pending
+        let replayed = self.reader.take_replay_pending();
+        replayed && self.replay_is_history
     }
 
     fn register(
@@ -749,6 +765,7 @@ impl RemotePty {
                 exit_pipe_r: exit_r,
                 token: corcovado::Token(0),
                 exit_token: corcovado::Token(0),
+                replay_is_history: true,
             },
             info,
         ))
@@ -862,7 +879,9 @@ impl RemotePty {
                 "rio-ptyd spawn returned no socket",
             )));
         }
-        let (pty, info) = Self::attach_unix(&socket, ws, Duration::from_secs(2))?;
+        let (mut pty, info) = Self::attach_unix(&socket, ws, Duration::from_secs(2))?;
+        // Just spawned: the replay holds this run's own startup output.
+        pty.replay_is_history = false;
         Ok((pty, info, pane_id, socket))
     }
 }
@@ -1063,6 +1082,108 @@ fn parse_remote_pane_list(json: &str) -> Result<Vec<(String, String)>, String> {
 }
 
 #[cfg(test)]
+mod replay_flag_tests {
+    use super::{ReadState, RemoteReader, HEADER_LEN};
+    use rio_ptyd::protocol::{write_frame, FrameType};
+    use std::io::{ErrorKind, Read};
+    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::unix::net::UnixStream;
+
+    /// Frames as the daemon sends them: ReplayBegin carries the replay
+    /// length, so it takes the Control path like the real one. The daemon
+    /// end is returned so it stays open; dropping it would turn the end of
+    /// the frames into EOF.
+    fn reader_over(
+        frames: &[(FrameType, &[u8])],
+    ) -> (RemoteReader, UnixStream, UnixStream, UnixStream) {
+        let (mut daemon, client) = UnixStream::pair().unwrap();
+        for (typ, payload) in frames {
+            write_frame(&mut daemon, *typ, payload).unwrap();
+        }
+        client.set_nonblocking(true).unwrap();
+        let (exit_w, exit_r) = UnixStream::pair().unwrap();
+        let reader = RemoteReader {
+            fd: client.as_raw_fd(),
+            state: ReadState::Header {
+                have: 0,
+                hdr: [0; HEADER_LEN],
+            },
+            exit_pipe_w: OwnedFd::from(exit_w),
+            exit_signaled: false,
+            exited: None,
+            link_lost: false,
+            in_replay: false,
+            replay_dirty: false,
+        };
+        (reader, daemon, client, exit_r)
+    }
+
+    fn read_bytes(reader: &mut RemoteReader) -> std::io::Result<Vec<u8>> {
+        let mut buf = [0u8; 64];
+        let n = reader.read(&mut buf)?;
+        Ok(buf[..n].to_vec())
+    }
+
+    #[test]
+    fn replay_flag_covers_replay_bytes_and_nothing_after() {
+        let begin = 3u64.to_le_bytes();
+        let (mut reader, _daemon, _client, _exit) = reader_over(&[
+            (FrameType::ReplayBegin, &begin[..]),
+            (FrameType::Output, b"old"),
+            (FrameType::ReplayEnd, b""),
+            (FrameType::Output, b"live\x07"),
+        ]);
+        assert_eq!(read_bytes(&mut reader).unwrap(), b"old");
+        assert!(
+            reader.take_replay_pending(),
+            "replay chunk parsed as replay"
+        );
+        // ReplayEnd is consumed on the way to the live frame.
+        assert_eq!(read_bytes(&mut reader).unwrap(), b"live\x07");
+        assert!(
+            !reader.take_replay_pending(),
+            "the first live frame is live"
+        );
+    }
+
+    #[test]
+    fn replay_end_hands_over_unparsed_replay_bytes_first() {
+        // The io loop could not parse the last replay chunk yet (the
+        // renderer held the terminal) and comes back for more.
+        let begin = 3u64.to_le_bytes();
+        let (mut reader, _daemon, _client, _exit) = reader_over(&[
+            (FrameType::ReplayBegin, &begin[..]),
+            (FrameType::Output, b"old"),
+            (FrameType::ReplayEnd, b""),
+            (FrameType::Output, b"live\x07"),
+        ]);
+        assert_eq!(read_bytes(&mut reader).unwrap(), b"old");
+        let err = read_bytes(&mut reader).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::WouldBlock, "stop at ReplayEnd");
+        assert!(
+            reader.take_replay_pending(),
+            "the held chunk is still replay"
+        );
+        assert_eq!(read_bytes(&mut reader).unwrap(), b"live\x07");
+        assert!(!reader.take_replay_pending());
+    }
+
+    #[test]
+    fn replay_end_with_nothing_held_does_not_stop() {
+        // Nothing of the replay is unparsed, so the live frame behind
+        // ReplayEnd comes back from the same read.
+        let begin = 0u64.to_le_bytes();
+        let (mut reader, _daemon, _client, _exit) = reader_over(&[
+            (FrameType::ReplayBegin, &begin[..]),
+            (FrameType::ReplayEnd, b""),
+            (FrameType::Output, b"live"),
+        ]);
+        assert_eq!(read_bytes(&mut reader).unwrap(), b"live");
+        assert!(!reader.take_replay_pending());
+    }
+}
+
+#[cfg(test)]
 mod spawn_argv_tests {
     use super::spawn_argv;
 
@@ -1208,5 +1329,238 @@ mod remote_list_tests {
     #[test]
     fn rejects_garbage() {
         assert!(parse_remote_pane_list("not json").is_err());
+    }
+}
+
+/// Against the tree's own `rio-ptyd`, through the real io machine: a
+/// fresh spawn's startup output is live, a resume's replay is history.
+/// Ignored by default because it spawns a daemon: build it first with
+/// `cargo build -p rio-ptyd`, then run `cargo test -p rioterm --
+/// --ignored daemon_tests`.
+#[cfg(all(test, unix))]
+mod daemon_tests {
+    use super::{ptyd_binary, RemotePty};
+    use crate::event::sync::FairMutex;
+    use crate::performer::{Machine, State};
+    use rio_backend::ansi::CursorShape;
+    use rio_backend::crosswords::pos::{Column, Line};
+    use rio_backend::crosswords::{Crosswords, CrosswordsSize};
+    use rio_backend::event::{EventListener, Msg, RioEvent, WindowId, WindowSize};
+    use std::borrow::Cow;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, OnceLock};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    const HOW_TO_RUN: &str = "the tree's daemon is missing: cargo build -p rio-ptyd, \
+        then cargo test -p rioterm -- --ignored daemon_tests";
+
+    /// Daemons spawned here must not land in the user's runtime dir next
+    /// to real sessions, and `ptyd_binary()` must resolve to the tree's
+    /// daemon, not one installed on PATH. Both are process-wide.
+    fn isolate() -> &'static PathBuf {
+        static RUNTIME: OnceLock<PathBuf> = OnceLock::new();
+        RUNTIME.get_or_init(|| {
+            let exe = std::env::current_exe().unwrap();
+            let deps = exe.parent().unwrap();
+            let built = deps.parent().unwrap().join("rio-ptyd");
+            assert!(built.exists(), "{HOW_TO_RUN}");
+            let beside = deps.join("rio-ptyd");
+            let _ = std::fs::remove_file(&beside);
+            std::fs::hard_link(&built, &beside).unwrap();
+            assert_eq!(ptyd_binary(), beside);
+
+            let runtime = std::env::temp_dir()
+                .join(format!("rioterm-daemon-tests-{}", std::process::id()));
+            std::fs::create_dir_all(&runtime).unwrap();
+            std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+            runtime
+        })
+    }
+
+    const SESSION: &str = "rioterm-daemon-test";
+
+    /// Kills every pane tagged with the test session on drop, so a
+    /// failed spawn, attach or assertion leaves no daemon behind, then
+    /// removes the runtime dir once the daemon has let go of its socket.
+    struct SessionGuard {
+        runtime: &'static PathBuf,
+        socket: Option<PathBuf>,
+    }
+
+    impl Drop for SessionGuard {
+        fn drop(&mut self) {
+            let _ = Command::new(ptyd_binary())
+                .args(["kill-session", SESSION])
+                .status();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let gone = loop {
+                let gone = self.socket.as_ref().is_none_or(|s| !s.exists());
+                if gone || Instant::now() > deadline {
+                    break gone;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            if gone {
+                let _ = std::fs::remove_dir_all(self.runtime);
+            }
+            if !std::thread::panicking() {
+                assert!(gone, "daemon did not exit on kill");
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct BellCounter(Arc<AtomicUsize>);
+
+    impl EventListener for BellCounter {
+        fn send_event(&self, event: RioEvent, _: WindowId) {
+            if matches!(event, RioEvent::Bell(_)) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// A pane as rioterm drives it: the pty owned by the io thread, the
+    /// grid behind the shared lock, input through the channel.
+    struct Client {
+        terminal: Arc<FairMutex<Crosswords<BellCounter>>>,
+        bells: BellCounter,
+        channel: corcovado::channel::Sender<Msg>,
+        io: Option<JoinHandle<(Machine<RemotePty, BellCounter>, State)>>,
+    }
+
+    impl Client {
+        fn attach(pty: RemotePty, ws: &WindowSize) -> Self {
+            let bells = BellCounter::default();
+            let terminal = Arc::new(FairMutex::new(Crosswords::new(
+                CrosswordsSize::new(ws.cols as usize, ws.rows as usize),
+                CursorShape::Block,
+                bells.clone(),
+                WindowId::from(0),
+                0,
+                1000,
+            )));
+            let machine = Machine::new(
+                Arc::clone(&terminal),
+                pty,
+                bells.clone(),
+                WindowId::from(0),
+                0,
+            )
+            .unwrap();
+            let channel = machine.channel();
+            let io = Some(machine.spawn());
+            Self {
+                terminal,
+                bells,
+                channel,
+                io,
+            }
+        }
+
+        fn type_line(&self, line: &str) {
+            let bytes = format!("{line}\n").into_bytes();
+            self.channel.send(Msg::Input(Cow::Owned(bytes))).unwrap();
+        }
+
+        fn wait_for(&self, needle: &str) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let text = self.screen();
+                if text.contains(needle) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {needle:?}; screen:\n{text}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn screen(&self) -> String {
+            let term = self.terminal.lock();
+            let mut out = String::new();
+            for line in 0..term.screen_lines() {
+                for col in 0..term.columns() {
+                    out.push(term.grid[Line(line as i32)][Column(col)].c());
+                }
+                out.push('\n');
+            }
+            out
+        }
+
+        fn bells(&self) -> usize {
+            self.bells.0.load(Ordering::SeqCst)
+        }
+
+        /// Stops the io thread and drops the pty: the socket closes, the
+        /// daemon keeps the pane.
+        fn detach(mut self) {
+            self.channel.send(Msg::Shutdown).unwrap();
+            let (machine, _) = self.io.take().unwrap().join().unwrap();
+            drop(machine);
+        }
+    }
+
+    #[test]
+    #[ignore = "spawns a rio-ptyd daemon; cargo build -p rio-ptyd, then run with --ignored"]
+    fn resume_replays_history_silently_while_fresh_spawn_output_is_live() {
+        let mut guard = SessionGuard {
+            runtime: isolate(),
+            socket: None,
+        };
+        let cwd = std::env::temp_dir().canonicalize().unwrap();
+        let ws = WindowSize {
+            rows: 12,
+            cols: 60,
+            width: 600,
+            height: 240,
+        };
+        let env = [("RIO_PTYD_TEST".to_string(), "hello".to_string())];
+        let (pty, hello, pane_id, socket) = RemotePty::spawn_local(
+            Some("/bin/sh"),
+            &[],
+            &Some(cwd.to_string_lossy().into_owned()),
+            Some(SESSION),
+            &ws,
+            64 * 1024,
+            &env,
+        )
+        .unwrap();
+        assert!(
+            socket.starts_with(guard.runtime),
+            "daemon escaped the test runtime dir"
+        );
+        guard.socket = Some(socket.clone());
+        assert!(!pane_id.is_empty());
+        assert_eq!(hello.program.as_deref(), Some("/bin/sh"));
+        assert_eq!(hello.cwd.as_deref(), cwd.to_str());
+
+        // Fresh spawn: the startup replay is this run's own output, and
+        // `--env` reached the shell.
+        let client = Client::attach(pty, &ws);
+        client.type_line(r#"printf '\007env=%s\n' "$RIO_PTYD_TEST""#);
+        client.wait_for("env=hello");
+        assert_eq!(client.bells(), 1, "a live bell rings");
+        client.detach();
+
+        // Resume: the ring is replayed as history, bell included.
+        let (pty, hello) =
+            RemotePty::attach_unix(&socket, &ws, Duration::from_secs(2)).unwrap();
+        assert_eq!(hello.program.as_deref(), Some("/bin/sh"));
+        let client = Client::attach(pty, &ws);
+        client.wait_for("env=hello");
+        assert_eq!(client.bells(), 0, "the replayed bell stays silent");
+
+        // Output after the replay is live again. The marker is split in
+        // the command so the echoed line cannot satisfy the wait.
+        client.type_line(r#"printf '\007%s\n' "li""ve""#);
+        client.wait_for("live");
+        assert_eq!(client.bells(), 1, "a bell after the replay rings");
+        client.detach();
     }
 }

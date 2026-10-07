@@ -3792,6 +3792,9 @@ impl<U: EventListener> Handler for Crosswords<U> {
     /// Store data into clipboard.
     #[inline]
     fn clipboard_store(&mut self, clipboard: u8, base64: &[u8]) {
+        if self.suppress_replies {
+            return;
+        }
         let clipboard_type = match clipboard {
             b'c' => ClipboardType::Clipboard,
             b'p' | b's' => ClipboardType::Selection,
@@ -4537,12 +4540,18 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
     #[inline]
     fn bell(&mut self) {
+        if self.suppress_replies {
+            return;
+        }
         self.event_proxy
             .send_event(RioEvent::Bell(self.route_id), self.window_id);
     }
 
     #[inline]
     fn desktop_notification(&mut self, title: String, body: String) {
+        if self.suppress_replies {
+            return;
+        }
         self.event_proxy.send_event(
             RioEvent::DesktopNotification { title, body },
             self.window_id,
@@ -4556,6 +4565,9 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
     #[inline]
     fn clipboard_load(&mut self, clipboard: u8, terminator: &str) {
+        if self.suppress_replies {
+            return;
+        }
         let clipboard_type = match clipboard {
             b'c' => ClipboardType::Clipboard,
             b'p' | b's' => ClipboardType::Selection,
@@ -4714,6 +4726,9 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
     #[inline]
     fn text_area_size_pixels(&mut self) {
+        if self.suppress_replies {
+            return;
+        }
         debug!("text_area_size_pixels");
         self.event_proxy.send_event(
             RioEvent::TextAreaSizeRequest(
@@ -4752,6 +4767,9 @@ impl<U: EventListener> Handler for Crosswords<U> {
 
     #[inline]
     fn graphics_attribute(&mut self, pi: u16, pa: u16) {
+        if self.suppress_replies {
+            return;
+        }
         // From Xterm documentation:
         //
         // CSI ? Pi ; Pa ; Pv S
@@ -5713,6 +5731,9 @@ impl<U: EventListener> Handler for Crosswords<U> {
     }
 
     fn glyph_query(&mut self, cp: u32) {
+        if self.suppress_replies {
+            return;
+        }
         // Defer to the frontend: only it has access to both the per-
         // route registry and the FontLibrary, so only it can compute
         // the System / Glossary / Both bits accurately. The frontend
@@ -8283,6 +8304,44 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, RioEvent::Bell(route) if *route == 7)),
             "BEL should emit RioEvent::Bell carrying its route id"
+        );
+    }
+
+    #[test]
+    fn bell_is_silent_while_replaying() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut term = Crosswords::new(
+            CrosswordsSize::new(10, 10),
+            CursorShape::Block,
+            TestListener {
+                events: events.clone(),
+            },
+            WindowId::from(0),
+            7,
+            10,
+        );
+        term.suppress_replies = true;
+        let mut parser = crate::performer::handler::Processor::default();
+        parser.advance(&mut term, b"\x07");
+        assert!(
+            !events
+                .borrow()
+                .iter()
+                .any(|e| matches!(e, RioEvent::Bell(_))),
+            "a replayed BEL already rang in the previous run"
+        );
+
+        term.suppress_replies = false;
+        parser.advance(&mut term, b"\x07");
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .any(|e| matches!(e, RioEvent::Bell(route) if *route == 7)),
+            "a live BEL after the replay still rings"
         );
     }
 
