@@ -114,6 +114,13 @@ impl Mouse {
     }
 }
 
+/// Whether `mode` asks for a cursor move to be reported: any move under 1003,
+/// and under 1002 only while a button is held.
+#[inline]
+pub fn motion_is_reported(mode: Mode, button_held: bool) -> bool {
+    mode.contains(Mode::MOUSE_MOTION) || (button_held && mode.contains(Mode::MOUSE_DRAG))
+}
+
 /// What a cursor move changed, from [`Mouse::track_position`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PointerMove {
@@ -912,5 +919,18 @@ pub mod test {
                 pixel_motion: true,
             }
         );
+    }
+
+    #[test]
+    fn motion_is_reported_only_when_the_protocol_wants_it() {
+        let drag = Mode::MOUSE_DRAG | Mode::SGR_PIXELS_MOUSE;
+        let motion = Mode::MOUSE_MOTION | Mode::SGR_PIXELS_MOUSE;
+
+        assert!(!motion_is_reported(drag, false));
+        assert!(motion_is_reported(drag, true));
+        assert!(motion_is_reported(motion, false));
+        assert!(motion_is_reported(motion, true));
+        assert!(!motion_is_reported(Mode::MOUSE_REPORT_CLICK, true));
+        assert!(!motion_is_reported(Mode::empty(), true));
     }
 }

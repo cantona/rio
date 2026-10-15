@@ -3729,14 +3729,9 @@ impl Screen<'_> {
         }
     }
 
-    #[inline]
-    pub fn has_mouse_motion(&mut self) -> bool {
-        self.get_mode().intersects(Mode::MOUSE_MOTION)
-    }
-
     /// Report a cursor move under the motion protocols (1002, 1003), coded by
-    /// the button held.
-    pub fn report_mouse_motion(&mut self) {
+    /// the button held. `mode` is the terminal mode the move was read under.
+    pub fn report_mouse_motion(&mut self, mode: Mode) {
         if self.mouse.left_button_state == ElementState::Pressed {
             // A latched hint click hides its press and release
             // from the application; a drag report leaking out
@@ -3748,7 +3743,7 @@ impl Screen<'_> {
             self.mouse_report(33, ElementState::Pressed);
         } else if self.mouse.right_button_state == ElementState::Pressed {
             self.mouse_report(34, ElementState::Pressed);
-        } else if self.has_mouse_motion() {
+        } else if mode.contains(Mode::MOUSE_MOTION) {
             self.mouse_report(35, ElementState::Pressed);
         }
     }

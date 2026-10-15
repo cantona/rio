@@ -1,6 +1,6 @@
 use crate::event::{ClickState, EventPayload, EventProxy, RioEvent, RioEventType};
 use crate::ime::{Preedit, PreeditCursor};
-use crate::mouse::PointerMove;
+use crate::mouse::{motion_is_reported, PointerMove};
 use crate::renderer::utils::update_colors_based_on_theme;
 use crate::router::{routes::RoutePath, Router};
 use crate::scheduler::{Scheduler, TimerId, Topic};
@@ -3051,8 +3051,12 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     mode.intersects(Mode::MOUSE_MODE) && !mode.contains(Mode::VI);
                 let is_selecting = (lmb_pressed || rmb_pressed)
                     && (route.window.screen.modifiers.state().shift_key() || !mouse_mode);
-                let report_motion = !is_selecting
-                    && mode.intersects(Mode::MOUSE_MOTION | Mode::MOUSE_DRAG);
+                let button_held = lmb_pressed
+                    || rmb_pressed
+                    || route.window.screen.mouse.middle_button_state
+                        == ElementState::Pressed;
+                let report_motion =
+                    !is_selecting && motion_is_reported(mode, button_held);
 
                 // If the cursor hasn't changed cells, do nothing.
                 // Force update when transitioning off a border so the cursor resets.
@@ -3062,7 +3066,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     && route.window.screen.mouse.inside_text_area == inside_text_area
                 {
                     if pixel_motion && report_motion {
-                        route.window.screen.report_mouse_motion();
+                        route.window.screen.report_mouse_motion(mode);
                     }
                     return;
                 }
@@ -3088,7 +3092,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     route.window.screen.update_selection(point, square_side);
                     route.window.screen.context_manager.request_render();
                 } else if (cell_changed || pixel_motion) && report_motion {
-                    route.window.screen.report_mouse_motion();
+                    route.window.screen.report_mouse_motion(mode);
                 }
             }
 
