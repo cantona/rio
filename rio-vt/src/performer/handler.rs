@@ -531,6 +531,11 @@ struct SyncState {
 
     /// Buffered bytes at which the update is flushed early.
     max_bytes: usize,
+
+    /// The last bytes handed to the live parser, so a BSU split across two
+    /// reads is still found at the start of the second.
+    live_tail: [u8; SYNC_ESCAPE_LEN - 1],
+    live_tail_len: usize,
 }
 
 #[derive(Debug, Default)]
@@ -560,11 +565,28 @@ impl Default for SyncState {
             buffer: Vec::with_capacity(DEFAULT_SYNC_BUFFER_SIZE),
             timeout: Default::default(),
             max_bytes: DEFAULT_SYNC_BUFFER_SIZE,
+            live_tail: [0; SYNC_ESCAPE_LEN - 1],
+            live_tail_len: 0,
         }
     }
 }
 
 impl SyncState {
+    /// Keep the last bytes that reached the live parser.
+    fn remember_live_tail(&mut self, bytes: &[u8]) {
+        let keep = self.live_tail.len();
+        if bytes.len() >= keep {
+            self.live_tail.copy_from_slice(&bytes[bytes.len() - keep..]);
+            self.live_tail_len = keep;
+            return;
+        }
+        let shift = (self.live_tail_len + bytes.len()).saturating_sub(keep);
+        self.live_tail.copy_within(shift..self.live_tail_len, 0);
+        let len = self.live_tail_len - shift;
+        self.live_tail[len..len + bytes.len()].copy_from_slice(bytes);
+        self.live_tail_len = len + bytes.len();
+    }
+
     /// A lowered limit should lower the footprint too, not just the flush
     /// point. Only an empty buffer can be shrunk, so a limit lowered while
     /// an update is open takes effect once that update ends.
@@ -669,23 +691,78 @@ impl Processor {
     where
         H: Handler,
     {
-        if self.state.sync_state.timeout.pending_timeout() {
-            // Cap synchronized-update latency for embedders that do not
-            // drive the timeout externally: once the deadline has passed,
-            // flush the buffered update before processing new bytes. Event
-            // loops that poll `sync_timeout()` (like Rio's machine) flush at
-            // the deadline itself and never reach this branch.
-            if self.state.sync_state.timeout.expired() {
-                self.stop_sync(handler);
-                let mut performer = Performer::new(&mut self.state, handler);
-                self.parser.advance(&mut performer, bytes);
-            } else {
-                self.advance_sync(handler, bytes);
+        // One loop and no recursion: a read may hold many BSUs under a limit
+        // smaller than the read, and every early flush comes back here. The
+        // scan cache keeps the read linear however many turns it takes.
+        let mut scan = ReadScan::new(bytes);
+        let mut pos = 0;
+        while pos < bytes.len() {
+            if self.state.sync_state.timeout.pending_timeout() {
+                // Cap synchronized-update latency for embedders that do not
+                // drive the timeout externally: once the deadline has passed,
+                // flush the buffered update before processing new bytes. Event
+                // loops that poll `sync_timeout()` (like Rio's machine) flush at
+                // the deadline itself and never reach this branch.
+                if self.state.sync_state.timeout.expired() {
+                    self.stop_sync(handler);
+                } else {
+                    pos = self.advance_sync(handler, bytes, pos, &mut scan);
+                }
+                continue;
             }
-        } else {
-            let mut performer = Performer::new(&mut self.state, handler);
-            self.parser.advance(&mut performer, bytes);
+
+            // Live-parse only up to the first BSU: the bytes after it belong
+            // to the update it opens and are buffered until its ESU, even
+            // though they arrived in the same read. A PTY hands over a whole
+            // frame at a time, so otherwise the start of every update would
+            // paint unsynchronized. If the parser opens no update on those
+            // bytes (a BSU inside a string), the next turn carries on live.
+            let (live_end, spans_reads) = match self.boundary_bsu_end(bytes, pos) {
+                Some(end) => (end, true),
+                None => (
+                    scan.next_end(bytes, pos, Needle::BsuCsi, Needle::BsuDcs)
+                        .unwrap_or(bytes.len()),
+                    false,
+                ),
+            };
+            {
+                let mut performer = Performer::new(&mut self.state, handler);
+                self.parser.advance(&mut performer, &bytes[pos..live_end]);
+            }
+            self.state
+                .sync_state
+                .remember_live_tail(&bytes[pos..live_end]);
+            // A DCS BSU acts at its `s`, so when a read ends right after it
+            // and the update is flushed before the `ESC \` arrives, that
+            // flush closed the update the BSU had just opened. Open it again.
+            if spans_reads && !self.state.sync_state.timeout.pending_timeout() {
+                self.state
+                    .sync_state
+                    .timeout
+                    .set_timeout(SYNC_UPDATE_TIMEOUT);
+                handler.set_private_mode(NamedPrivateMode::SyncUpdate.into());
+            }
+            pos = live_end;
         }
+    }
+
+    /// End offset in `bytes` of a BSU that began in the previous read and
+    /// ends at or after `pos`.
+    fn boundary_bsu_end(&self, bytes: &[u8], pos: usize) -> Option<usize> {
+        let tail_len = self.state.sync_state.live_tail_len;
+        if tail_len == 0 {
+            return None;
+        }
+        let rest = &bytes[pos..];
+        let mut window = [0u8; 2 * SYNC_ESCAPE_LEN];
+        let head = rest.len().min(SYNC_ESCAPE_LEN);
+        window[..tail_len].copy_from_slice(&self.state.sync_state.live_tail[..tail_len]);
+        window[tail_len..tail_len + head].copy_from_slice(&rest[..head]);
+        let window = &window[..tail_len + head];
+        (0..tail_len).find_map(|start| {
+            let len = bsu_len_at(window, start)?;
+            (start + len > tail_len).then_some(pos + start + len - tail_len)
+        })
     }
 
     /// End a synchronized update.
@@ -711,6 +788,7 @@ impl Processor {
         let offset = bsu_offset.unwrap_or(buffer.len());
         let mut performer = Performer::new(&mut self.state, handler);
         self.parser.advance(&mut performer, &buffer[..offset]);
+        self.state.sync_state.remember_live_tail(&buffer[..offset]);
         self.state.sync_state.buffer = buffer;
 
         match bsu_offset {
@@ -746,36 +824,53 @@ impl Processor {
         self.state.sync_state.buffer.len()
     }
 
-    /// Process a new byte during a synchronized update.
+    /// Buffer the read from `pos` into the open synchronized update and
+    /// return where to continue. When the rest of the read does not fit but
+    /// the update it starts with does, only that update is taken, up to its
+    /// end marker. When nothing fits, or the buffer cannot grow, the update
+    /// is flushed early and `pos` comes back for the caller to parse live.
     #[cold]
-    fn advance_sync<H>(&mut self, handler: &mut H, bytes: &[u8])
+    fn advance_sync<H>(
+        &mut self,
+        handler: &mut H,
+        bytes: &[u8],
+        pos: usize,
+        scan: &mut ReadScan,
+    ) -> usize
     where
         H: Handler,
     {
-        // Advance sync parser or stop sync if we'd exceed the maximum buffer
-        // size, or if the buffer cannot grow to hold the new bytes. Growth
-        // doubles for amortisation but never past the limit, so the capacity
-        // a pane keeps is bounded by the limit, not twice the largest update.
+        let buffered = self.state.sync_state.buffer.len();
+        let max_bytes = self.state.sync_state.max_bytes;
+        let mut end = bytes.len();
+        if buffered + (end - pos) > max_bytes {
+            if let Some(esu_end) =
+                scan.next_end(bytes, pos, Needle::EsuCsi, Needle::EsuDcs)
+            {
+                if buffered + (esu_end - pos) <= max_bytes {
+                    end = esu_end;
+                }
+            }
+        }
+        // Growth doubles for amortisation but never past the limit, so the
+        // capacity a pane keeps is bounded by the limit, not twice the
+        // largest update.
         let sync = &mut self.state.sync_state;
-        let needed = sync.buffer.len() + bytes.len();
-        let over_limit = needed > sync.max_bytes;
+        let needed = buffered + (end - pos);
+        let over_limit = needed > max_bytes;
         let cannot_grow = !over_limit && needed > sync.buffer.capacity() && {
-            let target = needed.max(sync.buffer.capacity() * 2).min(sync.max_bytes);
+            let target = needed.max(sync.buffer.capacity() * 2).min(max_bytes);
             sync.buffer
                 .try_reserve_exact(target - sync.buffer.len())
                 .is_err()
         };
         if over_limit || cannot_grow {
-            // Terminate the synchronized update.
             self.stop_sync_internal(handler, None);
-
-            // Just parse the bytes normally.
-            let mut performer = Performer::new(&mut self.state, handler);
-            self.parser.advance(&mut performer, bytes);
-        } else {
-            self.state.sync_state.buffer.extend(bytes);
-            self.advance_sync_csi(handler, bytes.len());
+            return pos;
         }
+        self.state.sync_state.buffer.extend(&bytes[pos..end]);
+        self.advance_sync_csi(handler, end - pos);
+        end
     }
 
     /// Handle BSU/ESU CSI sequences during synchronized update.
@@ -821,6 +916,95 @@ impl Processor {
                 break;
             }
         }
+    }
+}
+
+/// The four synchronized-update markers a read is scanned for.
+#[derive(Clone, Copy)]
+enum Needle {
+    BsuCsi,
+    BsuDcs,
+    EsuCsi,
+    EsuDcs,
+}
+
+impl Needle {
+    fn bytes(self) -> &'static [u8] {
+        match self {
+            Needle::BsuCsi => &BSU_CSI,
+            Needle::BsuDcs => &BSU_DCS,
+            Needle::EsuCsi => &ESU_CSI,
+            Needle::EsuDcs => &ESU_DCS,
+        }
+    }
+}
+
+/// Where each marker next occurs in one read, found once per occurrence
+/// rather than once per loop turn, so a read full of markers stays linear.
+/// A read without any ESC cannot hold a marker and is never scanned.
+struct ReadScan {
+    has_esc: bool,
+    /// Per marker: unscanned, or the first occurrence at or after the
+    /// position it was scanned from (none when the read holds no more).
+    next: [Option<Option<usize>>; 4],
+}
+
+impl ReadScan {
+    fn new(bytes: &[u8]) -> Self {
+        Self {
+            has_esc: memchr::memchr(0x1B, bytes).is_some(),
+            next: [None; 4],
+        }
+    }
+
+    /// Start of the first `needle` at or after `pos`.
+    fn next_start(&mut self, bytes: &[u8], pos: usize, needle: Needle) -> Option<usize> {
+        if !self.has_esc {
+            return None;
+        }
+        let slot = &mut self.next[needle as usize];
+        let valid = match slot {
+            Some(None) => true,
+            Some(Some(start)) => *start >= pos,
+            None => false,
+        };
+        if !valid {
+            *slot = Some(
+                memchr::memmem::find(&bytes[pos..], needle.bytes()).map(|at| pos + at),
+            );
+        }
+        slot.unwrap_or(None)
+    }
+
+    /// End of the first of two markers at or after `pos`.
+    fn next_end(
+        &mut self,
+        bytes: &[u8],
+        pos: usize,
+        csi: Needle,
+        dcs: Needle,
+    ) -> Option<usize> {
+        let csi = self
+            .next_start(bytes, pos, csi)
+            .map(|at| at + SYNC_ESCAPE_LEN);
+        let dcs = self
+            .next_start(bytes, pos, dcs)
+            .map(|at| at + SYNC_ESCAPE_MIN_LEN);
+        match (csi, dcs) {
+            (Some(csi), Some(dcs)) => Some(csi.min(dcs)),
+            (csi, dcs) => csi.or(dcs),
+        }
+    }
+}
+
+/// Length of the BSU sequence starting at `index`, in either form.
+fn bsu_len_at(buffer: &[u8], index: usize) -> Option<usize> {
+    if buffer.get(index..index + SYNC_ESCAPE_LEN) == Some(BSU_CSI.as_slice()) {
+        Some(SYNC_ESCAPE_LEN)
+    } else if buffer.get(index..index + SYNC_ESCAPE_MIN_LEN) == Some(BSU_DCS.as_slice()) {
+        Some(SYNC_ESCAPE_MIN_LEN)
+    } else {
+        None
     }
 }
 
@@ -2408,6 +2592,164 @@ mod tests {
         processor.advance(&mut handler, b"a\x1b[?2026hb\x1b[?2026lc");
 
         assert_eq!(handler.printed, "abc");
+        assert!(processor.sync_timeout().sync_timeout().is_none());
+        assert_eq!(processor.sync_bytes_count(), 0);
+    }
+
+    #[test]
+    fn sync_update_buffers_the_rest_of_the_read_after_a_bsu() {
+        for (bsu, esu) in [
+            (b"\x1b[?2026h".as_slice(), b"\x1b[?2026l".as_slice()),
+            (b"\x1bP=1s\x1b\\".as_slice(), b"\x1bP=2s\x1b\\".as_slice()),
+        ] {
+            let mut handler = SyncHandler::default();
+            let mut processor = Processor::default();
+            let read = [b"a".as_slice(), bsu, b"hidden"].concat();
+
+            processor.advance(&mut handler, &read);
+            assert_eq!(handler.printed, "a");
+            assert_eq!(processor.sync_bytes_count(), 6);
+            assert!(processor.sync_timeout().sync_timeout().is_some());
+
+            processor.advance(&mut handler, esu);
+            assert_eq!(handler.printed, "ahidden");
+            assert_eq!(processor.sync_bytes_count(), 0);
+        }
+    }
+
+    #[test]
+    fn sync_update_bsu_split_across_reads_still_buffers_the_rest() {
+        let mut handler = SyncHandler::default();
+        let mut processor = Processor::default();
+
+        processor.advance(&mut handler, b"a\x1b[?20");
+        processor.advance(&mut handler, b"26hhidden");
+        assert_eq!(handler.printed, "a");
+        assert_eq!(processor.sync_bytes_count(), 6);
+
+        processor.advance(&mut handler, b"\x1b[?2026l");
+        assert_eq!(handler.printed, "ahidden");
+        assert_eq!(processor.sync_bytes_count(), 0);
+    }
+
+    #[test]
+    fn sync_update_dcs_bsu_split_after_its_s_at_a_flush_survives() {
+        // The DCS hook acts at `s`; a read ending there, followed by a flush
+        // (by ESU or by the timeout), must not drop the update it opened.
+        for flush_by_timeout in [false, true] {
+            let mut handler = SyncHandler::default();
+            let mut processor = Processor::default();
+            processor.advance(&mut handler, b"\x1b[?2026h");
+            if flush_by_timeout {
+                processor.advance(&mut handler, b"x\x1bP=1s");
+                processor.state.sync_state.timeout.timeout = Some(
+                    Instant::now()
+                        .checked_sub(Duration::from_millis(1))
+                        .unwrap_or_else(Instant::now),
+                );
+            } else {
+                processor.advance(&mut handler, b"x\x1b[?2026l\x1bP=1s");
+            }
+
+            processor.advance(&mut handler, b"\x1b\\hidden");
+            assert_eq!(handler.printed, "x", "timeout {flush_by_timeout}");
+            assert!(processor.sync_timeout().sync_timeout().is_some());
+            assert_eq!(processor.sync_bytes_count(), 6);
+
+            processor.advance(&mut handler, b"\x1b[?2026l");
+            assert_eq!(handler.printed, "xhidden");
+        }
+    }
+
+    #[test]
+    fn sync_update_bsu_after_an_early_flush_in_the_same_read_opens_a_new_one() {
+        let mut handler = SyncHandler::default();
+        let mut processor = Processor::with_sync_buffer_size(MIN_SYNC_BUFFER_SIZE);
+        processor.advance(&mut handler, b"\x1b[?2026h");
+        let mut read = "x".repeat(MIN_SYNC_BUFFER_SIZE + 1).into_bytes();
+        read.extend_from_slice(b"\x1b[?2026hhidden");
+
+        processor.advance(&mut handler, &read);
+        assert_eq!(handler.printed.len(), MIN_SYNC_BUFFER_SIZE + 1);
+        assert_eq!(processor.sync_bytes_count(), 6);
+    }
+
+    #[test]
+    fn sync_update_many_bsus_in_one_read_do_not_recurse() {
+        // A small limit and a read full of BSUs flush once per BSU; that
+        // must neither nest a stack frame per flush nor rescan the read per
+        // flush, in either form.
+        for read in [
+            BSU_CSI.repeat(1024 * 1024 / SYNC_ESCAPE_LEN),
+            BSU_DCS.repeat(1024 * 1024 / SYNC_ESCAPE_MIN_LEN),
+        ] {
+            std::thread::Builder::new()
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    let mut handler = SyncHandler::default();
+                    let mut processor =
+                        Processor::with_sync_buffer_size(MIN_SYNC_BUFFER_SIZE);
+                    processor.advance(&mut handler, &read);
+                    assert_eq!(handler.printed, "");
+                    assert!(processor.sync_timeout().sync_timeout().is_some());
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+        }
+    }
+
+    /// Records mode changes and input in order, collapsing runs of input,
+    /// so a test can tell buffered from live-painted bytes.
+    #[derive(Default)]
+    struct OrderHandler {
+        events: String,
+        inputs: usize,
+    }
+
+    impl Handler for OrderHandler {
+        fn input(&mut self, _: char) {
+            self.inputs += 1;
+            if !self.events.ends_with('i') {
+                self.events.push('i');
+            }
+        }
+        fn set_private_mode(&mut self, mode: PrivateMode) {
+            if mode == NamedPrivateMode::SyncUpdate.into() {
+                self.events.push('S');
+            }
+        }
+        fn unset_private_mode(&mut self, mode: PrivateMode) {
+            if mode == NamedPrivateMode::SyncUpdate.into() {
+                self.events.push('U');
+            }
+        }
+    }
+
+    #[test]
+    fn sync_update_keeps_updates_that_fit_when_the_read_does_not() {
+        // 1 MiB of 2 KiB frames under a 64 KiB limit: each frame fits, so
+        // each is buffered until its ESU (S, input, U), never painted live
+        // (S, U, input).
+        let frame = [
+            BSU_CSI.as_slice(),
+            "f".repeat(2048).as_bytes(),
+            ESU_CSI.as_slice(),
+        ]
+        .concat();
+        let frames = 1024 * 1024 / frame.len();
+        let read = frame.repeat(frames);
+        let mut handler = OrderHandler::default();
+        let mut processor = Processor::with_sync_buffer_size(64 * 1024);
+
+        processor.advance(&mut handler, &read);
+
+        assert_eq!(handler.inputs, frames * 2048);
+        assert_eq!(handler.events.matches('S').count(), frames);
+        // Every update holds its input before it ends; an "SU" would be an
+        // update flushed empty with its frame then painted live. (A flush
+        // driven by a buffered ESU repeats the unset, hence no exact match.)
+        assert!(!handler.events.contains("SU"), "{}", handler.events);
         assert!(processor.sync_timeout().sync_timeout().is_none());
         assert_eq!(processor.sync_bytes_count(), 0);
     }
