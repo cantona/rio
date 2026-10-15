@@ -878,6 +878,7 @@ pub mod test {
             0,
             10,
         );
+        term.set_sgr_pixels_mouse_supported(true);
         let mut parser = Processor::default();
         let pos = at(2, 3, (25, 60));
         let press = |term: &Crosswords<VoidListener>| {

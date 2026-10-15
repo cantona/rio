@@ -594,6 +594,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         );
         terminal.set_grapheme_clustering(config.grapheme_clustering);
         terminal.blinking_cursor = cursor_state.1;
+        // rioterm reports mouse positions in pixels, so mode 1016 is honoured.
+        terminal.set_sgr_pixels_mouse_supported(true);
         let terminal: Arc<FairMutex<Crosswords<T>>> = Arc::new(FairMutex::new(terminal));
 
         let integration = if config.shell_integration {
@@ -828,6 +830,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             config.scrollback_history_limit,
         );
         terminal.blinking_cursor = cursor_state.1;
+        terminal.set_sgr_pixels_mouse_supported(true);
         let terminal: Arc<FairMutex<Crosswords<T>>> = Arc::new(FairMutex::new(terminal));
 
         let (messenger, io_thread) = Self::finish_machine(

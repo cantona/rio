@@ -447,6 +447,8 @@ impl Surface {
         );
         // Hosts pass librio cell positions only, so SGR-Pixels (1016) stays
         // an unknown mode here: ignored when set, "not supported" to DECRQM.
+        // Already the default; stated so a future default change cannot
+        // silently alter librio's reports.
         terminal.set_sgr_pixels_mouse_supported(false);
         // On wasm the delegate (and so the whole graph) is single-threaded
         // by design; Arc stays because the pty build shares it with the IO

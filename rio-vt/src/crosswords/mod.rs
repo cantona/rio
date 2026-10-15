@@ -540,7 +540,7 @@ impl<U: EventListener> Crosswords<U> {
             default_cursor_shape: cursor_shape,
             cursor_shape,
             blinking_cursor: false,
-            sgr_pixels_mouse_supported: true,
+            sgr_pixels_mouse_supported: false,
             window_id,
             route_id,
             title_stack: Default::default(),
@@ -568,10 +568,11 @@ impl<U: EventListener> Crosswords<U> {
     }
 
     /// Whether DEC private mode 1016 (SGR-Pixels mouse reporting) can be
-    /// honoured. A host that only ever hands this terminal cell positions
-    /// cannot report pixels, so for it `?1016h` is ignored and DECRQM
+    /// honoured. Off by default: a host that only hands this terminal cell
+    /// positions cannot report pixels, so `?1016h` is ignored and DECRQM
     /// answers "not supported", and an application falls back to cells
-    /// instead of misreading cell numbers as pixels. Defaults to supported.
+    /// instead of misreading cell numbers as pixels. A host whose reports
+    /// carry pixels (rioterm) turns it on after construction.
     pub fn set_sgr_pixels_mouse_supported(&mut self, supported: bool) {
         self.sgr_pixels_mouse_supported = supported;
         if !supported {
@@ -11243,6 +11244,7 @@ mod tests {
             0,
             10,
         );
+        term.set_sgr_pixels_mouse_supported(true);
         term.set_sgr_pixels_mouse_supported(false);
         let mut parser = Processor::default();
 
@@ -11290,6 +11292,7 @@ mod tests {
             0,
             10,
         );
+        term.set_sgr_pixels_mouse_supported(true);
         let mut parser = Processor::default();
 
         let mut query = |term: &mut Crosswords<TestListener>| -> Vec<String> {
@@ -11351,6 +11354,7 @@ mod tests {
             0,
             10,
         );
+        term.set_sgr_pixels_mouse_supported(true);
         let mut parser = Processor::default();
 
         parser.advance(&mut term, b"\x1b[?1003h\x1b[?1016h");
