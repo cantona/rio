@@ -205,6 +205,26 @@ pub struct Config {
         rename = "scrollback-history-limit"
     )]
     pub scrollback_history_limit: usize,
+    /// Bytes one synchronized update (DEC mode 2026) may buffer before
+    /// rio stops waiting for its end marker and paints what it has.
+    /// Programs that send large images inside one update, such as a
+    /// multiplexer forwarding Kitty graphics inline, need more than the
+    /// 2 MiB default or every frame paints half-finished. Values are
+    /// clamped to 4 KiB..=256 MiB. Each terminal starts with a buffer of
+    /// 2 MiB or this limit, whichever is smaller, that grows as updates
+    /// need, doubling but never past this limit, and keeps that size
+    /// afterwards, so memory follows the updates actually seen. An update
+    /// is applied under one terminal lock when it ends, so a very large
+    /// value lets one update stall rendering for as long as it takes to
+    /// parse; and a program that re-arms the update every frame restarts
+    /// the 150 ms timeout each time, so for it this size is the only bound
+    /// on how long the screen stays frozen. Applies to terminals created
+    /// after the change.
+    #[serde(
+        default = "default_sync_update_buffer_size",
+        rename = "sync-update-buffer-size"
+    )]
+    pub sync_update_buffer_size: usize,
     #[serde(default = "effects::Effects::default")]
     pub effects: effects::Effects,
 }
@@ -772,6 +792,7 @@ impl Default for Config {
             bell: Bell::default(),
             enable_scroll_bar: true,
             scrollback_history_limit: default_scrollback_history_limit(),
+            sync_update_buffer_size: default_sync_update_buffer_size(),
             effects: effects::Effects::default(),
         }
     }
@@ -1358,6 +1379,26 @@ mod tests {
         );
 
         assert_eq!(result.window.colorspace, window::Colorspace::DisplayP3);
+    }
+
+    #[test]
+    fn test_sync_update_buffer_size_default_and_custom() {
+        let result = create_temporary_config(
+            "sync-update-buffer-size-default",
+            r#"
+            [window]
+            width = 800
+        "#,
+        );
+        assert_eq!(result.sync_update_buffer_size, 2 * 1024 * 1024);
+
+        let result = create_temporary_config(
+            "sync-update-buffer-size-custom",
+            r#"
+            sync-update-buffer-size = 67108864
+        "#,
+        );
+        assert_eq!(result.sync_update_buffer_size, 64 * 1024 * 1024);
     }
 
     #[test]

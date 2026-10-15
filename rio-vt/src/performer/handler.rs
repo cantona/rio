@@ -29,8 +29,20 @@ use super::parser::{Params, ParamsIter, Parser, Perform};
 /// Maximum time before a synchronized update is aborted.
 const SYNC_UPDATE_TIMEOUT: Duration = Duration::from_millis(150);
 
-/// Maximum number of bytes read in one synchronized update (2MiB).
-const SYNC_BUFFER_SIZE: usize = 0x20_0000;
+/// Default maximum number of bytes read in one synchronized update (2MiB).
+pub const DEFAULT_SYNC_BUFFER_SIZE: usize = 0x20_0000;
+
+/// Smallest synchronized-update buffer a caller can configure. Below this
+/// the buffer would overflow on ordinary frames, which is no better than
+/// having no synchronized updates at all.
+pub const MIN_SYNC_BUFFER_SIZE: usize = 4096;
+
+/// Largest synchronized-update buffer a caller can configure. A program
+/// that keeps re-arming the update with BSU is bounded by this size alone
+/// (every BSU restarts the timeout), so this also caps how long such a
+/// program can hold the screen; and it keeps a typo in a config file from
+/// turning into a multi-gigabyte buffer.
+pub const MAX_SYNC_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 
 /// Number of bytes in the BSU/ESU CSI sequences.
 const SYNC_ESCAPE_LEN: usize = 8;
@@ -516,6 +528,9 @@ struct SyncState {
 
     /// Bytes read during the synchronized update.
     buffer: Vec<u8>,
+
+    /// Buffered bytes at which the update is flushed early.
+    max_bytes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -542,8 +557,20 @@ struct ApcState {
 impl Default for SyncState {
     fn default() -> Self {
         Self {
-            buffer: Vec::with_capacity(SYNC_BUFFER_SIZE),
+            buffer: Vec::with_capacity(DEFAULT_SYNC_BUFFER_SIZE),
             timeout: Default::default(),
+            max_bytes: DEFAULT_SYNC_BUFFER_SIZE,
+        }
+    }
+}
+
+impl SyncState {
+    /// A lowered limit should lower the footprint too, not just the flush
+    /// point. Only an empty buffer can be shrunk, so a limit lowered while
+    /// an update is open takes effect once that update ends.
+    fn release_excess_capacity(&mut self) {
+        if self.buffer.is_empty() && self.buffer.capacity() > self.max_bytes {
+            self.buffer.shrink_to(self.max_bytes);
         }
     }
 }
@@ -590,6 +617,47 @@ pub struct Processor {
 }
 
 impl Processor {
+    /// A processor whose synchronized updates may buffer up to `bytes`
+    /// before being flushed early; see [`Processor::set_sync_buffer_size`].
+    pub fn with_sync_buffer_size(bytes: usize) -> Self {
+        let mut processor = Self::default();
+        processor.set_sync_buffer_size(bytes);
+        processor
+    }
+
+    /// Set how many bytes one synchronized update (DEC mode 2026) may
+    /// buffer before the update is ended early and painted as is. Values
+    /// outside [`MIN_SYNC_BUFFER_SIZE`]..=[`MAX_SYNC_BUFFER_SIZE`] are
+    /// clamped. The buffer starts at the smaller of
+    /// [`DEFAULT_SYNC_BUFFER_SIZE`] and the limit, grows as updates need,
+    /// doubling but never past the limit, and keeps that capacity
+    /// afterwards, so memory follows the updates actually seen and is
+    /// bounded by the limit.
+    /// If the growth cannot be allocated the update is painted unfinished
+    /// instead of aborting. The whole update is still applied under one
+    /// terminal lock when it ends, and a program that re-arms the update
+    /// with BSU every frame restarts the timeout each time, so for it this
+    /// size is the only bound on how long the screen stays frozen.
+    pub fn set_sync_buffer_size(&mut self, bytes: usize) {
+        if bytes < MIN_SYNC_BUFFER_SIZE {
+            warn!(
+                "synchronized-update buffer of {bytes} bytes is below the {MIN_SYNC_BUFFER_SIZE} minimum; using the minimum"
+            );
+        } else if bytes > MAX_SYNC_BUFFER_SIZE {
+            warn!(
+                "synchronized-update buffer of {bytes} bytes is above the {MAX_SYNC_BUFFER_SIZE} maximum; using the maximum"
+            );
+        }
+        self.state.sync_state.max_bytes =
+            bytes.clamp(MIN_SYNC_BUFFER_SIZE, MAX_SYNC_BUFFER_SIZE);
+        self.state.sync_state.release_excess_capacity();
+    }
+
+    /// Bytes one synchronized update may buffer before being flushed early.
+    pub fn sync_buffer_size(&self) -> usize {
+        self.state.sync_state.max_bytes
+    }
+
     /// Synchronized update timeout.
     pub fn sync_timeout(&self) -> &StdSyncHandler {
         &self.state.sync_state.timeout
@@ -667,6 +735,7 @@ impl Processor {
                 handler.unset_private_mode(NamedPrivateMode::SyncUpdate.into());
                 self.state.sync_state.timeout.clear_timeout();
                 self.state.sync_state.buffer.clear();
+                self.state.sync_state.release_excess_capacity();
             }
         }
     }
@@ -683,8 +752,20 @@ impl Processor {
     where
         H: Handler,
     {
-        // Advance sync parser or stop sync if we'd exceed the maximum buffer size.
-        if self.state.sync_state.buffer.len() + bytes.len() >= SYNC_BUFFER_SIZE - 1 {
+        // Advance sync parser or stop sync if we'd exceed the maximum buffer
+        // size, or if the buffer cannot grow to hold the new bytes. Growth
+        // doubles for amortisation but never past the limit, so the capacity
+        // a pane keeps is bounded by the limit, not twice the largest update.
+        let sync = &mut self.state.sync_state;
+        let needed = sync.buffer.len() + bytes.len();
+        let over_limit = needed > sync.max_bytes;
+        let cannot_grow = !over_limit && needed > sync.buffer.capacity() && {
+            let target = needed.max(sync.buffer.capacity() * 2).min(sync.max_bytes);
+            sync.buffer
+                .try_reserve_exact(target - sync.buffer.len())
+                .is_err()
+        };
+        if over_limit || cannot_grow {
             // Terminate the synchronized update.
             self.stop_sync_internal(handler, None);
 
@@ -2433,7 +2514,7 @@ mod tests {
 
     /// Embedders without an event loop never poll `sync_timeout()`; an
     /// expired deadline must flush on the next `advance` call instead of
-    /// buffering until `SYNC_BUFFER_SIZE`.
+    /// buffering until the sync buffer size.
     #[test]
     fn sync_update_expired_deadline_flushes_on_next_advance() {
         let mut handler = SyncHandler::default();
@@ -2454,6 +2535,121 @@ mod tests {
         assert_eq!(handler.printed, "hidden visible");
         assert!(processor.sync_timeout().sync_timeout().is_none());
         assert_eq!(processor.sync_bytes_count(), 0);
+    }
+
+    #[test]
+    fn sync_update_flushes_when_the_configured_buffer_fills() {
+        let payload = "x".repeat(5000);
+
+        // The default buffer keeps 5000 bytes hidden until the ESU.
+        let mut handler = SyncHandler::default();
+        let mut processor = Processor::default();
+        processor.advance(&mut handler, b"\x1b[?2026h");
+        processor.advance(&mut handler, payload.as_bytes());
+        assert_eq!(handler.printed, "");
+        assert_eq!(processor.sync_bytes_count(), 5000);
+
+        // A 4 KiB buffer gives up part way and paints everything so far.
+        let mut handler = SyncHandler::default();
+        let mut processor = Processor::with_sync_buffer_size(MIN_SYNC_BUFFER_SIZE);
+        assert_eq!(processor.sync_buffer_size(), MIN_SYNC_BUFFER_SIZE);
+        processor.advance(&mut handler, b"\x1b[?2026h");
+        processor.advance(&mut handler, payload.as_bytes());
+        assert_eq!(handler.printed, payload);
+        assert!(processor.sync_timeout().sync_timeout().is_none());
+        assert_eq!(processor.sync_bytes_count(), 0);
+
+        // Requests below the minimum are raised to it.
+        assert_eq!(
+            Processor::with_sync_buffer_size(1).sync_buffer_size(),
+            MIN_SYNC_BUFFER_SIZE
+        );
+
+        // Requests above the maximum are lowered to it.
+        assert_eq!(
+            Processor::with_sync_buffer_size(usize::MAX).sync_buffer_size(),
+            MAX_SYNC_BUFFER_SIZE
+        );
+
+        // A limit under the preallocation shrinks the buffer to the limit.
+        let small = Processor::with_sync_buffer_size(64 * 1024);
+        assert_eq!(small.state.sync_state.buffer.capacity(), 64 * 1024);
+
+        // The limit is exact: an update of exactly the limit stays buffered,
+        // one byte more is flushed.
+        let exact = "e".repeat(MIN_SYNC_BUFFER_SIZE);
+        let mut handler = SyncHandler::default();
+        let mut processor = Processor::with_sync_buffer_size(MIN_SYNC_BUFFER_SIZE);
+        processor.advance(&mut handler, b"\x1b[?2026h");
+        processor.advance(&mut handler, exact.as_bytes());
+        assert_eq!(handler.printed, "");
+        assert_eq!(processor.sync_bytes_count(), MIN_SYNC_BUFFER_SIZE);
+        processor.advance(&mut handler, b"+");
+        assert_eq!(handler.printed.len(), MIN_SYNC_BUFFER_SIZE + 1);
+        assert_eq!(processor.sync_bytes_count(), 0);
+
+        // A limit lowered while an update is open is applied once it ends.
+        let mut handler = SyncHandler::default();
+        let mut processor = Processor::default();
+        processor.advance(&mut handler, b"\x1b[?2026h");
+        processor.advance(&mut handler, "m".repeat(1024 * 1024).as_bytes());
+        processor.set_sync_buffer_size(64 * 1024);
+        assert!(processor.state.sync_state.buffer.capacity() > 64 * 1024);
+        processor.advance(&mut handler, b"\x1b[?2026l");
+        assert_eq!(handler.printed.len(), 1024 * 1024);
+        assert_eq!(processor.state.sync_state.buffer.capacity(), 64 * 1024);
+
+        // A raised limit alone allocates nothing: small updates keep the
+        // preallocation however high the limit is.
+        let mut handler = SyncHandler::default();
+        let mut processor = Processor::with_sync_buffer_size(64 * 1024 * 1024);
+        for _ in 0..8 {
+            processor.advance(&mut handler, b"\x1b[?2026h");
+            processor.advance(&mut handler, b"small");
+            processor.advance(&mut handler, b"\x1b[?2026l");
+        }
+        assert_eq!(
+            processor.state.sync_state.buffer.capacity(),
+            DEFAULT_SYNC_BUFFER_SIZE
+        );
+
+        // A bigger update grows the buffer only once it is full, doubling but
+        // never past the limit, and keeps that capacity afterwards: 3 MiB in
+        // 64 KiB chunks grows 2 MiB -> 4 MiB and stops there.
+        let big = "y".repeat(3 * 1024 * 1024);
+        let mut handler = SyncHandler::default();
+        let mut processor = Processor::with_sync_buffer_size(5 * 1024 * 1024);
+        processor.advance(&mut handler, b"\x1b[?2026h");
+        for chunk in big.as_bytes().chunks(64 * 1024) {
+            processor.advance(&mut handler, chunk);
+        }
+        assert_eq!(handler.printed, "");
+        assert_eq!(
+            processor.state.sync_state.buffer.capacity(),
+            2 * DEFAULT_SYNC_BUFFER_SIZE
+        );
+        processor.advance(&mut handler, b"\x1b[?2026l");
+        assert_eq!(handler.printed.len(), big.len());
+        assert_eq!(processor.sync_bytes_count(), 0);
+        assert_eq!(
+            processor.state.sync_state.buffer.capacity(),
+            2 * DEFAULT_SYNC_BUFFER_SIZE
+        );
+
+        // The last doubling step is cut at the limit: 4.5 MiB under a 5 MiB
+        // limit ends at exactly 5 MiB, not 8.
+        let bigger = "z".repeat(4 * 1024 * 1024 + 512 * 1024);
+        let mut handler = SyncHandler::default();
+        let mut processor = Processor::with_sync_buffer_size(5 * 1024 * 1024);
+        processor.advance(&mut handler, b"\x1b[?2026h");
+        for chunk in bigger.as_bytes().chunks(64 * 1024) {
+            processor.advance(&mut handler, chunk);
+        }
+        assert_eq!(handler.printed, "");
+        assert_eq!(
+            processor.state.sync_state.buffer.capacity(),
+            5 * 1024 * 1024
+        );
     }
 
     #[test]

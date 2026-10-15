@@ -21,6 +21,11 @@ pub fn default_scrollback_history_limit() -> usize {
 }
 
 #[inline]
+pub fn default_sync_update_buffer_size() -> usize {
+    rio_vt::performer::handler::DEFAULT_SYNC_BUFFER_SIZE
+}
+
+#[inline]
 pub fn default_title_placeholder() -> Option<String> {
     Some(String::from("▲"))
 }

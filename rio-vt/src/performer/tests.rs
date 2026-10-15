@@ -192,6 +192,31 @@ fn read_with_contended_terminal(ending: Option<ErrorKind>, raw_error: Option<i32
 }
 
 #[test]
+fn reader_state_carries_the_configured_sync_buffer_size() {
+    let default_state = machine(Vec::new(), None).new_state();
+    assert_eq!(
+        default_state.parser.sync_buffer_size(),
+        handler::DEFAULT_SYNC_BUFFER_SIZE
+    );
+
+    let raised = machine(Vec::new(), None).with_sync_buffer_size(8 * 1024 * 1024);
+    let mut state = raised.new_state();
+    assert_eq!(state.parser.sync_buffer_size(), 8 * 1024 * 1024);
+
+    // The reader's parser, not just a fresh Processor, holds a 3 MiB update
+    // open until its end marker.
+    let update = "x".repeat(3 * 1024 * 1024);
+    let mut terminal = raised.terminal.lock();
+    state.parser.advance(&mut *terminal, b"\x1b[?2026h");
+    state.parser.advance(&mut *terminal, update.as_bytes());
+    assert_eq!(state.parser.sync_bytes_count(), update.len());
+    state.parser.advance(&mut *terminal, b"\x1b[?2026l");
+    assert_eq!(state.parser.sync_bytes_count(), 0);
+    drop(terminal);
+    assert_eq!(first_line(&raised, 4), "xxxx");
+}
+
+#[test]
 fn eof_preserves_buffered_output_under_lock_contention() {
     read_with_contended_terminal(None, None);
 }

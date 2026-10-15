@@ -286,6 +286,7 @@ impl Screen<'_> {
             title: config.title.clone(),
             keyboard: config.keyboard.clone(),
             scrollback_history_limit: config.scrollback_history_limit,
+            sync_update_buffer_size: Some(config.sync_update_buffer_size),
             grapheme_clustering: config.grapheme_clustering,
         };
 
@@ -652,6 +653,9 @@ impl Screen<'_> {
         // Update keyboard config in context manager
         self.context_manager.config.keyboard = config.keyboard.clone();
         self.context_manager.config.title = config.title.clone();
+        // Terminals created after a reload parse with the new limit.
+        self.context_manager.config.sync_update_buffer_size =
+            Some(config.sync_update_buffer_size);
 
         // Session mode can change on reload: recompute autosave (only
         // `always` writes without a prompt) and the daemon persistence

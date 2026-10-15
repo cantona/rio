@@ -128,6 +128,7 @@ pub struct Machine<T: teletypewriter::EventedPty, U: EventListener> {
     event_proxy: U,
     window_id: WindowId,
     route_id: usize,
+    sync_buffer_size: usize,
 }
 
 #[cfg(feature = "pty")]
@@ -225,7 +226,15 @@ where
             event_proxy,
             window_id,
             route_id,
+            sync_buffer_size: handler::DEFAULT_SYNC_BUFFER_SIZE,
         })
+    }
+
+    /// Bytes one synchronized update may buffer before the parser paints
+    /// it unfinished; see [`handler::Processor::set_sync_buffer_size`].
+    pub fn with_sync_buffer_size(mut self, bytes: usize) -> Self {
+        self.sync_buffer_size = bytes;
+        self
     }
 
     /// Read from the PTY and parse into the terminal.
@@ -405,8 +414,16 @@ where
         })
     }
 
-    fn run_to_end(mut self) -> (Self, State) {
+    /// The reader state for this machine: a parser carrying the configured
+    /// synchronized-update limit.
+    fn new_state(&self) -> State {
         let mut state = State::default();
+        state.parser.set_sync_buffer_size(self.sync_buffer_size);
+        state
+    }
+
+    fn run_to_end(mut self) -> (Self, State) {
+        let mut state = self.new_state();
         let mut buf = [0u8; READ_BUFFER_SIZE];
         let reason = self.run(&mut state, &mut buf);
         self.finish(&mut state, &mut buf, reason);

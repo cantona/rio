@@ -309,6 +309,9 @@ pub struct ContextManagerConfig {
     pub title: rio_backend::config::title::Title,
     pub keyboard: rio_backend::config::keyboard::Keyboard,
     pub scrollback_history_limit: usize,
+    /// `None` keeps rio-vt's own default; `Default` for this struct must
+    /// not pick a size the parser would then clamp to its floor.
+    pub sync_update_buffer_size: Option<usize>,
     pub grapheme_clustering: bool,
 }
 
@@ -687,6 +690,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             window_id,
             route_id,
             config.spawn_performer,
+            config.sync_update_buffer_size,
         )?;
 
         let mut context = Context {
@@ -724,12 +728,17 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         window_id: WindowId,
         route_id: usize,
         spawn_performer: bool,
+        sync_buffer_size: Option<usize>,
     ) -> Result<(Messenger, Option<JoinHandle<()>>), Box<dyn Error>>
     where
         P: teletypewriter::EventedPty + Send + 'static,
     {
         let machine =
             Machine::new(Arc::clone(terminal), pty, event_proxy, window_id, route_id)?;
+        let machine = match sync_buffer_size {
+            Some(bytes) => machine.with_sync_buffer_size(bytes),
+            None => machine,
+        };
         let channel = machine.channel();
         let io_thread = if spawn_performer {
             Some(machine.spawn_detached())
@@ -840,6 +849,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             window_id,
             route_id,
             config.spawn_performer,
+            config.sync_update_buffer_size,
         )
         .map_err(|e| {
             crate::ptyd::AttachError::Io(std::io::Error::other(e.to_string()))
@@ -2095,6 +2105,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             title: config.title,
             keyboard: config.keyboard,
             scrollback_history_limit: config.scrollback_history_limit,
+            sync_update_buffer_size: Some(config.sync_update_buffer_size),
             grapheme_clustering: config.grapheme_clustering,
         };
 
