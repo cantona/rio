@@ -456,6 +456,7 @@ where
     pub cursor_shape: CursorShape,
     pub default_cursor_shape: CursorShape,
     pub blinking_cursor: bool,
+    sgr_pixels_mouse_supported: bool,
     pub window_id: WindowId,
     pub route_id: usize,
     title_stack: Vec<String>,
@@ -539,6 +540,7 @@ impl<U: EventListener> Crosswords<U> {
             default_cursor_shape: cursor_shape,
             cursor_shape,
             blinking_cursor: false,
+            sgr_pixels_mouse_supported: true,
             window_id,
             route_id,
             title_stack: Default::default(),
@@ -563,6 +565,18 @@ impl<U: EventListener> Crosswords<U> {
     pub fn set_grapheme_clustering(&mut self, enabled: bool) {
         self.grapheme_clustering_default = enabled;
         self.mode.set(Mode::GRAPHEME_CLUSTER, enabled);
+    }
+
+    /// Whether DEC private mode 1016 (SGR-Pixels mouse reporting) can be
+    /// honoured. A host that only ever hands this terminal cell positions
+    /// cannot report pixels, so for it `?1016h` is ignored and DECRQM
+    /// answers "not supported", and an application falls back to cells
+    /// instead of misreading cell numbers as pixels. Defaults to supported.
+    pub fn set_sgr_pixels_mouse_supported(&mut self, supported: bool) {
+        self.sgr_pixels_mouse_supported = supported;
+        if !supported {
+            self.mode.remove(Mode::SGR_PIXELS_MOUSE);
+        }
     }
 
     pub fn mark_fully_damaged(&mut self) {
@@ -3162,6 +3176,10 @@ impl<U: EventListener> Handler for Crosswords<U> {
                 self.mode.insert(Mode::UTF8_MOUSE);
             }
             NamedPrivateMode::SgrPixelsMouse => {
+                if !self.sgr_pixels_mouse_supported {
+                    debug!("Ignoring SGR-Pixels mouse mode: host reports cells only");
+                    return;
+                }
                 self.mode.remove(Mode::SGR_MOUSE | Mode::UTF8_MOUSE);
                 self.mode.insert(Mode::SGR_PIXELS_MOUSE);
             }
@@ -3283,7 +3301,11 @@ impl<U: EventListener> Handler for Crosswords<U> {
                 }
                 NamedPrivateMode::SgrMouse => self.mode.contains(Mode::SGR_MOUSE).into(),
                 NamedPrivateMode::SgrPixelsMouse => {
-                    self.mode.contains(Mode::SGR_PIXELS_MOUSE).into()
+                    if self.sgr_pixels_mouse_supported {
+                        self.mode.contains(Mode::SGR_PIXELS_MOUSE).into()
+                    } else {
+                        ModeState::NotSupported
+                    }
                 }
                 NamedPrivateMode::AlternateScroll => {
                     self.mode.contains(Mode::ALTERNATE_SCROLL).into()
@@ -11204,6 +11226,53 @@ mod tests {
 
     /// 1005, 1006 and 1016 are one encoding setting: the last one set wins,
     /// and DECRQM reports exactly the one in effect.
+    #[test]
+    fn hosts_without_pixel_mouse_keep_ignoring_mode_1016() {
+        use crate::performer::handler::Processor;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut term = Crosswords::new(
+            CrosswordsSize::new(10, 10),
+            CursorShape::Block,
+            TestListener {
+                events: events.clone(),
+            },
+            WindowId::from(0),
+            0,
+            10,
+        );
+        term.set_sgr_pixels_mouse_supported(false);
+        let mut parser = Processor::default();
+
+        parser.advance(&mut term, b"\x1b[?1006h\x1b[?1016h");
+        assert!(term.mode().contains(Mode::SGR_MOUSE));
+        assert!(!term.mode().contains(Mode::SGR_PIXELS_MOUSE));
+
+        events.borrow_mut().clear();
+        parser.advance(&mut term, b"\x1b[?1006$p\x1b[?1016$p");
+        let replies: Vec<String> = events
+            .borrow()
+            .iter()
+            .filter_map(|event| match event {
+                RioEvent::PtyWrite(_, text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replies, vec!["\x1b[?1006;1$y", "\x1b[?1016;0$y"]);
+
+        parser.advance(&mut term, b"\x1b[?1016l");
+        assert!(term.mode().contains(Mode::SGR_MOUSE));
+
+        // Withdrawing support drops a mode that was already set.
+        term.set_sgr_pixels_mouse_supported(true);
+        parser.advance(&mut term, b"\x1b[?1016h");
+        assert!(term.mode().contains(Mode::SGR_PIXELS_MOUSE));
+        term.set_sgr_pixels_mouse_supported(false);
+        assert!(!term.mode().contains(Mode::SGR_PIXELS_MOUSE));
+    }
+
     #[test]
     fn sgr_pixels_mouse_mode_is_an_exclusive_encoding() {
         use crate::performer::handler::Processor;

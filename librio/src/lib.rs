@@ -365,11 +365,10 @@ pub struct Surface {
     )>,
 }
 
-/// The report encoding `mode` selects, as (sgr, utf8). SGR-Pixels (1016)
-/// reports in SGR with cell coordinates: hosts pass cells, not pixels.
+/// The report encoding `mode` selects, as (sgr, utf8).
 fn mouse_encoding(mode: Mode) -> (bool, bool) {
     (
-        mode.intersects(Mode::SGR_MOUSE | Mode::SGR_PIXELS_MOUSE),
+        mode.contains(Mode::SGR_MOUSE),
         mode.contains(Mode::UTF8_MOUSE),
     )
 }
@@ -433,7 +432,7 @@ impl Surface {
             pty_writer: pty_writer.clone(),
         };
 
-        let terminal = Crosswords::new(
+        let mut terminal = Crosswords::new(
             GridSize::new(
                 desc.cols as usize,
                 desc.rows as usize,
@@ -446,6 +445,9 @@ impl Surface {
             id,
             desc.scrollback,
         );
+        // Hosts pass librio cell positions only, so SGR-Pixels (1016) stays
+        // an unknown mode here: ignored when set, "not supported" to DECRQM.
+        terminal.set_sgr_pixels_mouse_supported(false);
         // On wasm the delegate (and so the whole graph) is single-threaded
         // by design; Arc stays because the pty build shares it with the IO
         // thread and the API is one type on every target.
@@ -1386,7 +1388,7 @@ mod tests {
     // librio hosts pass cells, so SGR-Pixels (1016) must keep the SGR cell
     // report a program got from 1006 before 1016 cleared it.
     #[test]
-    fn sgr_pixels_mode_keeps_sgr_cell_reports() {
+    fn mode_1016_is_ignored_like_an_unknown_mode() {
         let engine = Engine::new(Arc::new(CountingDelegate {
             wakeups: AtomicUsize::new(0),
         }));
@@ -1395,14 +1397,24 @@ mod tests {
                 .create_surface(&SurfaceDesc::default())
                 .expect("spawn shell");
             surface.inject_output(setup);
-            let (sgr, utf8) = mouse_encoding(surface.terminal.lock().mode());
-            mouse_report(0, 4, 2, true, sgr, utf8)
+            let mode = surface.terminal.lock().mode();
+            assert!(!mode.contains(Mode::SGR_PIXELS_MOUSE));
+            let (sgr, utf8) = mouse_encoding(mode);
+            (mouse_report(0, 4, 2, true, sgr, utf8), mode)
         };
 
-        let sgr_cells = click(b"\x1b[?1003h\x1b[?1006h");
+        let (sgr_cells, _) = click(b"\x1b[?1003h\x1b[?1006h");
         assert_eq!(sgr_cells, b"\x1b[<0;5;3M".to_vec());
-        assert_eq!(click(b"\x1b[?1003h\x1b[?1006h\x1b[?1016h"), sgr_cells);
-        assert_eq!(click(b"\x1b[?1003h\x1b[?1016h"), sgr_cells);
+        // Every sequence reports exactly as it did before 1016 existed.
+        assert_eq!(click(b"\x1b[?1003h\x1b[?1006h\x1b[?1016h").0, sgr_cells);
+        assert_eq!(
+            click(b"\x1b[?1003h\x1b[?1006h\x1b[?1016h\x1b[?1016l").0,
+            sgr_cells
+        );
+        assert_eq!(click(b"\x1b[?1003h\x1b[?1016h").0, b"\x1b[M %#".to_vec());
+        let (utf8_bytes, mode) = click(b"\x1b[?1003h\x1b[?1005h\x1b[?1016h");
+        assert!(mode.contains(Mode::UTF8_MOUSE));
+        assert_eq!(utf8_bytes, b"\x1b[M %#".to_vec());
     }
 
     // Clicks and drags report only when the program asked; shift bypasses to
