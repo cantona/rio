@@ -16,6 +16,11 @@ use crate::sockdir;
 /// lets the other side grow the buffer without bound.
 const RELAY_BUF_CAP: usize = 1 << 20;
 
+/// Undoes any terminal modes the replayed stream switched on — the
+/// pane's application state (mouse, alt screen, paste, keypad)
+/// must not leak into the console we return to.
+const TTY_RESET: &[u8] = b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?1004l\x1b[?2004l\x1b[?25h\x1b>";
+
 pub fn resolve_socket(target: &str) -> io::Result<PathBuf> {
     if target.ends_with(".sock") && Path::new(target).exists() {
         return Ok(PathBuf::from(target));
@@ -183,10 +188,6 @@ pub fn attach_interactive(target: &str, no_replay: bool) -> io::Result<i32> {
     }
     drop(winch_w);
     drop(winch_r);
-    // Undo any terminal modes the replayed stream switched on — the
-    // pane's application state (mouse, alt screen, paste, keypad)
-    // must not leak into the console we return to.
-    const TTY_RESET: &[u8] = b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[?25h\x1b>";
     let _ = io::stdout().write_all(TTY_RESET);
     let _ = io::stdout().flush();
     match &result {
@@ -479,4 +480,20 @@ fn flush_all(fd: i32, buf: &mut Vec<u8>) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tty_reset_clears_every_replayable_mouse_mode() {
+        let reset = String::from_utf8_lossy(TTY_RESET);
+        for mode in crate::modes::MOUSE_MODES {
+            assert!(
+                reset.contains(&format!("\x1b[?{mode}l")),
+                "TTY_RESET leaves mouse mode {mode} on"
+            );
+        }
+    }
 }

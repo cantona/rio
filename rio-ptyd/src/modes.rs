@@ -16,6 +16,9 @@
 
 const MAX_PARAMS: usize = 16;
 const MAX_TITLE: usize = 512;
+/// Mouse modes tracked for replay, and reset on replay when unset.
+pub const MOUSE_MODES: [u16; 7] = [1000, 1002, 1003, 1005, 1006, 1015, 1016];
+const MOUSE_ENCODINGS: [u16; 3] = [1005, 1006, 1016];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
@@ -46,7 +49,7 @@ pub struct Modes {
     pub cursor_hidden: bool,     // ?25 (tracked inverted: default visible)
     pub autowrap_off: bool,      // ?7 (tracked inverted: DECSTR turns it on)
     pub alt_screen: Option<u16>, // 47 | 1047 | 1049 (1048 is cursor-save only)
-    pub mouse: Vec<u16>,         // 1000/1002/1003/1005/1006/1015, set order
+    pub mouse: Vec<u16>,         // 1000/1002/1003/1005/1006/1015/1016, set order
     pub focus_reporting: bool,   // ?1004
     pub bracketed_paste: bool,   // ?2004
     pub app_keypad: bool,        // ESC = / ESC >
@@ -298,8 +301,13 @@ impl ModeTracker {
                     self.modes.alt_screen = None;
                 }
             }
-            1000 | 1002 | 1003 | 1005 | 1006 | 1015 => {
+            mode if MOUSE_MODES.contains(&mode) => {
                 if set {
+                    // 1005, 1006 and 1016 are one encoding setting in rio:
+                    // the last one set clears the others.
+                    if MOUSE_ENCODINGS.contains(&mode) {
+                        self.modes.mouse.retain(|m| !MOUSE_ENCODINGS.contains(m));
+                    }
                     if !self.modes.mouse.contains(&mode) {
                         self.modes.mouse.push(mode);
                     }
@@ -372,7 +380,7 @@ impl ModeTracker {
         // every mouse mode this reattach doesn't want, then set the
         // active ones. Without the resets a stale mouse mode from the
         // client's prior life survives a dirty-grid reattach.
-        for mode in [1000u16, 1002, 1003, 1005, 1006, 1015] {
+        for mode in MOUSE_MODES {
             if !m.mouse.contains(&mode) {
                 out.extend_from_slice(format!("\x1b[?{mode}l").as_bytes());
             }
@@ -433,6 +441,36 @@ mod tests {
         assert_eq!(t.modes.mouse, vec![1000, 1006]);
         t.advance(b"\x1b[?1000l");
         assert_eq!(t.modes.mouse, vec![1006]);
+    }
+
+    #[test]
+    fn tracks_sgr_pixels_mouse_mode() {
+        let mut t = ModeTracker::new();
+        t.advance(b"\x1b[?1003;1006h\x1b[?1016h");
+        assert_eq!(t.modes.mouse, vec![1003, 1016]);
+        let p = String::from_utf8_lossy(&t.replay_prefix()).into_owned();
+        assert!(p.contains("\x1b[?1006l"), "1006 must be reset");
+        assert!(p.contains("\x1b[?1016h"), "1016 must be replayed");
+        assert!(!p.contains("\x1b[?1006h"));
+
+        t.advance(b"\x1b[?1016l");
+        assert_eq!(t.modes.mouse, vec![1003]);
+        let p = String::from_utf8_lossy(&t.replay_prefix()).into_owned();
+        assert!(p.contains("\x1b[?1016l"), "stale 1016 must be reset");
+    }
+
+    #[test]
+    fn mouse_encodings_are_exclusive() {
+        let mut t = ModeTracker::new();
+        t.advance(b"\x1b[?1000h\x1b[?1016h\x1b[?1006h");
+        assert_eq!(t.modes.mouse, vec![1000, 1006]);
+        t.advance(b"\x1b[?1016h\x1b[?1005h");
+        assert_eq!(t.modes.mouse, vec![1000, 1005]);
+        t.advance(b"\x1b[?1006h");
+        assert_eq!(t.modes.mouse, vec![1000, 1006]);
+        // 1015 is not one of rio's encodings and is left alone.
+        t.advance(b"\x1b[?1015h\x1b[?1016h");
+        assert_eq!(t.modes.mouse, vec![1000, 1015, 1016]);
     }
 
     #[test]
@@ -579,6 +617,7 @@ mod tests {
         let p = String::from_utf8_lossy(&t.replay_prefix()).into_owned();
         assert!(p.contains("\x1b[?1049l"), "alt-screen off missing");
         assert!(p.contains("\x1b[?1000l"), "mouse 1000 off missing");
+        assert!(p.contains("\x1b[?1016l"), "mouse 1016 off missing");
         assert!(p.contains("\x1b[?2004l"), "bracketed-paste off missing");
         assert!(p.contains("\x1b[?1004l"), "focus off missing");
         assert!(p.contains("\x1b>"), "keypad-normal missing");
