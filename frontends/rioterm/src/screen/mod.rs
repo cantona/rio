@@ -516,7 +516,7 @@ impl Screen<'_> {
     }
 
     #[inline]
-    fn mouse_grid_position(&self, display_offset: usize) -> GridPosition {
+    pub fn mouse_grid_position(&self, display_offset: usize) -> GridPosition {
         let current_grid = self.context_manager.current_grid();
         let (context, margin) = current_grid.current_context_with_computed_dimension();
         let context_dimension = context.dimension;
@@ -863,6 +863,12 @@ impl Screen<'_> {
         let display_offset = terminal.display_offset();
         drop(terminal);
         display_offset
+    }
+
+    #[inline]
+    pub fn display_offset_and_mode(&self) -> (usize, Mode) {
+        let terminal = self.ctx().current().terminal.lock();
+        (terminal.display_offset(), terminal.mode())
     }
 
     #[inline]
@@ -3724,14 +3730,27 @@ impl Screen<'_> {
     }
 
     #[inline]
-    pub fn has_mouse_motion_and_drag(&mut self) -> bool {
-        self.get_mode()
-            .intersects(Mode::MOUSE_MOTION | Mode::MOUSE_DRAG)
-    }
-
-    #[inline]
     pub fn has_mouse_motion(&mut self) -> bool {
         self.get_mode().intersects(Mode::MOUSE_MOTION)
+    }
+
+    /// Report a cursor move under the motion protocols (1002, 1003), coded by
+    /// the button held.
+    pub fn report_mouse_motion(&mut self) {
+        if self.mouse.left_button_state == ElementState::Pressed {
+            // A latched hint click hides its press and release
+            // from the application; a drag report leaking out
+            // mid-click would arrive with no press around it.
+            if self.mouse.hint_click_latched.is_none() {
+                self.mouse_report(32, ElementState::Pressed);
+            }
+        } else if self.mouse.middle_button_state == ElementState::Pressed {
+            self.mouse_report(33, ElementState::Pressed);
+        } else if self.mouse.right_button_state == ElementState::Pressed {
+            self.mouse_report(34, ElementState::Pressed);
+        } else if self.has_mouse_motion() {
+            self.mouse_report(35, ElementState::Pressed);
+        }
     }
 
     #[inline]

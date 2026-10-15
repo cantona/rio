@@ -1,5 +1,6 @@
 use crate::event::{ClickState, EventPayload, EventProxy, RioEvent, RioEventType};
 use crate::ime::{Preedit, PreeditCursor};
+use crate::mouse::PointerMove;
 use crate::renderer::utils::update_colors_based_on_theme;
 use crate::router::{routes::RoutePath, Router};
 use crate::scheduler::{Scheduler, TimerId, Topic};
@@ -14,6 +15,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use raw_window_handle::HasDisplayHandle;
 use rio_backend::clipboard::{Clipboard, ClipboardType};
 use rio_backend::config::colors::{ColorRgb, NamedColor};
+use rio_backend::crosswords::Mode;
 use rio_backend::event::WindowId;
 use rio_window::application::ApplicationHandler;
 use rio_window::event::{
@@ -3023,18 +3025,34 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     }
                 }
 
-                let display_offset = route.window.screen.display_offset();
-                let point = route.window.screen.mouse_position(display_offset);
+                let (display_offset, mode) =
+                    route.window.screen.display_offset_and_mode();
+                let grid_position =
+                    route.window.screen.mouse_grid_position(display_offset);
+                let point = grid_position.cell;
 
                 // Compare *cell* coordinates, not pixel coordinates, so
                 // subpixel HiDPI jitter inside the same cell doesn't
                 // re-fire hint / OSC-8 / hyperlink work every event.
-                let prev_cell = route.window.screen.mouse.last_cell;
-                let cell_changed = prev_cell != Some(point);
-                route.window.screen.mouse.last_cell = Some(point);
+                // Only SGR-Pixels motion reports follow the pixel.
+                let PointerMove {
+                    cell_changed,
+                    pixel_motion,
+                } = route
+                    .window
+                    .screen
+                    .mouse
+                    .track_position(&grid_position, mode);
 
                 let inside_text_area = route.window.screen.contains_point(x, y);
                 let square_side = route.window.screen.side_by_pos(x);
+
+                let mouse_mode =
+                    mode.intersects(Mode::MOUSE_MODE) && !mode.contains(Mode::VI);
+                let is_selecting = (lmb_pressed || rmb_pressed)
+                    && (route.window.screen.modifiers.state().shift_key() || !mouse_mode);
+                let report_motion = !is_selecting
+                    && mode.intersects(Mode::MOUSE_MOTION | Mode::MOUSE_DRAG);
 
                 // If the cursor hasn't changed cells, do nothing.
                 // Force update when transitioning off a border so the cursor resets.
@@ -3043,15 +3061,14 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     && route.window.screen.mouse.square_side == square_side
                     && route.window.screen.mouse.inside_text_area == inside_text_area
                 {
+                    if pixel_motion && report_motion {
+                        route.window.screen.report_mouse_motion();
+                    }
                     return;
                 }
 
                 // Skip hint/hyperlink highlighting during active selection
                 // drag to avoid unnecessary terminal locks and regex matching.
-                let is_selecting = (lmb_pressed || rmb_pressed)
-                    && (route.window.screen.modifiers.state().shift_key()
-                        || !route.window.screen.mouse_mode());
-
                 if !is_selecting {
                     let hint_changed = route.window.screen.update_highlighted_hints();
                     route
@@ -3070,26 +3087,8 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 if is_selecting {
                     route.window.screen.update_selection(point, square_side);
                     route.window.screen.context_manager.request_render();
-                } else if cell_changed && route.window.screen.has_mouse_motion_and_drag()
-                {
-                    if lmb_pressed {
-                        // A latched hint click hides its press and release
-                        // from the application; a drag report leaking out
-                        // mid-click would arrive with no press around it.
-                        if route.window.screen.mouse.hint_click_latched.is_none() {
-                            route.window.screen.mouse_report(32, ElementState::Pressed);
-                        }
-                    } else if route.window.screen.mouse.middle_button_state
-                        == ElementState::Pressed
-                    {
-                        route.window.screen.mouse_report(33, ElementState::Pressed);
-                    } else if route.window.screen.mouse.right_button_state
-                        == ElementState::Pressed
-                    {
-                        route.window.screen.mouse_report(34, ElementState::Pressed);
-                    } else if route.window.screen.has_mouse_motion() {
-                        route.window.screen.mouse_report(35, ElementState::Pressed);
-                    }
+                } else if (cell_changed || pixel_motion) && report_motion {
+                    route.window.screen.report_mouse_motion();
                 }
             }
 

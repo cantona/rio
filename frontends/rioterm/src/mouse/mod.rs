@@ -48,6 +48,8 @@ pub struct Mouse {
     /// within the same cell — replaces the old pixel-equality check
     /// that fired on every subpixel HiDPI jitter.
     pub last_cell: Option<Pos>,
+    /// Last text-area pixel the cursor was over, as SGR-Pixels reports it.
+    pub last_pixel: Option<(usize, usize)>,
     /// The hint under an in-flight left press that bypassed mouse
     /// reporting. The release consults this latch instead of
     /// re-checking the highlight (the modifier can change mid-click,
@@ -76,6 +78,7 @@ impl Default for Mouse {
             y: 0.0,
             raw_y: 0.0,
             last_cell: None,
+            last_pixel: None,
             hint_click_latched: None,
         }
     }
@@ -95,6 +98,30 @@ impl Mouse {
         self.multiplier = multiplier;
         self.divider = divider;
     }
+
+    /// Record the grid position under the cursor and say what changed.
+    #[inline]
+    pub fn track_position(&mut self, position: &GridPosition, mode: Mode) -> PointerMove {
+        let cell_changed = self.last_cell != Some(position.cell);
+        let pixel_changed = self.last_pixel != Some(position.pixel);
+        self.last_cell = Some(position.cell);
+        self.last_pixel = Some(position.pixel);
+
+        PointerMove {
+            cell_changed,
+            pixel_motion: pixel_changed && mode.contains(Mode::SGR_PIXELS_MOUSE),
+        }
+    }
+}
+
+/// What a cursor move changed, from [`Mouse::track_position`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PointerMove {
+    /// The cursor is over a different cell.
+    pub cell_changed: bool,
+    /// The reported pixel changed while SGR-Pixels (1016) is set, so the
+    /// move is motion to report even within one cell.
+    pub pixel_motion: bool,
 }
 
 /// A cursor position resolved against a terminal grid.
@@ -836,5 +863,54 @@ pub mod test {
         // 1016 cleared 1006, so resetting it leaves the default encoding.
         parser.advance(&mut term, b"\x1b[?1016l");
         assert_eq!(press(&term), vec![0x1b, b'[', b'M', 32, 35, 36]);
+    }
+
+    #[test]
+    fn move_within_a_cell_is_motion_only_under_sgr_pixels() {
+        let first = at(2, 3, (25, 60));
+        let same_cell = at(2, 3, (26, 61));
+        let next_cell = at(3, 3, (28, 61));
+
+        let mut mouse = Mouse::default();
+        mouse.track_position(&first, Mode::SGR_MOUSE);
+        assert_eq!(
+            mouse.track_position(&same_cell, Mode::SGR_MOUSE),
+            PointerMove {
+                cell_changed: false,
+                pixel_motion: false,
+            }
+        );
+        assert_eq!(
+            mouse.track_position(&next_cell, Mode::SGR_MOUSE),
+            PointerMove {
+                cell_changed: true,
+                pixel_motion: false,
+            }
+        );
+
+        let mut mouse = Mouse::default();
+        mouse.track_position(&first, Mode::SGR_PIXELS_MOUSE);
+        assert_eq!(
+            mouse.track_position(&same_cell, Mode::SGR_PIXELS_MOUSE),
+            PointerMove {
+                cell_changed: false,
+                pixel_motion: true,
+            }
+        );
+        // Subpixel jitter that lands on the same integer pixel is not motion.
+        assert_eq!(
+            mouse.track_position(&same_cell, Mode::SGR_PIXELS_MOUSE),
+            PointerMove {
+                cell_changed: false,
+                pixel_motion: false,
+            }
+        );
+        assert_eq!(
+            mouse.track_position(&next_cell, Mode::SGR_PIXELS_MOUSE),
+            PointerMove {
+                cell_changed: true,
+                pixel_motion: true,
+            }
+        );
     }
 }
