@@ -66,6 +66,7 @@ impl PrivateMode {
             1005 => Self::Named(NamedPrivateMode::Utf8Mouse),
             1006 => Self::Named(NamedPrivateMode::SgrMouse),
             1007 => Self::Named(NamedPrivateMode::AlternateScroll),
+            1016 => Self::Named(NamedPrivateMode::SgrPixelsMouse),
             1042 => Self::Named(NamedPrivateMode::UrgencyHints),
             1049 => Self::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor),
             2004 => Self::Named(NamedPrivateMode::BracketedPaste),
@@ -123,6 +124,12 @@ pub enum NamedPrivateMode {
     Utf8Mouse = 1005,
     SgrMouse = 1006,
     AlternateScroll = 1007,
+    /// SGR-Pixels mouse encoding.
+    ///
+    /// The SGR wire format of [`Self::SgrMouse`] with 1-based pixel
+    /// coordinates relative to the text area instead of cells. One of the
+    /// mutually exclusive mouse encodings, with 1005 and 1006.
+    SgrPixelsMouse = 1016,
     UrgencyHints = 1042,
     SwapScreenAndSetRestoreCursor = 1049,
     BracketedPaste = 2004,

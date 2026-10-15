@@ -102,6 +102,7 @@ bitflags! {
         /// across main/alt screens (the mode lives on the terminal,
         /// not the grid), matching contour.
         const GRAPHEME_CLUSTER        = 1 << 24;
+        const SGR_PIXELS_MOUSE        = 1 << 25;
         const MOUSE_MODE = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits() | Self::MOUSE_REPORT_X10.bits();
         const KITTY_KEYBOARD_PROTOCOL = Self::DISAMBIGUATE_ESC_CODES.bits()
                                       | Self::REPORT_EVENT_TYPES.bits()
@@ -3153,12 +3154,16 @@ impl<U: EventListener> Handler for Crosswords<U> {
             NamedPrivateMode::BracketedPaste => self.mode.insert(Mode::BRACKETED_PASTE),
             // Mouse encodings are mutually exclusive.
             NamedPrivateMode::SgrMouse => {
-                self.mode.remove(Mode::UTF8_MOUSE);
+                self.mode.remove(Mode::UTF8_MOUSE | Mode::SGR_PIXELS_MOUSE);
                 self.mode.insert(Mode::SGR_MOUSE);
             }
             NamedPrivateMode::Utf8Mouse => {
-                self.mode.remove(Mode::SGR_MOUSE);
+                self.mode.remove(Mode::SGR_MOUSE | Mode::SGR_PIXELS_MOUSE);
                 self.mode.insert(Mode::UTF8_MOUSE);
+            }
+            NamedPrivateMode::SgrPixelsMouse => {
+                self.mode.remove(Mode::SGR_MOUSE | Mode::UTF8_MOUSE);
+                self.mode.insert(Mode::SGR_PIXELS_MOUSE);
             }
             NamedPrivateMode::AlternateScroll => self.mode.insert(Mode::ALTERNATE_SCROLL),
             NamedPrivateMode::LineWrap => self.mode.insert(Mode::LINE_WRAP),
@@ -3229,6 +3234,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
             NamedPrivateMode::BracketedPaste => self.mode.remove(Mode::BRACKETED_PASTE),
             NamedPrivateMode::SgrMouse => self.mode.remove(Mode::SGR_MOUSE),
             NamedPrivateMode::Utf8Mouse => self.mode.remove(Mode::UTF8_MOUSE),
+            NamedPrivateMode::SgrPixelsMouse => self.mode.remove(Mode::SGR_PIXELS_MOUSE),
             NamedPrivateMode::AlternateScroll => self.mode.remove(Mode::ALTERNATE_SCROLL),
             NamedPrivateMode::LineWrap => self.mode.remove(Mode::LINE_WRAP),
             NamedPrivateMode::Origin => self.mode.remove(Mode::ORIGIN),
@@ -3276,6 +3282,9 @@ impl<U: EventListener> Handler for Crosswords<U> {
                     self.mode.contains(Mode::UTF8_MOUSE).into()
                 }
                 NamedPrivateMode::SgrMouse => self.mode.contains(Mode::SGR_MOUSE).into(),
+                NamedPrivateMode::SgrPixelsMouse => {
+                    self.mode.contains(Mode::SGR_PIXELS_MOUSE).into()
+                }
                 NamedPrivateMode::AlternateScroll => {
                     self.mode.contains(Mode::ALTERNATE_SCROLL).into()
                 }
@@ -11180,5 +11189,106 @@ mod tests {
         events.borrow_mut().clear();
         parser.advance(&mut term, b"\x1b[?9h\x1b[?9$p");
         assert_eq!(replies(&events), vec!["\x1b[?9;1$y".to_string()]);
+    }
+
+    #[test]
+    fn sgr_pixels_mouse_mode_parses_to_named_mode() {
+        use crate::ansi::mode::{NamedPrivateMode, PrivateMode};
+
+        assert!(matches!(
+            PrivateMode::new(1016),
+            PrivateMode::Named(NamedPrivateMode::SgrPixelsMouse)
+        ));
+        assert_eq!(PrivateMode::new(1016).raw(), 1016);
+    }
+
+    /// 1005, 1006 and 1016 are one encoding setting: the last one set wins,
+    /// and DECRQM reports exactly the one in effect.
+    #[test]
+    fn sgr_pixels_mouse_mode_is_an_exclusive_encoding() {
+        use crate::performer::handler::Processor;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut term = Crosswords::new(
+            CrosswordsSize::new(10, 10),
+            CursorShape::Block,
+            TestListener {
+                events: events.clone(),
+            },
+            WindowId::from(0),
+            0,
+            10,
+        );
+        let mut parser = Processor::default();
+
+        let mut query = |term: &mut Crosswords<TestListener>| -> Vec<String> {
+            events.borrow_mut().clear();
+            parser.advance(term, b"\x1b[?1005$p\x1b[?1006$p\x1b[?1016$p");
+            events
+                .borrow()
+                .iter()
+                .filter_map(|event| match event {
+                    RioEvent::PtyWrite(_, text) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let states = |utf8: u8, sgr: u8, pixels: u8| -> Vec<String> {
+            vec![
+                format!("\x1b[?1005;{utf8}$y"),
+                format!("\x1b[?1006;{sgr}$y"),
+                format!("\x1b[?1016;{pixels}$y"),
+            ]
+        };
+
+        assert_eq!(query(&mut term), states(2, 2, 2));
+
+        Processor::default().advance(&mut term, b"\x1b[?1006h\x1b[?1016h");
+        assert!(term.mode().contains(Mode::SGR_PIXELS_MOUSE));
+        assert!(!term.mode().contains(Mode::SGR_MOUSE));
+        assert_eq!(query(&mut term), states(2, 2, 1));
+
+        Processor::default().advance(&mut term, b"\x1b[?1016l");
+        assert!(!term
+            .mode()
+            .intersects(Mode::SGR_MOUSE | Mode::UTF8_MOUSE | Mode::SGR_PIXELS_MOUSE));
+        assert_eq!(query(&mut term), states(2, 2, 2));
+
+        Processor::default().advance(&mut term, b"\x1b[?1005h\x1b[?1016h");
+        assert_eq!(query(&mut term), states(2, 2, 1));
+
+        Processor::default().advance(&mut term, b"\x1b[?1006h");
+        assert_eq!(query(&mut term), states(2, 1, 2));
+
+        Processor::default().advance(&mut term, b"\x1b[?1016h\x1b[?1005h");
+        assert_eq!(query(&mut term), states(1, 2, 2));
+
+        // Resetting another encoding leaves 1016 alone.
+        Processor::default().advance(&mut term, b"\x1b[?1016h\x1b[?1006l\x1b[?1005l");
+        assert_eq!(query(&mut term), states(2, 2, 1));
+    }
+
+    #[test]
+    fn full_reset_clears_sgr_pixels_mouse_mode() {
+        use crate::performer::handler::Processor;
+
+        let mut term = Crosswords::new(
+            CrosswordsSize::new(10, 10),
+            CursorShape::Block,
+            VoidListener,
+            WindowId::from(0),
+            0,
+            10,
+        );
+        let mut parser = Processor::default();
+
+        parser.advance(&mut term, b"\x1b[?1003h\x1b[?1016h");
+        assert!(term.mode().contains(Mode::SGR_PIXELS_MOUSE));
+
+        parser.advance(&mut term, b"\x1bc");
+        assert!(!term.mode().contains(Mode::SGR_PIXELS_MOUSE));
+        assert!(!term.mode().intersects(Mode::MOUSE_MODE));
     }
 }
