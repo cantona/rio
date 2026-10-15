@@ -187,8 +187,12 @@ pub fn calculate_grid_position(
 
     let grid_w = columns_rows.0 * cell.0 as usize;
     let grid_h = columns_rows.1 * cell.1 as usize;
+    // Pixels are relative to the application's grid, like the cell row: a
+    // viewport scrolled back by `display_offset` lines shows the
+    // application's first row that many rows further down.
+    let y_in_app = y_in_grid - display_offset as f64 * cell_h;
     let pixel_x = (x_in_grid as usize + 1).min(grid_w).max(1);
-    let pixel_y = (y_in_grid as usize + 1).min(grid_h).max(1);
+    let pixel_y = (y_in_app.max(0.0) as usize + 1).min(grid_h).max(1);
 
     GridPosition {
         cell: Pos::new(row, col),
@@ -730,12 +734,20 @@ pub mod test {
     }
 
     #[test]
-    fn grid_pos_pixel_ignores_display_offset() {
+    fn grid_pos_pixel_follows_display_offset() {
         let cell = (9u32, 18u32);
+        // Scrolled back one line: viewport row 2 is the application's row 1,
+        // and the pixel moves up by one cell with it.
+        let pos =
+            calculate_grid_position(&mk_mouse(40.0, 40.0), 1, (10, 5), 0.0, 0.0, cell);
+        assert_eq!(pos.cell.row, Line(2) - 1);
+        assert_eq!(pos.pixel, (41, 23));
+        // Scrolled back past the pointer: the cell is in the scrollback (the
+        // encoder drops it) and the pixel clamps to the first row.
         let pos =
             calculate_grid_position(&mk_mouse(40.0, 40.0), 3, (10, 5), 0.0, 0.0, cell);
-        assert_eq!(pos.pixel, (41, 41));
         assert_eq!(pos.cell.row, Line(2) - 3);
+        assert_eq!(pos.pixel, (41, 1));
     }
 
     fn at(col: usize, row: i32, pixel: (usize, usize)) -> GridPosition {
