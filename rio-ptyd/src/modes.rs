@@ -386,6 +386,9 @@ impl ModeTracker {
         // keeps SGR cells, while rio itself still ends up in 1016. A program
         // that set 1016 parses that CSI < syntax, which urxvt's 1015 does
         // not share, so 1006 is the fallback even when 1015 is tracked too.
+        // This holds only while 1016 is set: after ?1016l the tracker, like
+        // rio and xterm, is back in the default encoding, so a terminal that
+        // ignored 1016 (and so kept 1006 live) is replayed without it.
         let wants_pixels = m.mouse.contains(&1016);
         for mode in MOUSE_MODES {
             if !m.mouse.contains(&mode) && (mode != 1006 || !wants_pixels) {
