@@ -383,7 +383,9 @@ impl ModeTracker {
         // rio clears 1006 when 1016 is set, so a live session in 1016 saw
         // pixels. Replaying 1016 alone into a terminal that ignores it would
         // leave the default byte encoding; set 1006 first so such a terminal
-        // keeps SGR cells, while rio itself still ends up in 1016.
+        // keeps SGR cells, while rio itself still ends up in 1016. A program
+        // that set 1016 parses that CSI < syntax, which urxvt's 1015 does
+        // not share, so 1006 is the fallback even when 1015 is tracked too.
         let wants_pixels = m.mouse.contains(&1016);
         for mode in MOUSE_MODES {
             if !m.mouse.contains(&mode) && (mode != 1006 || !wants_pixels) {
@@ -469,6 +471,15 @@ mod tests {
         assert_eq!(t.modes.mouse, vec![1003]);
         let p = String::from_utf8_lossy(&t.replay_prefix()).into_owned();
         assert!(p.contains("\x1b[?1016l"), "stale 1016 must be reset");
+
+        // 1015 is tracked alongside, but the fallback stays SGR.
+        let mut t = ModeTracker::new();
+        t.advance(b"\x1b[?1003h\x1b[?1015h\x1b[?1016h");
+        assert_eq!(t.modes.mouse, vec![1003, 1015, 1016]);
+        let p = String::from_utf8_lossy(&t.replay_prefix()).into_owned();
+        assert!(p.contains("\x1b[?1015h"), "{p:?}");
+        assert!(p.contains("\x1b[?1006h\x1b[?1016h"), "{p:?}");
+        assert!(!p.contains("\x1b[?1006l"), "{p:?}");
     }
 
     #[test]
