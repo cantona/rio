@@ -380,12 +380,20 @@ impl ModeTracker {
         // every mouse mode this reattach doesn't want, then set the
         // active ones. Without the resets a stale mouse mode from the
         // client's prior life survives a dirty-grid reattach.
+        // rio clears 1006 when 1016 is set, so a live session in 1016 saw
+        // pixels. Replaying 1016 alone into a terminal that ignores it would
+        // leave the default byte encoding; set 1006 first so such a terminal
+        // keeps SGR cells, while rio itself still ends up in 1016.
+        let wants_pixels = m.mouse.contains(&1016);
         for mode in MOUSE_MODES {
-            if !m.mouse.contains(&mode) {
+            if !m.mouse.contains(&mode) && (mode != 1006 || !wants_pixels) {
                 out.extend_from_slice(format!("\x1b[?{mode}l").as_bytes());
             }
         }
         for mode in &m.mouse {
+            if *mode == 1016 {
+                out.extend_from_slice(b"\x1b[?1006h");
+            }
             out.extend_from_slice(format!("\x1b[?{mode}h").as_bytes());
         }
         // Focus reporting / bracketed paste / keypad — both directions.
@@ -449,9 +457,13 @@ mod tests {
         t.advance(b"\x1b[?1003;1006h\x1b[?1016h");
         assert_eq!(t.modes.mouse, vec![1003, 1016]);
         let p = String::from_utf8_lossy(&t.replay_prefix()).into_owned();
-        assert!(p.contains("\x1b[?1006l"), "1006 must be reset");
-        assert!(p.contains("\x1b[?1016h"), "1016 must be replayed");
-        assert!(!p.contains("\x1b[?1006h"));
+        // 1006 is set right before 1016: rio ends in 1016 as the live
+        // session did, a terminal without 1016 keeps SGR cells.
+        assert!(
+            p.contains("\x1b[?1006h\x1b[?1016h"),
+            "1006 then 1016: {p:?}"
+        );
+        assert!(!p.contains("\x1b[?1006l"), "1006 must not be reset first");
 
         t.advance(b"\x1b[?1016l");
         assert_eq!(t.modes.mouse, vec![1003]);
