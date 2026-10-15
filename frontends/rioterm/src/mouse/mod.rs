@@ -48,7 +48,8 @@ pub struct Mouse {
     /// within the same cell — replaces the old pixel-equality check
     /// that fired on every subpixel HiDPI jitter.
     pub last_cell: Option<Pos>,
-    /// Last text-area pixel the cursor was over, as SGR-Pixels reports it.
+    /// Last application-grid pixel the cursor was over, as SGR-Pixels
+    /// reports it.
     pub last_pixel: Option<(usize, usize)>,
     /// The hint under an in-flight left press that bypassed mouse
     /// reporting. The release consults this latch instead of
@@ -136,14 +137,17 @@ pub struct PointerMove {
 pub struct GridPosition {
     /// The cell under the cursor, viewport-relative.
     pub cell: Pos,
-    /// The cursor in pixels from the top-left of the text area, 1-based and
-    /// clamped to `columns * cell_width` by `rows * cell_height`, as SGR-Pixels
-    /// (mode 1016) reports it.
+    /// The cursor in pixels from the top-left of the application's grid,
+    /// 1-based and clamped to `columns * cell_width` by
+    /// `(rows - display_offset) * cell_height`, as SGR-Pixels (mode 1016)
+    /// reports it.
     pub pixel: (usize, usize),
 }
 
 /// Map a physical-pixel cursor position to the grid cell under it and to its
-/// pixel offset in the text area, from one origin so the two cannot disagree.
+/// pixel offset in the application's grid, from one origin so the two cannot
+/// disagree. Both shift by `display_offset` when the viewport is scrolled
+/// back.
 ///
 /// Pixel coords stay `f64` until the final integer truncation, and
 /// the divide uses the canonical `u32` `cell_width / cell_height`
