@@ -1,6 +1,11 @@
+// encode_mouse_report is adapted from sgr_mouse_report and normal_mouse_report in
+// https://github.com/alacritty/alacritty/blob/c39c3c97f1a1213418c3629cc59a1d46e34070e0/alacritty/src/input.rs
+// which is licensed under Apache 2.0 license.
+
 use crate::crosswords::pos::Column;
 use crate::crosswords::pos::Line;
 use crate::crosswords::pos::Side;
+use crate::crosswords::Mode;
 use crate::event::ClickState;
 use rio_backend::crosswords::pos::Pos;
 use rio_window::event::ElementState;
@@ -92,7 +97,19 @@ impl Mouse {
     }
 }
 
-/// Map a physical-pixel cursor position to a terminal grid `Pos`.
+/// A cursor position resolved against a terminal grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridPosition {
+    /// The cell under the cursor, viewport-relative.
+    pub cell: Pos,
+    /// The cursor in pixels from the top-left of the text area, 1-based and
+    /// clamped to `columns * cell_width` by `rows * cell_height`, as SGR-Pixels
+    /// (mode 1016) reports it.
+    pub pixel: (usize, usize),
+}
+
+/// Map a physical-pixel cursor position to the grid cell under it and to its
+/// pixel offset in the text area, from one origin so the two cannot disagree.
 ///
 /// Pixel coords stay `f64` until the final integer truncation, and
 /// the divide uses the canonical `u32` `cell_width / cell_height`
@@ -100,19 +117,23 @@ impl Mouse {
 /// painted cell stride and click→cell mapping).
 ///
 /// `margin_x_left / margin_y_top` are already pre-scaled (physical
-/// pixels), do not multiply by `scale_factor` here.
+/// pixels), do not multiply by `scale_factor` here. For a split they include
+/// the panel's origin in the window.
 #[inline]
-pub fn calculate_mouse_position(
+pub fn calculate_grid_position(
     mouse: &Mouse,
     display_offset: usize,
     columns_rows: (usize, usize),
     margin_x_left: f32,
     margin_y_top: f32,
     cell: (u32, u32),
-) -> Pos {
+) -> GridPosition {
     let (cell_w, cell_h) = (cell.0 as f64, cell.1 as f64);
     if cell_w == 0.0 || cell_h == 0.0 {
-        return Pos::default();
+        return GridPosition {
+            cell: Pos::default(),
+            pixel: (1, 1),
+        };
     }
 
     let margin_x = margin_x_left as f64;
@@ -130,7 +151,74 @@ pub fn calculate_mouse_position(
     let row = std::cmp::min(row_idx, columns_rows.1 - 1);
     let row = Line(row as i32) - display_offset;
 
-    Pos::new(row, col)
+    let grid_w = columns_rows.0 * cell.0 as usize;
+    let grid_h = columns_rows.1 * cell.1 as usize;
+    let pixel_x = (x_in_grid as usize + 1).min(grid_w).max(1);
+    let pixel_y = (y_in_grid as usize + 1).min(grid_h).max(1);
+
+    GridPosition {
+        cell: Pos::new(row, col),
+        pixel: (pixel_x, pixel_y),
+    }
+}
+
+/// Encode a mouse report in the encoding `mode` selects: SGR-Pixels (1016),
+/// SGR (1006), or the default byte encoding with its UTF-8 extension (1005).
+///
+/// `button` is the button code without modifiers and `mods` the modifier
+/// bits. Returns `None` when the cell cannot be represented in the default
+/// encoding, or lies in the scrollback.
+pub fn encode_mouse_report(
+    mode: Mode,
+    position: &GridPosition,
+    button: u8,
+    mods: u8,
+    state: ElementState,
+) -> Option<Vec<u8>> {
+    let sgr = |x: usize, y: usize| {
+        let c = match state {
+            ElementState::Pressed => 'M',
+            ElementState::Released => 'm',
+        };
+        format!("\x1b[<{};{};{}{}", button + mods, x, y, c).into_bytes()
+    };
+
+    let col = position.cell.col.0;
+    let row = usize::try_from(position.cell.row.0).ok()?;
+
+    if mode.contains(Mode::SGR_PIXELS_MOUSE) {
+        let (x, y) = position.pixel;
+        return Some(sgr(x, y));
+    }
+    if mode.contains(Mode::SGR_MOUSE) {
+        return Some(sgr(col + 1, row + 1));
+    }
+
+    let utf8 = mode.contains(Mode::UTF8_MOUSE);
+    let max_point = if utf8 { 2015 } else { 223 };
+    if row >= max_point || col >= max_point {
+        return None;
+    }
+
+    let code = match state {
+        ElementState::Pressed => button + mods,
+        ElementState::Released => 3 + mods,
+    };
+    let mut msg = vec![b'\x1b', b'[', b'M', 32 + code];
+
+    let mut push_pos = |pos: usize| {
+        if utf8 && pos >= 95 {
+            let pos = 32 + 1 + pos;
+            msg.push((0xC0 + pos / 64) as u8);
+            msg.push((0x80 + (pos & 63)) as u8);
+        } else {
+            msg.push(32 + 1 + pos as u8);
+        }
+    };
+    push_pos(col);
+    push_pos(row);
+
+    Some(msg)
 }
 
 /// Determine which side of a cell the mouse x-position falls on.
@@ -174,6 +262,25 @@ pub fn calculate_side_by_pos(
 #[cfg(test)]
 pub mod test {
     use super::*;
+
+    fn calculate_mouse_position(
+        mouse: &Mouse,
+        display_offset: usize,
+        columns_rows: (usize, usize),
+        margin_x_left: f32,
+        margin_y_top: f32,
+        cell: (u32, u32),
+    ) -> Pos {
+        calculate_grid_position(
+            mouse,
+            display_offset,
+            columns_rows,
+            margin_x_left,
+            margin_y_top,
+            cell,
+        )
+        .cell
+    }
 
     fn mk_mouse(x: f64, y: f64) -> Mouse {
         Mouse {
@@ -511,5 +618,223 @@ pub mod test {
             calculate_side_by_pos(49.61, margin_x, cell, grid_w),
             Side::Right,
         );
+    }
+
+    fn grid_pos(x: f64, y: f64, margin: (f32, f32), cell: (u32, u32)) -> GridPosition {
+        calculate_grid_position(&mk_mouse(x, y), 0, (10, 5), margin.0, margin.1, cell)
+    }
+
+    #[test]
+    fn grid_pos_pixel_is_one_based_from_the_margin() {
+        let cell = (9u32, 18u32);
+        let margin = (10.0_f32, 20.0_f32);
+
+        let pos = grid_pos(10.0, 20.0, margin, cell);
+        assert_eq!(pos.pixel, (1, 1));
+        assert_eq!(pos.cell, Pos::new(Line(0), Column(0)));
+
+        let pos = grid_pos(19.5, 38.0, margin, cell);
+        assert_eq!(pos.pixel, (10, 19));
+        assert_eq!(pos.cell, Pos::new(Line(1), Column(1)));
+    }
+
+    #[test]
+    fn grid_pos_last_pixel_of_last_cell() {
+        // 10 columns of 9 and 5 rows of 18: the text area is 90x90.
+        let cell = (9u32, 18u32);
+
+        let pos = grid_pos(89.9, 89.9, (0.0, 0.0), cell);
+        assert_eq!(pos.pixel, (90, 90));
+        assert_eq!(pos.cell, Pos::new(Line(4), Column(9)));
+    }
+
+    #[test]
+    fn grid_pos_pixel_clamps_in_the_margins() {
+        let cell = (9u32, 18u32);
+        let margin = (10.0_f32, 20.0_f32);
+
+        let pos = grid_pos(3.0, 5.0, margin, cell);
+        assert_eq!(pos.pixel, (1, 1));
+        assert_eq!(pos.cell, Pos::new(Line(0), Column(0)));
+
+        // Right and bottom padding past the last cell.
+        let pos = grid_pos(10.0 + 90.0 + 7.0, 20.0 + 90.0 + 12.0, margin, cell);
+        assert_eq!(pos.pixel, (90, 90));
+        assert_eq!(pos.cell, Pos::new(Line(4), Column(9)));
+    }
+
+    #[test]
+    fn grid_pos_fractional_hidpi_scale() {
+        // Scale 1.5: a 5px margin is 7.5 physical pixels, and the cursor
+        // arrives at fractional physical positions.
+        let cell = (14u32, 27u32);
+        let margin = (7.5_f32, 7.5_f32);
+
+        let pos = grid_pos(7.5 + 20.25, 7.5 + 53.9, margin, cell);
+        assert_eq!(pos.pixel, (21, 54));
+        assert_eq!(pos.cell, Pos::new(Line(1), Column(1)));
+
+        let pos = grid_pos(7.5 + 13.99, 7.5 + 26.99, margin, cell);
+        assert_eq!(pos.pixel, (14, 27));
+        assert_eq!(pos.cell, Pos::new(Line(0), Column(0)));
+    }
+
+    #[test]
+    fn grid_pos_split_with_non_zero_origin() {
+        // A right-hand split at x = 400, y = 0: the margin the layout hands
+        // over is the window margin plus the panel's origin.
+        let cell = (9u32, 18u32);
+        let margin = (10.0_f32 + 400.0, 20.0_f32);
+
+        let pos = grid_pos(415.0, 25.0, margin, cell);
+        assert_eq!(pos.pixel, (6, 6));
+        assert_eq!(pos.cell, Pos::new(Line(0), Column(0)));
+
+        // On the divider, left of the panel's text area.
+        let pos = grid_pos(405.0, 25.0, margin, cell);
+        assert_eq!(pos.pixel, (1, 6));
+    }
+
+    #[test]
+    fn grid_pos_pixel_ignores_display_offset() {
+        let cell = (9u32, 18u32);
+        let pos =
+            calculate_grid_position(&mk_mouse(40.0, 40.0), 3, (10, 5), 0.0, 0.0, cell);
+        assert_eq!(pos.pixel, (41, 41));
+        assert_eq!(pos.cell.row, Line(2) - 3);
+    }
+
+    fn at(col: usize, row: i32, pixel: (usize, usize)) -> GridPosition {
+        GridPosition {
+            cell: Pos::new(Line(row), Column(col)),
+            pixel,
+        }
+    }
+
+    fn encode(mode: Mode, pos: &GridPosition, button: u8, state: ElementState) -> String {
+        let bytes = encode_mouse_report(mode, pos, button, 0, state).unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn encode_sgr_reports_cells() {
+        let pos = at(2, 3, (25, 60));
+        assert_eq!(
+            encode(Mode::SGR_MOUSE, &pos, 0, ElementState::Pressed),
+            "\x1b[<0;3;4M"
+        );
+        assert_eq!(
+            encode(Mode::SGR_MOUSE, &pos, 0, ElementState::Released),
+            "\x1b[<0;3;4m"
+        );
+    }
+
+    #[test]
+    fn encode_sgr_pixels_reports_pixels() {
+        let pos = at(2, 3, (25, 60));
+        assert_eq!(
+            encode(Mode::SGR_PIXELS_MOUSE, &pos, 0, ElementState::Pressed),
+            "\x1b[<0;25;60M"
+        );
+        assert_eq!(
+            encode(Mode::SGR_PIXELS_MOUSE, &pos, 2, ElementState::Released),
+            "\x1b[<2;25;60m"
+        );
+        // Motion with the left button held, and the wheel.
+        assert_eq!(
+            encode(Mode::SGR_PIXELS_MOUSE, &pos, 32, ElementState::Pressed),
+            "\x1b[<32;25;60M"
+        );
+        assert_eq!(
+            encode(Mode::SGR_PIXELS_MOUSE, &pos, 65, ElementState::Pressed),
+            "\x1b[<65;25;60M"
+        );
+        let ctrl_wheel = encode_mouse_report(
+            Mode::SGR_PIXELS_MOUSE,
+            &pos,
+            64,
+            16,
+            ElementState::Pressed,
+        );
+        assert_eq!(ctrl_wheel.unwrap(), b"\x1b[<80;25;60M");
+    }
+
+    #[test]
+    fn encode_default_and_utf8() {
+        let pos = at(2, 3, (25, 60));
+        let mode = Mode::empty();
+        assert_eq!(
+            encode_mouse_report(mode, &pos, 0, 0, ElementState::Pressed).unwrap(),
+            vec![0x1b, b'[', b'M', 32, 35, 36]
+        );
+        assert_eq!(
+            encode_mouse_report(mode, &pos, 0, 4, ElementState::Released).unwrap(),
+            vec![0x1b, b'[', b'M', 32 + 3 + 4, 35, 36]
+        );
+
+        let far = at(300, 3, (2701, 60));
+        assert_eq!(
+            encode_mouse_report(mode, &far, 0, 0, ElementState::Pressed),
+            None
+        );
+        let pos = 32 + 1 + 300;
+        assert_eq!(
+            encode_mouse_report(Mode::UTF8_MOUSE, &far, 0, 0, ElementState::Pressed)
+                .unwrap(),
+            vec![
+                0x1b,
+                b'[',
+                b'M',
+                32,
+                (0xC0 + pos / 64) as u8,
+                (0x80 + (pos & 63)) as u8,
+                36
+            ]
+        );
+    }
+
+    #[test]
+    fn encode_skips_scrollback_rows() {
+        let pos = at(2, -1, (25, 60));
+        for mode in [Mode::empty(), Mode::SGR_MOUSE, Mode::SGR_PIXELS_MOUSE] {
+            assert_eq!(
+                encode_mouse_report(mode, &pos, 0, 0, ElementState::Pressed),
+                None
+            );
+        }
+    }
+
+    /// The encoding follows the terminal's mode through 1006 and 1016 being
+    /// set and reset the way terminal-browser and herdr do it.
+    #[test]
+    fn encode_follows_mode_1016_set_and_reset() {
+        use rio_backend::ansi::CursorShape;
+        use rio_backend::crosswords::{Crosswords, CrosswordsSize};
+        use rio_backend::event::{VoidListener, WindowId};
+        use rio_backend::performer::handler::Processor;
+
+        let mut term = Crosswords::new(
+            CrosswordsSize::new(10, 5),
+            CursorShape::Block,
+            VoidListener {},
+            WindowId::from(0),
+            0,
+            10,
+        );
+        let mut parser = Processor::default();
+        let pos = at(2, 3, (25, 60));
+        let press = |term: &Crosswords<VoidListener>| {
+            encode_mouse_report(term.mode(), &pos, 0, 0, ElementState::Pressed).unwrap()
+        };
+
+        parser.advance(&mut term, b"\x1b[?1003h\x1b[?1006h");
+        assert_eq!(press(&term), b"\x1b[<0;3;4M");
+
+        parser.advance(&mut term, b"\x1b[?1016h");
+        assert_eq!(press(&term), b"\x1b[<0;25;60M");
+
+        // 1016 cleared 1006, so resetting it leaves the default encoding.
+        parser.advance(&mut term, b"\x1b[?1016l");
+        assert_eq!(press(&term), vec![0x1b, b'[', b'M', 32, 35, 36]);
     }
 }

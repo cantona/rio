@@ -2,7 +2,7 @@
 // Copyright 2022-present Raphael Amorim
 //
 // The functions (including comments) and logic of process_key_event, build_key_sequence, process_mouse_bindings, copy_selection, start_selection, update_selection_scrolling,
-// side_by_pos, on_left_click, paste, sgr_mouse_report, mouse_report, normal_mouse_report, scroll,
+// side_by_pos, on_left_click, paste, mouse_report, scroll,
 // were retired from https://github.com/alacritty/alacritty/blob/c39c3c97f1a1213418c3629cc59a1d46e34070e0/alacritty/src/input.rs
 // which is licensed under Apache 2.0 license.
 
@@ -25,7 +25,7 @@ use crate::crosswords::{
 };
 use crate::hints::HintState;
 use crate::layout::ContextDimension;
-use crate::mouse::{calculate_mouse_position, Mouse};
+use crate::mouse::{calculate_grid_position, encode_mouse_report, GridPosition, Mouse};
 use crate::renderer::island::{self, TabStripLayout};
 use crate::renderer::{utils::padding_top_from_config, Renderer};
 use crate::screen::hint::HintMatches;
@@ -512,10 +512,15 @@ impl Screen<'_> {
 
     #[inline]
     pub fn mouse_position(&self, display_offset: usize) -> Pos {
+        self.mouse_grid_position(display_offset).cell
+    }
+
+    #[inline]
+    fn mouse_grid_position(&self, display_offset: usize) -> GridPosition {
         let current_grid = self.context_manager.current_grid();
         let (context, margin) = current_grid.current_context_with_computed_dimension();
         let context_dimension = context.dimension;
-        calculate_mouse_position(
+        calculate_grid_position(
             &self.mouse,
             display_offset,
             (context_dimension.columns, context_dimension.lines),
@@ -3718,19 +3723,6 @@ impl Screen<'_> {
         }
     }
 
-    fn sgr_mouse_report(&mut self, pos: Pos, button: u8, state: ElementState) {
-        let c = match state {
-            ElementState::Pressed => 'M',
-            ElementState::Released => 'm',
-        };
-
-        let msg = format!("\x1b[<{};{};{}{}", button, pos.col + 1, pos.row + 1, c);
-        self.ctx_mut()
-            .current_mut()
-            .messenger
-            .send_write(msg.into_bytes());
-    }
-
     #[inline]
     pub fn has_mouse_motion_and_drag(&mut self) -> bool {
         self.get_mode()
@@ -3749,10 +3741,10 @@ impl Screen<'_> {
         let mode = terminal.mode();
         drop(terminal);
 
-        let pos = self.mouse_position(display_offset);
+        let position = self.mouse_grid_position(display_offset);
 
         // Assure the mouse pos is not in the scrollback.
-        if pos.row < 0 {
+        if position.cell.row < 0 {
             return;
         }
 
@@ -3762,74 +3754,29 @@ impl Screen<'_> {
         // wheel codes (64 and up) do, and neither is reportable. Both are
         // dropped rather than falling back to local scrolling, since the
         // protocol still owns the wheel while it is active.
-        if mode.contains(Mode::MOUSE_REPORT_X10) {
-            if state == ElementState::Pressed && button <= 2 {
-                if mode.contains(Mode::SGR_MOUSE) {
-                    self.sgr_mouse_report(pos, button, state);
-                } else {
-                    self.normal_mouse_report(pos, button);
-                }
+        let mods = if mode.contains(Mode::MOUSE_REPORT_X10) {
+            if state == ElementState::Released || button > 2 {
+                return;
             }
-
-            return;
-        }
-
-        // Calculate modifiers value.
-        let mut mods = 0;
-        let mod_state = self.modifiers.state();
-        if mod_state.shift_key() {
-            mods += 4;
-        }
-        if mod_state.alt_key() {
-            mods += 8;
-        }
-        if mod_state.control_key() {
-            mods += 16;
-        }
-
-        // Report mouse events.
-        if mode.contains(Mode::SGR_MOUSE) {
-            self.sgr_mouse_report(pos, button + mods, state);
-        } else if let ElementState::Released = state {
-            self.normal_mouse_report(pos, 3 + mods);
+            0
         } else {
-            self.normal_mouse_report(pos, button + mods);
-        }
-    }
-
-    #[inline]
-    fn normal_mouse_report(&mut self, position: Pos, button: u8) {
-        let Pos { row, col } = position;
-        let utf8 = self.get_mode().contains(Mode::UTF8_MOUSE);
-
-        let max_point = if utf8 { 2015 } else { 223 };
-
-        if row >= max_point || col >= max_point {
-            return;
-        }
-
-        let mut msg = vec![b'\x1b', b'[', b'M', 32 + button];
-
-        let mouse_pos_encode = |pos: usize| -> Vec<u8> {
-            let pos = 32 + 1 + pos;
-            let first = 0xC0 + pos / 64;
-            let second = 0x80 + (pos & 63);
-            vec![first as u8, second as u8]
+            let mut mods = 0;
+            let mod_state = self.modifiers.state();
+            if mod_state.shift_key() {
+                mods += 4;
+            }
+            if mod_state.alt_key() {
+                mods += 8;
+            }
+            if mod_state.control_key() {
+                mods += 16;
+            }
+            mods
         };
 
-        if utf8 && col >= Column(95) {
-            msg.append(&mut mouse_pos_encode(col.0));
-        } else {
-            msg.push(32 + 1 + col.0 as u8);
+        if let Some(msg) = encode_mouse_report(mode, &position, button, mods, state) {
+            self.ctx_mut().current_mut().messenger.send_write(msg);
         }
-
-        if utf8 && row >= 95 {
-            msg.append(&mut mouse_pos_encode(row.0 as usize));
-        } else {
-            msg.push(32 + 1 + row.0 as u8);
-        }
-
-        self.ctx_mut().current_mut().messenger.send_write(msg);
     }
 
     #[inline]
