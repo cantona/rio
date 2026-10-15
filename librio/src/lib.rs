@@ -365,6 +365,15 @@ pub struct Surface {
     )>,
 }
 
+/// The report encoding `mode` selects, as (sgr, utf8). SGR-Pixels (1016)
+/// reports in SGR with cell coordinates: hosts pass cells, not pixels.
+fn mouse_encoding(mode: Mode) -> (bool, bool) {
+    (
+        mode.intersects(Mode::SGR_MOUSE | Mode::SGR_PIXELS_MOUSE),
+        mode.contains(Mode::UTF8_MOUSE),
+    )
+}
+
 /// Encode one mouse report. SGR (`CSI < b ; x ; y M`) when the program
 /// asked for it, else the original X10 form, whose coordinates are
 /// offset by 32 and cannot exceed 223 without the UTF-8 extension.
@@ -684,7 +693,7 @@ impl Surface {
         if lines == 0 {
             return false;
         }
-        let (mouse_mode, alt_screen, alt_scroll, app_cursor, sgr, utf8) = {
+        let (mouse_mode, alt_screen, alt_scroll, app_cursor, (sgr, utf8)) = {
             let terminal = self.terminal.lock();
             let mode = terminal.mode();
             (
@@ -692,8 +701,7 @@ impl Surface {
                 mode.contains(Mode::ALT_SCREEN),
                 mode.contains(Mode::ALTERNATE_SCROLL),
                 mode.contains(Mode::APP_CURSOR),
-                mode.contains(Mode::SGR_MOUSE),
-                mode.contains(Mode::UTF8_MOUSE),
+                mouse_encoding(mode),
             )
         };
         let shift = mods.contains(Modifiers::SHIFT);
@@ -753,13 +761,12 @@ impl Surface {
         pressed: bool,
         mods: Modifiers,
     ) -> bool {
-        let (mouse_mode, x10, sgr, utf8) = {
+        let (mouse_mode, x10, (sgr, utf8)) = {
             let mode = self.terminal.lock().mode();
             (
                 mode.intersects(Mode::MOUSE_MODE),
                 mode.contains(Mode::MOUSE_REPORT_X10),
-                mode.contains(Mode::SGR_MOUSE),
-                mode.contains(Mode::UTF8_MOUSE),
+                mouse_encoding(mode),
             )
         };
         if !mouse_mode || mods.contains(Modifiers::SHIFT) {
@@ -788,13 +795,12 @@ impl Surface {
     /// held during a drag, or 3 when none is held. Returns true when a report
     /// was written.
     pub fn mouse_motion(&self, col: u16, row: u16, button: u8, mods: Modifiers) -> bool {
-        let (drag, motion, sgr, utf8) = {
+        let (drag, motion, (sgr, utf8)) = {
             let mode = self.terminal.lock().mode();
             (
                 mode.contains(Mode::MOUSE_DRAG),
                 mode.contains(Mode::MOUSE_MOTION),
-                mode.contains(Mode::SGR_MOUSE),
-                mode.contains(Mode::UTF8_MOUSE),
+                mouse_encoding(mode),
             )
         };
         if mods.contains(Modifiers::SHIFT) {
@@ -1375,6 +1381,28 @@ mod tests {
             mouse_report(16, 0, 0, false, false, false),
             vec![0x1b, b'[', b'M', 32 + 19, 33, 33]
         );
+    }
+
+    // librio hosts pass cells, so SGR-Pixels (1016) must keep the SGR cell
+    // report a program got from 1006 before 1016 cleared it.
+    #[test]
+    fn sgr_pixels_mode_keeps_sgr_cell_reports() {
+        let engine = Engine::new(Arc::new(CountingDelegate {
+            wakeups: AtomicUsize::new(0),
+        }));
+        let click = |setup: &[u8]| {
+            let surface = engine
+                .create_surface(&SurfaceDesc::default())
+                .expect("spawn shell");
+            surface.inject_output(setup);
+            let (sgr, utf8) = mouse_encoding(surface.terminal.lock().mode());
+            mouse_report(0, 4, 2, true, sgr, utf8)
+        };
+
+        let sgr_cells = click(b"\x1b[?1003h\x1b[?1006h");
+        assert_eq!(sgr_cells, b"\x1b[<0;5;3M".to_vec());
+        assert_eq!(click(b"\x1b[?1003h\x1b[?1006h\x1b[?1016h"), sgr_cells);
+        assert_eq!(click(b"\x1b[?1003h\x1b[?1016h"), sgr_cells);
     }
 
     // Clicks and drags report only when the program asked; shift bypasses to
