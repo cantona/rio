@@ -4593,8 +4593,8 @@ fn test_retransmit_reclamps_crop_and_updates_footprint() {
     assert_eq!(v1, 1.0);
 
     // The new pixels were dispatched for upload without a re-place
-    // (send_graphics_updates drains the queue into an event, so the
-    // dirty flag is the observable side).
+    // (send_graphics_updates moves the queue into the terminal's outbox,
+    // so the dirty flag is the observable side here).
     assert!(term.graphics.kitty_graphics_dirty);
 }
 

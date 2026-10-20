@@ -1,6 +1,5 @@
 pub mod sync;
 
-use crate::ansi::graphics::UpdateQueues;
 use crate::clipboard::ClipboardType;
 use crate::config::colors::ColorRgb;
 use crate::crosswords::grid::Scroll;
@@ -167,10 +166,10 @@ pub enum RioEvent {
     /// Terminal content changed — lightweight notification (no damage payload).
     /// Damage stays in the terminal; renderer extracts it when it locks.
     TerminalDamaged(usize),
-    /// Graphics update available from terminal.
+    /// Graphics queues wait in the terminal's outbox; whoever locks it
+    /// next (the event handler or a render) takes and applies them.
     UpdateGraphics {
         route_id: usize,
-        queues: UpdateQueues,
     },
     /// A pane's Glyph Protocol registry just became live (first
     /// `register` after session start, or first register following
@@ -536,6 +535,14 @@ pub trait OnResize {
 pub trait EventListener {
     fn send_event(&self, _event: RioEvent, _id: WindowId) {}
 
+    /// Whether the owner answers `UpdateGraphics` by taking the terminal's
+    /// graphics outbox (`Crosswords::take_graphics_outbox`). The signal is
+    /// sent either way; only a listener that returns true gets the pixels
+    /// kept in the outbox, so one that never takes it cannot pile them up.
+    fn takes_graphics_outbox(&self) -> bool {
+        false
+    }
+
     fn send_event_with_high_priority(&self, _event: RioEvent, _id: WindowId) {}
 
     fn send_redraw(&self, _id: WindowId) {}
@@ -575,6 +582,10 @@ impl EventProxy {
 impl EventListener for EventProxy {
     fn send_event(&self, event: RioEvent, id: WindowId) {
         let _ = self.proxy.send_event(EventPayload::new(event.into(), id));
+    }
+
+    fn takes_graphics_outbox(&self) -> bool {
+        true
     }
 }
 

@@ -1111,71 +1111,55 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     }
                 }
             }
-            RioEventType::Rio(RioEvent::UpdateGraphics { route_id, queues }) => {
-                use rio_backend::sugarloaf::route_image_key;
+            RioEventType::Rio(RioEvent::UpdateGraphics { route_id }) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
                     // A batch the VT thread queued before the user
                     // closed its tab or split would otherwise land
                     // under a route nothing will ever release.
-                    if route
-                        .window
-                        .screen
-                        .context_manager
-                        .get_by_route_id(route_id)
-                        .is_none()
-                    {
+                    let Some(ctx_item) =
+                        route.window.screen.ctx_mut().get_by_route_id(route_id)
+                    else {
                         return;
-                    }
-
-                    // Process graphics directly in sugarloaf
-                    let sugarloaf = &mut route.window.screen.sugarloaf;
-
-                    // Atlas graphics (sixel/iTerm2) share the per-image
-                    // texture store with kitty images, in a disjoint key
-                    // namespace.
-                    for graphic_data in queues.pending {
-                        let key = route_image_key(
-                            route_id,
-                            crate::renderer::atlas_image_key(graphic_data.id.get()),
-                        );
-                        sugarloaf.image_data.insert(
-                            key,
-                            rio_backend::sugarloaf::GraphicDataEntry::from_graphic_data(
-                                graphic_data,
-                            ),
-                        );
-                    }
-
-                    // Removals arrive as final image keys (atlas refs
-                    // dropped off scrollback, kitty evictions) and free
-                    // both the pixel store and the cached GPU texture.
-                    // They run before the kitty uploads so a batch that
-                    // frees a key and resends it keeps the new pixels.
-                    for key in queues.remove_queue {
-                        sugarloaf.remove_image(route_image_key(route_id, key));
-                    }
-
-                    // Image textures (kitty) → separate store, no clone
-                    for (image_id, graphic_data) in queues.pending_images {
-                        sugarloaf.image_data.insert(
-                            route_image_key(
-                                route_id,
-                                crate::renderer::kitty_image_key(image_id),
-                            ),
-                            rio_backend::sugarloaf::GraphicDataEntry::from_graphic_data(
-                                graphic_data,
-                            ),
-                        );
-                    }
-
+                    };
                     // Mark the panel dirty: the renderer skips non-dirty
                     // panels, so a bare redraw after the pixels arrive
                     // would no-op and leave the image blank until the
-                    // next unrelated damage.
-                    if let Some(ctx_item) =
-                        route.window.screen.ctx_mut().get_by_route_id(route_id)
-                    {
-                        ctx_item.val.renderable_content.pending_update.set_dirty();
+                    // next unrelated damage. A visible pane's render then
+                    // takes the outbox itself under the fair lock.
+                    ctx_item.val.renderable_content.pending_update.set_dirty();
+
+                    // The queues ride with the terminal lock, so a render
+                    // that got the lock first has already applied them.
+                    // Waiting here would stall the UI behind a pane still
+                    // parsing, so come back a little later instead: a
+                    // hidden pane is never rendered, and its removals must
+                    // still free their textures.
+                    let queues = match ctx_item.val.terminal.try_lock_unfair() {
+                        Some(mut terminal) => terminal.take_graphics_outbox(),
+                        None => {
+                            let timer_id = TimerId::new(Topic::GraphicsOutbox, route_id);
+                            if !self.scheduler.scheduled(timer_id) {
+                                self.scheduler.schedule(
+                                    EventPayload::new(
+                                        RioEventType::Rio(RioEvent::UpdateGraphics {
+                                            route_id,
+                                        }),
+                                        window_id,
+                                    ),
+                                    Duration::from_millis(16),
+                                    false,
+                                    timer_id,
+                                );
+                            }
+                            None
+                        }
+                    };
+                    if let Some(queues) = queues {
+                        crate::renderer::apply_graphics_queues(
+                            &mut route.window.screen.sugarloaf,
+                            route_id,
+                            queues,
+                        );
                     }
 
                     // Request a redraw to display the updated graphics

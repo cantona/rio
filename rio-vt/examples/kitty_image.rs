@@ -1,8 +1,9 @@
 //! Transmit an image with the Kitty graphics protocol and capture it.
 //!
-//! Kitty images are delivered through `RioEvent::UpdateGraphics` in the
+//! Kitty images wait in the terminal's graphics outbox in the
 //! `pending_images` queue (keyed by the client's image id), separate from
-//! the sixel/iTerm2 `pending` queue.
+//! the sixel/iTerm2 `pending` queue; `RioEvent::UpdateGraphics` says that
+//! the outbox has something to take.
 //!
 //! Run: `cargo run -p rio-vt --example kitty_image`
 
@@ -10,21 +11,23 @@ use rio_vt::ansi::CursorShape;
 use rio_vt::crosswords::{Crosswords, CrosswordsSize};
 use rio_vt::event::{EventListener, RioEvent, WindowId};
 use rio_vt::performer::handler::Processor;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
-/// Records (image_id, width, height, byte-len) for every kitty image emitted.
+/// Counts how often the terminal announced graphics in its outbox.
 #[derive(Clone, Default)]
-#[allow(clippy::type_complexity)]
-struct ImageSink(Arc<Mutex<Vec<(u32, usize, usize, usize)>>>);
+struct ImageSink(Arc<AtomicUsize>);
 
 impl EventListener for ImageSink {
     fn send_event(&self, event: RioEvent, _window: WindowId) {
-        if let RioEvent::UpdateGraphics { queues, .. } = event {
-            let mut sink = self.0.lock().unwrap();
-            for (image_id, g) in &queues.pending_images {
-                sink.push((*image_id, g.width, g.height, g.pixels.len()));
-            }
+        if let RioEvent::UpdateGraphics { .. } = event {
+            self.0.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    // Without this the terminal drops the pixels and only signals.
+    fn takes_graphics_outbox(&self) -> bool {
+        true
     }
 }
 
@@ -52,12 +55,18 @@ fn main() {
     let mut parser = Processor::default();
     parser.advance(&mut term, kitty);
 
-    let images = sink.0.lock().unwrap();
-    if images.is_empty() {
-        println!("no kitty image captured");
-    } else {
-        for (id, w, h, bytes) in images.iter() {
-            println!("kitty image: id={id} {w}x{h}px rgba_bytes={bytes}");
+    println!("graphics signals: {}", sink.0.load(Ordering::Relaxed));
+    match term.take_graphics_outbox() {
+        None => println!("no kitty image captured"),
+        Some(queues) => {
+            for (id, g) in &queues.pending_images {
+                println!(
+                    "kitty image: id={id} {}x{}px rgba_bytes={}",
+                    g.width,
+                    g.height,
+                    g.pixels.len()
+                );
+            }
         }
     }
 }

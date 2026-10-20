@@ -24,6 +24,7 @@ pub mod style;
 pub mod vi_mode;
 
 use crate::ansi::graphics::Graphics;
+use crate::ansi::graphics::GraphicsOutbox;
 use crate::ansi::graphics::KittyPlacement;
 use crate::ansi::graphics::UpdateQueues;
 use crate::ansi::mode::NamedMode;
@@ -479,6 +480,13 @@ where
     /// Set by PTY thread before sending; cleared by renderer after extracting damage.
     pub damage_event_in_flight: bool,
 
+    /// Graphics uploads and removals on their way to the frontend. They
+    /// travel with the terminal lock, not inside the event: a render that
+    /// locks the terminal applies them before it draws, so a placement
+    /// never shows up ahead of its pixels or after they were freed. Kept
+    /// only for a listener that takes it, one copy per key.
+    graphics_outbox: GraphicsOutbox,
+
     /// What DECRQM callers see after a full reset: the
     /// consumer-configured default for grapheme clustering (mode
     /// 2027). On by default; embedders serving legacy wcwidth
@@ -549,6 +557,7 @@ impl<U: EventListener> Crosswords<U> {
             replayed_through: [None; 2],
             user_vars: rustc_hash::FxHashMap::default(),
             damage_event_in_flight: false,
+            graphics_outbox: GraphicsOutbox::default(),
             modify_other_keys: 0,
             keyboard_mode_stack: Default::default(),
             keyboard_mode_idx: 0,
@@ -796,19 +805,30 @@ impl<U: EventListener> Crosswords<U> {
         self.graphics.take_queues()
     }
 
+    /// Moves the queued graphics uploads and removals into the outbox and
+    /// tells the frontend that graphics changed. A listener that never
+    /// takes the outbox still gets the signal but not the pixels, which
+    /// are dropped here as the event that used to carry them was.
     #[inline]
     pub fn send_graphics_updates(&mut self) {
         if self.graphics.has_pending_updates() {
             if let Some(queues) = self.graphics.take_queues() {
+                if self.event_proxy.takes_graphics_outbox() {
+                    self.graphics_outbox.absorb(queues);
+                }
                 self.event_proxy.send_event(
                     RioEvent::UpdateGraphics {
                         route_id: self.route_id,
-                        queues,
                     },
                     self.window_id,
                 );
             }
         }
+    }
+
+    /// Everything queued since the last take, one delivery, or `None`.
+    pub fn take_graphics_outbox(&mut self) -> Option<UpdateQueues> {
+        self.graphics_outbox.take()
     }
 
     #[inline]
@@ -6205,6 +6225,125 @@ mod tests {
         fn send_event(&self, event: RioEvent, _id: WindowId) {
             self.events.borrow_mut().push(event);
         }
+
+        fn takes_graphics_outbox(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn graphics_updates_wait_in_the_outbox_until_taken() {
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let listener = TestListener {
+            events: events.clone(),
+        };
+        let size = CrosswordsSize::new(4, 4);
+        let window_id = crate::event::WindowId::from(0);
+        let mut cw =
+            Crosswords::new(size, CursorShape::Block, listener, window_id, 0, 10);
+
+        cw.store_graphic(kitty_test_image(1, 2, 2));
+        cw.place_graphic(virtual_request(1, 1));
+        cw.graphics.texture_operations.lock().push(7);
+        cw.send_graphics_updates();
+        assert!(
+            cw.graphics.pending_images.is_empty(),
+            "queues leave graphics at once"
+        );
+        let signals = events
+            .borrow()
+            .iter()
+            .filter(|event| matches!(event, RioEvent::UpdateGraphics { .. }))
+            .count();
+        assert!(signals >= 1);
+
+        let queues = cw
+            .take_graphics_outbox()
+            .expect("the batch is in the outbox");
+        assert_eq!(queues.pending_images.len(), 1);
+        assert_eq!(queues.remove_queue, vec![7]);
+        assert!(cw.take_graphics_outbox().is_none(), "taken once");
+    }
+
+    #[test]
+    fn listener_that_never_takes_the_outbox_still_gets_the_signal_but_no_pixels() {
+        #[derive(Clone)]
+        struct SignalOnly(std::rc::Rc<std::cell::RefCell<Vec<RioEvent>>>);
+        impl EventListener for SignalOnly {
+            fn send_event(&self, event: RioEvent, _id: WindowId) {
+                self.0.borrow_mut().push(event);
+            }
+        }
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let size = CrosswordsSize::new(4, 4);
+        let window_id = crate::event::WindowId::from(0);
+        let mut cw = Crosswords::new(
+            size,
+            CursorShape::Block,
+            SignalOnly(events.clone()),
+            window_id,
+            0,
+            10,
+        );
+        for _ in 0..3 {
+            cw.store_graphic(kitty_test_image(1, 2, 2));
+            cw.place_graphic(virtual_request(1, 1));
+            cw.send_graphics_updates();
+        }
+        assert!(cw.graphics.pending_images.is_empty());
+        assert!(cw.take_graphics_outbox().is_none());
+        assert!(events
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, RioEvent::UpdateGraphics { .. })));
+    }
+
+    #[test]
+    fn outbox_keeps_the_latest_upload_and_honours_removal_order() {
+        let kitty = |id: u32, w: usize| UpdateQueues {
+            pending_images: vec![(id, kitty_test_image(id, w, 1))],
+            ..Default::default()
+        };
+        let remove = |keys: Vec<u64>| UpdateQueues {
+            remove_queue: keys,
+            ..Default::default()
+        };
+        let key = rio_graphics::kitty_image_key;
+        let mut outbox = GraphicsOutbox::default();
+        assert!(outbox.take().is_none());
+        for batch in [
+            kitty(1, 1),
+            kitty(2, 1),
+            kitty(1, 2),
+            remove(vec![key(2), key(2), key(3)]),
+            kitty(3, 5),
+        ] {
+            outbox.absorb(batch);
+        }
+        let queues = outbox.take().expect("something queued");
+        let ids: Vec<(u32, usize)> = queues
+            .pending_images
+            .iter()
+            .map(|(id, graphic)| (*id, graphic.width))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![(1, 2), (3, 5)],
+            "2 removed, 1 replaced, 3 re-sent"
+        );
+        assert_eq!(queues.remove_queue, vec![key(2), key(3)]);
+        assert!(outbox.take().is_none(), "taken once");
+
+        // A frame loop on one id, with or without a delete in between,
+        // never holds more than the latest copy.
+        for frame in 1..=200 {
+            outbox.absorb(remove(vec![key(9)]));
+            outbox.absorb(kitty(9, frame));
+        }
+        let queues = outbox.take().expect("the loop queued");
+        assert_eq!(queues.pending_images.len(), 1);
+        assert_eq!(queues.pending_images[0].1.width, 200);
+        assert_eq!(queues.remove_queue, vec![key(9)]);
     }
 
     fn make_crosswords() -> Crosswords<VoidListener> {

@@ -31,6 +31,7 @@ pub enum Topic {
     SelectionScrolling,
     ClearSessionNotice,
     DisarmCloseButton,
+    GraphicsOutbox,
 }
 
 /// Event scheduled to be emitted at a specific time.

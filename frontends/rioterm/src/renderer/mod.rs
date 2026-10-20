@@ -152,6 +152,33 @@ fn window_bg_alpha(config: &Config) -> f32 {
 
 pub use rio_backend::sugarloaf::{atlas_image_key, kitty_image_key, route_image_key};
 
+/// Moves one terminal's queued graphics into the window's image store:
+/// removals first, so a batch that frees a key and resends it keeps the
+/// new pixels, then atlas (sixel/iTerm2) and kitty uploads. Atlas and
+/// kitty keys share the per-image texture store in disjoint namespaces,
+/// scoped by route because kitty ids are per terminal.
+pub fn apply_graphics_queues(
+    sugarloaf: &mut Sugarloaf,
+    route_id: usize,
+    queues: rio_backend::ansi::graphics::UpdateQueues,
+) {
+    for key in queues.remove_queue {
+        sugarloaf.remove_image(route_image_key(route_id, key));
+    }
+    for graphic_data in queues.pending {
+        sugarloaf.image_data.insert(
+            route_image_key(route_id, atlas_image_key(graphic_data.id.get())),
+            rio_backend::sugarloaf::GraphicDataEntry::from_graphic_data(graphic_data),
+        );
+    }
+    for (image_id, graphic_data) in queues.pending_images {
+        sugarloaf.image_data.insert(
+            route_image_key(route_id, kitty_image_key(image_id)),
+            rio_backend::sugarloaf::GraphicDataEntry::from_graphic_data(graphic_data),
+        );
+    }
+}
+
 pub struct Renderer {
     is_vi_mode_enabled: bool,
     is_game_mode_enabled: bool,
@@ -514,6 +541,12 @@ impl Renderer {
 
             {
                 let mut terminal = context.terminal.lock();
+
+                // Textures first: the placements read below may already
+                // point at an upload still in the outbox.
+                if let Some(queues) = terminal.take_graphics_outbox() {
+                    apply_graphics_queues(sugarloaf, context.route_id, queues);
+                }
 
                 // Clear in-flight flag so PTY thread can notify again
                 terminal.damage_event_in_flight = false;

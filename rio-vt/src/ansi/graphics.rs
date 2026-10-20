@@ -12,7 +12,7 @@ use std::mem;
 use std::sync::Arc;
 use tracing::debug;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct UpdateQueues {
     /// Atlas graphics (sixel/iTerm2) read from the PTY.
     pub pending: Vec<GraphicData>,
@@ -23,6 +23,95 @@ pub struct UpdateQueues {
     /// Image keys removed from the grid or evicted
     /// (`rio_graphics::graphics::kitty_image_key` / `atlas_image_key`).
     pub remove_queue: Vec<u64>,
+}
+
+#[derive(Debug, Clone)]
+enum QueuedUpload {
+    Atlas(GraphicData),
+    Kitty(u32, GraphicData),
+}
+
+/// Graphics changes on their way to the frontend, folded as they arrive so
+/// a key costs one copy however long they wait: a removal drops an earlier
+/// upload of its key, since the frontend applies every removal before
+/// every upload of one delivery, and an upload after the removal keeps the
+/// key; a later upload of a key replaces the earlier one in its slot.
+#[derive(Debug, Default)]
+pub struct GraphicsOutbox {
+    uploads: Vec<Option<QueuedUpload>>,
+    slot: FxHashMap<u64, usize>,
+    live: usize,
+    removals: Vec<u64>,
+    removed: rustc_hash::FxHashSet<u64>,
+}
+
+impl GraphicsOutbox {
+    pub fn is_empty(&self) -> bool {
+        self.live == 0 && self.removals.is_empty()
+    }
+
+    /// Appends a batch, removals first, as the frontend applied a batch.
+    pub fn absorb(&mut self, batch: UpdateQueues) {
+        for key in batch.remove_queue {
+            if let Some(&slot) = self.slot.get(&key) {
+                if self.uploads[slot].take().is_some() {
+                    self.live -= 1;
+                }
+            }
+            if self.removed.insert(key) {
+                self.removals.push(key);
+            }
+        }
+        for graphic in batch.pending {
+            let key = rio_graphics::atlas_image_key(graphic.id.get());
+            self.push(key, QueuedUpload::Atlas(graphic));
+        }
+        for (image_id, graphic) in batch.pending_images {
+            let key = rio_graphics::kitty_image_key(image_id);
+            self.push(key, QueuedUpload::Kitty(image_id, graphic));
+        }
+    }
+
+    fn push(&mut self, key: u64, upload: QueuedUpload) {
+        let slot = *self.slot.entry(key).or_insert_with(|| {
+            self.uploads.push(None);
+            self.uploads.len() - 1
+        });
+        if self.uploads[slot].replace(upload).is_none() {
+            self.live += 1;
+        }
+    }
+
+    /// Everything absorbed since the last take, or `None`.
+    pub fn take(&mut self) -> Option<UpdateQueues> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut queues = UpdateQueues {
+            remove_queue: mem::take(&mut self.removals),
+            ..Default::default()
+        };
+        for upload in mem::take(&mut self.uploads).into_iter().flatten() {
+            match upload {
+                QueuedUpload::Atlas(graphic) => queues.pending.push(graphic),
+                QueuedUpload::Kitty(image_id, graphic) => {
+                    queues.pending_images.push((image_id, graphic))
+                }
+            }
+        }
+        self.slot.clear();
+        self.removed.clear();
+        self.live = 0;
+        Some(queues)
+    }
+}
+
+impl UpdateQueues {
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+            && self.pending_images.is_empty()
+            && self.remove_queue.is_empty()
+    }
 }
 
 /// Kitty graphics Unicode placeholder character

@@ -1,8 +1,9 @@
 //! Feed a Sixel image and capture the decoded graphic via the event sink.
 //!
-//! Received images are drained into a `RioEvent::UpdateGraphics` event
-//! (the renderer picks them up there), so we install a small
-//! `EventListener` that records what the terminal emits.
+//! Received images are drained into the terminal's graphics outbox and a
+//! `RioEvent::UpdateGraphics` signal tells the renderer to take them, so
+//! we install a small `EventListener` that counts the signals and then
+//! take the outbox ourselves.
 //!
 //! Run: `cargo run -p rio-vt --example sixel`
 
@@ -10,21 +11,23 @@ use rio_vt::ansi::CursorShape;
 use rio_vt::crosswords::{Crosswords, CrosswordsSize};
 use rio_vt::event::{EventListener, RioEvent, WindowId};
 use rio_vt::performer::handler::Processor;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
-/// Records (id, width, height, byte-len) for every graphic the terminal emits.
+/// Counts how often the terminal announced graphics in its outbox.
 #[derive(Clone, Default)]
-#[allow(clippy::type_complexity)]
-struct GraphicSink(Arc<Mutex<Vec<(u64, usize, usize, usize)>>>);
+struct GraphicSink(Arc<AtomicUsize>);
 
 impl EventListener for GraphicSink {
     fn send_event(&self, event: RioEvent, _window: WindowId) {
-        if let RioEvent::UpdateGraphics { queues, .. } = event {
-            let mut sink = self.0.lock().unwrap();
-            for g in &queues.pending {
-                sink.push((g.id.get(), g.width, g.height, g.pixels.len()));
-            }
+        if let RioEvent::UpdateGraphics { .. } = event {
+            self.0.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    // Without this the terminal drops the pixels and only signals.
+    fn takes_graphics_outbox(&self) -> bool {
+        true
     }
 }
 
@@ -55,12 +58,19 @@ fn main() {
     let mut parser = Processor::default();
     parser.advance(&mut term, &sixel);
 
-    let graphics = sink.0.lock().unwrap();
-    if graphics.is_empty() {
-        println!("no sixel graphic captured");
-    } else {
-        for (id, w, h, bytes) in graphics.iter() {
-            println!("sixel graphic: id={id} {w}x{h}px rgba_bytes={bytes}");
+    println!("graphics signals: {}", sink.0.load(Ordering::Relaxed));
+    match term.take_graphics_outbox() {
+        None => println!("no sixel graphic captured"),
+        Some(queues) => {
+            for g in &queues.pending {
+                println!(
+                    "sixel graphic: id={} {}x{}px rgba_bytes={}",
+                    g.id.get(),
+                    g.width,
+                    g.height,
+                    g.pixels.len()
+                );
+            }
         }
     }
 }

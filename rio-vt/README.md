@@ -84,16 +84,20 @@ Each is runnable with `cargo run -p rio-vt --example <name>`:
 | Example | Shows |
 | --- | --- |
 | [`quickstart`](examples/quickstart.rs) | Create a grid, feed bytes, read cells back. |
-| [`sixel`](examples/sixel.rs) | Decode a Sixel image, captured via `RioEvent::UpdateGraphics`. |
+| [`sixel`](examples/sixel.rs) | Decode a Sixel image and take it from the graphics outbox. |
 | [`kitty_image`](examples/kitty_image.rs) | Transmit a Kitty graphics-protocol image and capture it. |
 | [`selection`](examples/selection.rs) | Select a range and read it back as text. |
 | [`resize`](examples/resize.rs) | Resize the terminal and watch the grid follow. |
 
 The `sixel` and `kitty_image` examples double as a reference for the
-event-driven graphics flow: received images are drained into a
-`RioEvent::UpdateGraphics` event (with `pending` for Sixel/iTerm2 and
-`pending_images` for Kitty), which a frontend records through its
-`EventListener`.
+graphics flow: received images are drained into the terminal's graphics
+outbox (with `pending` for Sixel/iTerm2 and `pending_images` for Kitty),
+a `RioEvent::UpdateGraphics` signal reaches the frontend's
+`EventListener`, and the frontend takes the outbox with
+`take_graphics_outbox` while it holds the terminal lock. The outbox keeps
+one copy per image key however long it waits. The listener must return
+true from `takes_graphics_outbox`, or the terminal drops the pixels and
+sends the signal alone.
 
 ## Receiving events
 
