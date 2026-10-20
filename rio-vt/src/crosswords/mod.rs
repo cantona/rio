@@ -11383,8 +11383,7 @@ mod tests {
             0,
             10,
         );
-        term.set_sgr_pixels_mouse_supported(true);
-        term.set_sgr_pixels_mouse_supported(false);
+        // A fresh terminal is such a host: pixel mouse support is opt-in.
         let mut parser = Processor::default();
 
         parser.advance(&mut term, b"\x1b[?1006h\x1b[?1016h");
