@@ -33,7 +33,7 @@ use crate::config::window::Window;
 use colors::Colors;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{default::Default, fs::File};
 #[cfg(feature = "renderer")]
 use sugarloaf::font::fonts::SugarloafFonts;
@@ -280,11 +280,6 @@ pub fn config_file_path() -> PathBuf {
 }
 
 #[inline]
-pub fn triggers_file_path() -> PathBuf {
-    config_dir_path().join("triggers.toml")
-}
-
-#[inline]
 pub fn session_file_path() -> PathBuf {
     config_dir_path().join("session.json")
 }
@@ -431,7 +426,7 @@ impl Config {
         }
     }
 
-    fn load_triggers(path: &PathBuf) -> Result<Triggers, String> {
+    fn load_triggers(path: &Path) -> Result<Triggers, String> {
         if path.exists() {
             let content = std::fs::read_to_string(path)
                 .map_err(|err| format!("error reading: {err}"))?;
@@ -483,13 +478,23 @@ impl Config {
     }
 
     pub fn try_load() -> Result<Self, ConfigError> {
-        let path = config_file_path();
+        Self::try_load_from_dir(&config_dir_path())
+    }
+
+    /// Load `config.toml`, its themes and `triggers.toml` from `dir`, then
+    /// fold the `[platform.<os>]` section into the base values. Startup and
+    /// hot reload both come through here, so a platform override survives
+    /// a config save; it is applied exactly once per load because the
+    /// merge is not idempotent (platform env-vars append).
+    fn try_load_from_dir(dir: &Path) -> Result<Self, ConfigError> {
+        let path = dir.join("config.toml");
+        let triggers_path = dir.join("triggers.toml");
         if path.exists() {
             match std::fs::read_to_string(path) {
                 Ok(content) => match toml::from_str::<Config>(&content) {
                     Ok(mut decoded) => {
                         let theme = &decoded.theme;
-                        let theme_path = config_dir_path().join("themes");
+                        let theme_path = dir.join("themes");
                         if !theme.is_empty() {
                             let path = theme_path.join(theme).with_extension("toml");
                             match Config::load_theme(&path) {
@@ -547,7 +552,8 @@ impl Config {
                             }
                         }
 
-                        Config::apply_triggers(&mut decoded);
+                        Config::apply_triggers(&mut decoded, &triggers_path);
+                        decoded.overwrite_based_on_platform();
 
                         Ok(decoded)
                     }
@@ -563,7 +569,7 @@ impl Config {
             // No config.toml, but triggers.toml is loaded independently so a
             // triggers-only setup still works.
             let mut decoded = Config::default();
-            Config::apply_triggers(&mut decoded);
+            Config::apply_triggers(&mut decoded, &triggers_path);
             Ok(decoded)
         }
     }
@@ -575,12 +581,11 @@ impl Config {
     /// hot-reload keep the previously-live rules rather than silently
     /// wiping them with this config's empty default, and gives the UI a
     /// message to surface.
-    fn apply_triggers(config: &mut Config) {
-        let triggers_path = triggers_file_path();
+    fn apply_triggers(config: &mut Config, triggers_path: &Path) {
         if !triggers_path.exists() {
             return;
         }
-        match Config::load_triggers(&triggers_path) {
+        match Config::load_triggers(triggers_path) {
             Ok(loaded) => config.triggers = loaded,
             Err(err_message) => {
                 warn!("failed to load triggers.toml: {err_message}");
@@ -1657,6 +1662,35 @@ mod tests {
 
         // Theme should be overridden
         assert_eq!(result.theme, "macos-specific-theme");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    fn test_try_load_applies_platform_overrides_once() {
+        // Per-process dir: two test runs as the same user (another worktree,
+        // CI) must not read each other's half-written config.toml.
+        let dir =
+            tmp_dir().join(format!("test-rio-try-load-platform-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            r#"
+            env-vars = ["GLOBAL=1"]
+
+            [platform]
+            linux.env-vars = ["PLATFORM=linux"]
+            macos.env-vars = ["PLATFORM=macos"]
+            windows.env-vars = ["PLATFORM=windows"]
+        "#,
+        )
+        .unwrap();
+
+        let result = Config::try_load_from_dir(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let result = result.unwrap();
+
+        let platform = format!("PLATFORM={}", std::env::consts::OS);
+        assert_eq!(result.env_vars, vec![String::from("GLOBAL=1"), platform]);
     }
 
     #[test]
